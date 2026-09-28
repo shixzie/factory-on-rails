@@ -2,6 +2,7 @@ import { ExternalLinkIcon } from "lucide-react";
 import type { Metadata } from "next";
 import { ApiKeys } from "@/components/api-keys";
 import { PageHeader } from "@/components/page-header";
+import { SnapshotPicker } from "@/components/snapshot-picker";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { getMe, serverApi } from "@/lib/server";
@@ -21,7 +22,7 @@ function Section({ title, description, children }: { title: string; description:
 }
 
 export default async function SettingsPage() {
-  const [me, keys] = await Promise.all([getMe(), serverApi(api.keys)]);
+  const [me, keys, snapshot] = await Promise.all([getMe(), serverApi(api.keys), serverApi(api.snapshot)]);
   return (
     <>
       <PageHeader>
@@ -30,10 +31,16 @@ export default async function SettingsPage() {
       <div className="px-4 py-8">
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-10">
           <Section
-            title="Model API keys"
-            description="Bring your own key: your runs use your key, and only your runs. Keys are encrypted at rest, never shown again after you save them, and only handed to the sandboxes that run your tasks."
+            title="Agents and keys"
+            description="Bring your own key: your runs use your key, and only your runs. Each run gets the key for the agent it uses. Keys are encrypted at rest, never shown again after you save them, and only handed to the sandboxes that run your tasks."
           >
             <ApiKeys initial={keys} />
+          </Section>
+          <Section
+            title="Sandbox snapshot"
+            description="A snapshot is a prepared sandbox your runs start from, for example with Claude Code or Codex already signed in to your subscription. An agent with no key saved above uses the sign-in in the snapshot; a saved key takes precedence over it."
+          >
+            <SnapshotPicker initial={snapshot} />
           </Section>
           <Section
             title="Repository access"

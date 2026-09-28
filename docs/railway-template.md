@@ -65,6 +65,7 @@ over the private network.
 | `PUBLIC_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | The address people use. Change it if you add a custom domain. |
 | `PORT` | `8080` | |
 | `HOST` | `::` | Listen on IPv6 so the private network reaches it. |
+| `SANDBOX_SNAPSHOTS` | *(empty, optional)* | Prepared sandbox checkpoints users may start runs from, as `name=login\|login`, comma-separated (see setup.md, step 7). |
 
 ### web
 
@@ -101,6 +102,7 @@ The worker that drives one sandbox per run. No networking.
 | `TOKEN_ENCRYPTION_KEY` | `${{harness.TOKEN_ENCRYPTION_KEY}}` | Same key as the harness. |
 | `HARNESS_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | Links pull requests back to their run. |
 | `MAX_CONCURRENT_RUNS` | `3` (optional) | Runs at once, one sandbox each. |
+| `SANDBOX_SNAPSHOTS` | `${{harness.SANDBOX_SNAPSHOTS}}` | The same list as the harness; checked again when a run starts. |
 | `SANDBOX_REGION` | *(empty, optional)* | Where sandboxes run, e.g. `us-east4-eqdc4a`. Railway's default is us-west2; put them near the factory's region. |
 
 The template sets no GitHub App or sandbox variables: the setup page creates
@@ -114,7 +116,7 @@ by hand still works and takes precedence ([setup.md](setup.md)).
 # Deploy and Host Factory on Rails with Railway
 
 Factory on Rails is a self-hosted software factory. Sign in with GitHub, pick
-a repository, describe a change, and a coding agent (Claude Code) does the work
+a repository, describe a change, and a coding agent (Claude Code or Codex) does the work
 in its own Railway sandbox and opens a pull request. You can follow the agent
 live, answer its questions and keep the conversation going.
 
@@ -137,7 +139,7 @@ workspace.
 ## Dependencies for Factory on Rails Hosting
 
 - A GitHub account (for the GitHub App and sign-in)
-- A model API key per user (Anthropic)
+- A model credential per user: a Claude subscription token, an Anthropic API key, or an OpenAI API key
 - Railway Sandboxes
 
 ### Deployment Dependencies

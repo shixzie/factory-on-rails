@@ -79,6 +79,10 @@ const TestLayer = Layer.mergeAll(
     allowedLogins: ["shixzie"],
     sessionTtlSeconds: 3600,
     railwayProjectId: Option.some("project-1"),
+    snapshots: [
+      { name: "snap-agents", logins: ["snapper"] },
+      { name: "node-base", logins: ["*"] },
+    ],
   }),
 ).pipe(
   Layer.provideMerge(InstanceSettings.Live),
@@ -184,6 +188,11 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(await json(res)).toEqual({
       user: { login: "me", name: null, avatarUrl: null },
       hasApiKey: false,
+      agents: [
+        { id: "claude", label: "Claude Code", ready: false },
+        { id: "codex", label: "Codex", ready: false },
+      ],
+      snapshot: null,
       installUrl: "https://github.com/apps/factory-on-rails/installations/new",
     });
   });
@@ -361,6 +370,52 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect((await send("DELETE", "/api/settings/keys/anthropic", cookie)).status).toBe(200);
       const rows = await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`select 1 from user_api_keys`));
       expect(rows).toHaveLength(0);
+    });
+  });
+
+  describe("agents and snapshots", () => {
+    it("needs the chosen agent's own key", async () => {
+      const { cookie } = await signIn("codexer", 11);
+      github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-api03-" + "a".repeat(30) });
+      const refused = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "codex" });
+      expect(refused.status).toBe(400);
+      expect(await json(refused)).toMatchObject({ code: "api_key_required", error: expect.stringContaining("Codex") });
+      expect((await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "gemini" })).status).toBe(400);
+
+      expect((await send("PUT", "/api/settings/keys/openai", cookie, { key: "sk-proj-" + "o".repeat(30) })).status).toBe(200);
+      const me = await json(request("/api/me", { headers: { cookie } }));
+      expect(me.agents.map((a: { ready: boolean }) => a.ready)).toEqual([true, true]);
+      const ok = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "codex" });
+      expect(ok.status).toBe(201);
+      expect((await json(ok)).agent).toBe("codex");
+    });
+
+    it("offers each user only their snapshots, and lets one stand in for a key", async () => {
+      const snapper = await signIn("snapper", 12);
+      const other = await signIn("other-snapper", 13);
+      expect(await json(request("/api/settings/snapshot", { headers: { cookie: snapper.cookie } }))).toEqual({
+        available: ["snap-agents", "node-base"],
+        selected: null,
+      });
+      expect(await json(request("/api/settings/snapshot", { headers: { cookie: other.cookie } }))).toEqual({
+        available: ["node-base"],
+        selected: null,
+      });
+      expect((await send("PUT", "/api/settings/snapshot", other.cookie, { snapshot: "snap-agents" })).status).toBe(400);
+      expect((await send("PUT", "/api/settings/snapshot", other.cookie, { snapshot: "run-anything" })).status).toBe(400);
+
+      const saved = await send("PUT", "/api/settings/snapshot", snapper.cookie, { snapshot: "snap-agents" });
+      expect(await json(saved)).toEqual({ available: ["snap-agents", "node-base"], selected: "snap-agents" });
+      const me = await json(request("/api/me", { headers: { cookie: snapper.cookie } }));
+      expect(me).toMatchObject({ hasApiKey: true, snapshot: "snap-agents" });
+
+      github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];
+      const ok = await post("/api/runs", snapper.cookie, { installationId: 1, repo: "shixzie/demo", task: "x" });
+      expect(ok.status).toBe(201);
+
+      await send("PUT", "/api/settings/snapshot", snapper.cookie, { snapshot: null });
+      expect((await json(request("/api/me", { headers: { cookie: snapper.cookie } }))).hasApiKey).toBe(false);
     });
   });
 

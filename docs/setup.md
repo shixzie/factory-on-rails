@@ -124,7 +124,17 @@ IaC). To restrict it, change that value to a comma-separated list of logins.
 
 There is no platform-wide model API key. The factory is bring-your-own-key:
 each user saves their own key under **Settings** in the web app, and only their
-runs use it.
+runs use it. Runs use Claude Code or Codex, picked per run in the composer:
+
+| Agent | Credential in Settings | What it bills |
+|---|---|---|
+| Claude Code | Claude subscription token (`claude setup-token`) | Your Pro, Max, Team or Enterprise plan |
+| Claude Code | Anthropic API key | Your Anthropic Console account |
+| Codex | OpenAI API key | Your OpenAI Platform account |
+
+A run gets only its agent's credential. With both saved, Claude Code gets the
+subscription token (it would prefer an API key if it had both). An agent can
+also run on the sign-in inside a sandbox snapshot (step 7).
 
 ## 6. Smoke test
 
@@ -133,6 +143,71 @@ Open the site, sign in with GitHub, save your Anthropic API key under
 a small task ("Add a CONTRIBUTING.md with a short how-to-run section"). You
 should see the sandbox come up in the `agents` environment's Sandboxes tab,
 the log stream on the run page, and a PR on the repository when it finishes.
+
+## 7. Sandbox snapshots (optional)
+
+A snapshot is a sandbox prepared once by hand and saved as a Railway
+checkpoint in the `agents` environment. Runs of the users it is declared for
+boot from it instead of a blank sandbox. Use one to have Codex (or Claude Code)
+signed in to your ChatGPT or Claude subscription, or to preinstall
+toolchains a repository needs. For Claude Code alone you don't need one: save
+a subscription token in Settings instead.
+
+Railway's standard sandbox image already has git, Node and the common coding
+agents; the runner installs Claude Code or Codex if a snapshot lacks them.
+
+1. Start a sandbox in `agents` and open a shell in it. `ssh` needs an SSH key
+   on your Railway account (Account Settings → SSH Keys); the dashboard's
+   Sandboxes tab can open one in the browser instead.
+
+   ```bash
+   railway link                     # project factory-on-rails
+   railway sandbox create -e agents --idle-timeout-minutes 60
+   railway sandbox ssh -e agents
+   ```
+
+2. In that shell, set it up as the agent should find it:
+
+   - Codex with ChatGPT: `codex login --device-auth`, then open the link it
+     prints on any device and enter the code. `codex login status` confirms it.
+   - Claude Code with your plan: run `claude`, type `/login`, open the link
+     and paste the code back. (Or skip this and use the token in Settings.)
+   - Anything else runs need: toolchains, package caches, global config.
+
+   Stay out of `/workspace/repo`, which is where each run clones its
+   repository. Then `exit`.
+
+3. Save it and remove the sandbox (reusing a name replaces that checkpoint,
+   which is also how you update one):
+
+   ```bash
+   railway sandbox checkpoint create shixzie-agents -e agents
+   railway sandbox destroy -e agents
+   ```
+
+4. Declare who may use it in `SANDBOX_SNAPSHOTS` in `.railway/railway.ts`
+   (both the harness and the runner read it) and merge the PR: entries are
+   `name=login|login`, comma-separated, and `*` means everyone. A snapshot
+   holds the sign-in of whoever prepared it, and every run that boots from it
+   can use that account, so list only that person unless it has no
+   credentials in it.
+
+5. In the web app, **Settings → Sandbox snapshot**, pick it. New sandboxes for
+   your runs boot from it; an agent with no key saved in Settings uses the
+   sign-in in the snapshot, and a saved key takes precedence.
+
+Good to know:
+
+- A sandbox from a checkpoint runs in the region the checkpoint was captured
+  in, and the CLI creates sandboxes in us-west2, so runs from a CLI-made
+  snapshot run there rather than next to the factory.
+- Snapshots count toward the same per-environment checkpoint limit as stopped
+  runs (50 on Hobby, 100 on Pro).
+- If runs from a snapshot start failing to authenticate (a login expired),
+  redo steps 1 to 3 with the same name.
+- `SANDBOX_CHECKPOINT` on the runner still names a base every run starts from
+  when its user hasn't picked a snapshot. It is for everyone, so it must not
+  hold anyone's sign-in.
 
 ## Local development
 

@@ -57,10 +57,12 @@ do, and the app walks you through it on its setup page:
    it. The factory uses it once to create an empty `agents` environment in the
    project and a token that can only reach that environment, then forgets it;
    you can delete the token afterwards.
-6. **Save your model API key** under **Settings** and start a run.
+6. **Save your agent credential** under **Settings** (a Claude subscription
+   token or Anthropic API key for Claude Code, an OpenAI API key for Codex)
+   and start a run.
 
 Costs: services and sandboxes are billed to the Railway workspace you deploy
-into; each user's model usage goes to their own API key. To open sign-in to
+into; each user's model usage goes to their own key or subscription. To open sign-in to
 any GitHub account, set `ALLOWED_GITHUB_LOGINS` to `*` on the `harness` service
 after setup.
 

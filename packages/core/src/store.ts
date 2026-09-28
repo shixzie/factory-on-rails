@@ -23,6 +23,8 @@ export interface UserRow {
   access_token_expires_at: Date | null;
   refresh_token_enc: string | null;
   refresh_token_expires_at: Date | null;
+  /** The sandbox snapshot the user's runs start from (see SANDBOX_SNAPSHOTS); null for the platform default. */
+  sandbox_snapshot: string | null;
 }
 
 export type UserTokenColumns = Pick<
@@ -37,6 +39,8 @@ export interface RunRow {
   installation_id: string;
   base_branch: string;
   task: string;
+  /** The coding agent: `claude` or `codex` (see AGENTS). */
+  agent: string;
   status: RunStatus;
   branch: string | null;
   sandbox_id: string | null;
@@ -122,14 +126,16 @@ export type RunPatch = Partial<
 
 export interface StoreService {
   // users & sessions
-  readonly upsertUser: (u: Omit<UserRow, "id" | "github_id"> & { github_id: number }) => Q<UserRow>;
+  readonly upsertUser: (u: Omit<UserRow, "id" | "github_id" | "sandbox_snapshot"> & { github_id: number }) => Q<UserRow>;
+  readonly getUser: (userId: string) => Q<Option.Option<UserRow>>;
+  readonly setSandboxSnapshot: (userId: string, snapshot: string | null) => Q<void>;
   readonly updateUserTokens: (userId: string, t: UserTokenColumns) => Q<void>;
   readonly createSession: (tokenHash: string, userId: string, ttlSeconds: number) => Q<void>;
   readonly userForSession: (tokenHash: string) => Q<Option.Option<UserRow>>;
   readonly deleteSession: (tokenHash: string) => Q<void>;
   // runs
   readonly enqueueRun: (
-    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & { installation_id: number },
+    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & { installation_id: number; agent?: string },
   ) => Q<RunRow>;
   readonly listRuns: (userId: string, limit?: number) => Q<ReadonlyArray<RunRow>>;
   readonly getRun: (id: string) => Q<Option.Option<RunRow>>;
@@ -210,6 +216,11 @@ const make = Effect.gen(function* () {
           updated_at = now()
         returning *`.pipe(Effect.map((rows) => rows[0]!)),
 
+    getUser: (userId) => sql<UserRow>`select * from users where id = ${userId}`.pipe(Effect.map(Arr.head)),
+
+    setSandboxSnapshot: (userId, snapshot) =>
+      sql`update users set sandbox_snapshot = ${snapshot}, updated_at = now() where id = ${userId}`.pipe(Effect.asVoid),
+
     updateUserTokens: (userId, t) =>
       sql`update users set ${sql.update(t)}, updated_at = now() where id = ${userId}`.pipe(Effect.asVoid),
 
@@ -227,7 +238,7 @@ const make = Effect.gen(function* () {
 
     enqueueRun: (r) =>
       Effect.gen(function* () {
-        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert(r)} returning *`;
+        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert({ ...r, agent: r.agent ?? "claude" })} returning *`;
         yield* notifyQueued(row!.id);
         return row!;
       }),

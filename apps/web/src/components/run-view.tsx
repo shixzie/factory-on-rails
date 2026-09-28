@@ -26,6 +26,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useFollow } from "@/hooks/use-follow";
 import { openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
@@ -58,7 +59,9 @@ function MessageComposer({
   hint,
   disabled,
   sending,
+  stopping,
   onSend,
+  onStop,
 }: {
   question: boolean;
   live: boolean;
@@ -66,11 +69,16 @@ function MessageComposer({
   hint?: string;
   disabled: boolean;
   sending: boolean;
+  stopping: boolean;
   onSend: (text: string) => Promise<boolean>;
+  onStop: () => void;
 }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
-  const canSend = !disabled && !sending && text.trim().length > 0;
+  const empty = text.trim().length === 0;
+  const canSend = !disabled && !sending && !empty;
+  // With nothing typed, a live run's send button stops it instead, as in t3code.
+  const showStop = live && empty && !sending;
   useEffect(() => {
     if (question) ref.current?.focus();
   }, [question]);
@@ -120,9 +128,29 @@ function MessageComposer({
           <Kbd>⌘</Kbd>
           <Kbd>↵</Kbd>
         </span>
-        <Button type="submit" size="icon-sm" className="rounded-full" disabled={!canSend} aria-label="Send to the agent">
-          {sending ? <Spinner /> : <ArrowUpIcon />}
-        </Button>
+        {showStop ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  className="rounded-full"
+                  onClick={onStop}
+                  disabled={stopping}
+                  aria-label="Stop the run"
+                />
+              }
+            >
+              {stopping ? <Spinner /> : <SquareIcon className="size-3 fill-current" />}
+            </TooltipTrigger>
+            <TooltipContent>{stopping ? "Stopping…" : "Stop the run"}</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Button type="submit" size="icon-sm" className="rounded-full" disabled={!canSend} aria-label="Send to the agent">
+            {sending ? <Spinner /> : <ArrowUpIcon />}
+          </Button>
+        )}
       </div>
     </form>
   );
@@ -420,6 +448,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground" suppressHydrationWarning>
                   <span>{run.repo}</span>
                   <span>·</span>
+                  <span>{Api.AGENT_LABELS[run.agent]}</span>
+                  <span>·</span>
                   <GitBranchIcon className="size-3" />
                   <span>{run.branch ? `${run.baseBranch} ← ${run.branch}` : run.baseBranch}</span>
                   <span>·</span>
@@ -472,7 +502,9 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
               hint={sandboxHint(run.sandboxState)}
               disabled={run.status === "cancelling"}
               sending={sending}
+              stopping={cancelling || run.status === "cancelling"}
               onSend={send}
+              onStop={cancel}
             />
             {!active ? (
               <p className="mx-auto mt-2 max-w-3xl px-1 text-center text-[11px] text-muted-foreground/80">

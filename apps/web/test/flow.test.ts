@@ -78,5 +78,8 @@ describe("flow", () => {
     expect(describeCall("Bash", { command: "pnpm test", description: "Run the tests" })).toBe("Run the tests");
     expect(describeCall("Bash", { command: "pnpm test" })).toBe("Running pnpm test");
     expect(describeCall("mcp__linear__search", {})).toBe("Using linear search");
+    // Codex's patches (see apps/runner/src/codex-stream.ts).
+    expect(describeCall("FileChange", { changes: [{ path: "/workspace/repo/README.md", kind: "add" }] })).toBe("Editing README.md");
+    expect(describeCall("FileChange", { changes: [{ path: "a", kind: "update" }, { path: "b", kind: "update" }] })).toBe("Editing 2 files");
   });
 });

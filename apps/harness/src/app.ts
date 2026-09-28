@@ -1,6 +1,9 @@
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import {
+  agentCredential,
+  AGENTS,
   Api,
+  DEFAULT_AGENT,
   GitHubError,
   GitHubUserApi,
   InstanceSettings,
@@ -10,6 +13,8 @@ import {
   Store,
   TokenCipher,
   validateApiKey,
+  snapshotsFor,
+  type AgentId,
   type ModelProvider,
   type RunEventRow,
   type RunRow,
@@ -43,6 +48,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   repo: r.repo_full_name,
   baseBranch: r.base_branch,
   task: r.task,
+  agent: r.agent === "codex" ? "codex" : "claude",
   status: r.status,
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
@@ -111,12 +117,42 @@ const keySlots = (user: UserRow) =>
       return {
         provider,
         label: meta.label,
+        description: meta.description,
+        agent: (Object.keys(AGENTS) as AgentId[]).find((a) => (AGENTS[a].providers as ReadonlyArray<string>).includes(provider))!,
         placeholder: meta.placeholder,
-        consoleUrl: meta.consoleUrl,
+        consoleUrl: meta.helpUrl,
+        consoleLabel: meta.helpLabel,
         saved: key ? { hint: key.hint, updatedAt: key.updated_at } : null,
       };
     });
   });
+
+/** The snapshots this user may start runs from, and the one they picked if it is still theirs to use. */
+const snapshotSettings = (user: UserRow) =>
+  Effect.map(HarnessConfig, ({ snapshots }): Api.SnapshotSettings => {
+    const available = snapshotsFor(snapshots, user.github_login);
+    return { available, selected: user.sandbox_snapshot && available.includes(user.sandbox_snapshot) ? user.sandbox_snapshot : null };
+  });
+
+/**
+ * Which agents this user can start a run with: one needs a saved credential,
+ * or a sandbox snapshot, which can carry the agent's own sign-in.
+ */
+const agentsFor = (user: UserRow) =>
+  Effect.gen(function* () {
+    const saved = (yield* (yield* Store).listApiKeys(user.id)).map((k) => k.provider);
+    const { selected } = yield* snapshotSettings(user);
+    return (Object.keys(AGENTS) as AgentId[]).map(
+      (id): Api.ApiAgent => ({ id, label: AGENTS[id].label, ready: selected !== null || agentCredential(id, saved) !== undefined }),
+    );
+  });
+
+const agentNotReady = (agent: AgentId) =>
+  fail(
+    400,
+    "api_key_required",
+    `Add a key for ${AGENTS[agent].label} in Settings, or pick a sandbox snapshot, before starting a run with it.`,
+  );
 
 /** A run owned by the signed-in user, or a 404. */
 const ownedRun = Effect.gen(function* () {
@@ -155,10 +191,12 @@ export const router = HttpRouter.empty.pipe(
     "/api/me",
     Effect.gen(function* () {
       const user = yield* requireUser;
-      const keys = yield* (yield* Store).listApiKeys(user.id);
+      const agents = yield* agentsFor(user);
       return yield* json(Api.Me)({
         user: { login: user.github_login, name: user.name, avatarUrl: user.avatar_url },
-        hasApiKey: keys.length > 0,
+        hasApiKey: agents.some((a) => a.ready),
+        agents,
+        snapshot: (yield* snapshotSettings(user)).selected,
         installUrl: yield* installUrl,
       });
     }),
@@ -232,6 +270,25 @@ export const router = HttpRouter.empty.pipe(
     }),
   ),
 
+  // ---- sandbox snapshot -----------------------------------------------------------
+  HttpRouter.get(
+    "/api/settings/snapshot",
+    Effect.flatMap(requireUser, snapshotSettings).pipe(Effect.flatMap(json(Api.SnapshotSettings))),
+  ),
+
+  HttpRouter.put(
+    "/api/settings/snapshot",
+    Effect.gen(function* () {
+      const user = yield* requireUser;
+      const { snapshot } = yield* HttpServerRequest.schemaBodyJson(Api.SaveSnapshotBody);
+      if (snapshot !== null && !(yield* snapshotSettings(user)).available.includes(snapshot)) {
+        return yield* fail(400, "bad_request", "That snapshot isn't available to you.");
+      }
+      yield* (yield* Store).setSandboxSnapshot(user.id, snapshot);
+      return yield* json(Api.SnapshotSettings)(yield* snapshotSettings({ ...user, sandbox_snapshot: snapshot }));
+    }),
+  ),
+
   // ---- runs ---------------------------------------------------------------------
   HttpRouter.get(
     "/api/runs",
@@ -250,9 +307,8 @@ export const router = HttpRouter.empty.pipe(
       const body = yield* HttpServerRequest.schemaBodyJson(Api.CreateRunBody);
       const task = body.task.trim();
       if (!body.repo || !task) return yield* fail(400, "bad_request", "Pick a repository and describe the task.");
-      if ((yield* store.listApiKeys(user.id)).length === 0) {
-        return yield* fail(400, "api_key_required", "Add your model API key in Settings before starting a run.");
-      }
+      const agent = body.agent ?? DEFAULT_AGENT;
+      if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
       if (!(yield* (yield* InstanceSettings).sandboxesReady).ready) {
         return yield* fail(400, "setup_required", "Sandboxes aren't set up yet. Finish setup at /setup first.");
       }
@@ -269,6 +325,7 @@ export const router = HttpRouter.empty.pipe(
         installation_id: repo.installationId,
         base_branch: body.baseBranch?.trim() || repo.defaultBranch,
         task,
+        agent,
       });
       return yield* json(Api.ApiRun)(toApiRun(run), 201);
     }),
@@ -315,9 +372,8 @@ export const router = HttpRouter.empty.pipe(
         yield* store.addUserMessage(run.id, text);
       } else {
         // A finished run: the message starts the next turn, in the same sandbox when it is still there.
-        if ((yield* store.listApiKeys(user.id)).length === 0) {
-          return yield* fail(400, "api_key_required", "Add your model API key in Settings before continuing a run.");
-        }
+        const agent = toApiRun(run).agent;
+        if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
         yield* store.continueRun(run.id, text);
       }
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);

@@ -72,6 +72,8 @@ export interface FakeSandbox {
   files: Record<string, string>;
   modes: Record<string, number | undefined>;
   createdWith?: Record<string, string>;
+  /** The snapshot a new sandbox was created from, if any. */
+  createdFrom?: string;
   /** The checkpoint name a sandbox was booted from. */
   restoredFrom?: string;
   /** Sandboxes that exist right now, by id. */
@@ -152,11 +154,12 @@ export const fakeSandboxes = (
   let created = 0;
   let checkpointed = 0;
   const layer = Layer.succeed(Sandboxes, {
-    create: (env) =>
+    create: (env, snapshot) =>
       failCreate
         ? Effect.fail(new SandboxError({ message: failCreate }))
         : Effect.sync(() => {
             state.createdWith = env;
+            state.createdFrom = snapshot;
             const id = `sbx_${++created}`;
             state.alive.add(id);
             return handle(id);

@@ -10,8 +10,8 @@ export const metadata: Metadata = { title: "New run" };
 
 async function NewRunComposer() {
   const [me, { repos, error }, runs] = await Promise.all([getMe(), getRepos(), getRuns()]);
-  // Runs come newest first, so start on the repository used last.
-  return <Composer me={me} repos={repos} reposError={error} defaultRepo={runs[0]?.repo} autoFocus />;
+  // Runs come newest first, so start on the repository and agent used last.
+  return <Composer me={me} repos={repos} reposError={error} defaultRepo={runs[0]?.repo} defaultAgent={runs[0]?.agent} autoFocus />;
 }
 
 export default function NewRunPage() {

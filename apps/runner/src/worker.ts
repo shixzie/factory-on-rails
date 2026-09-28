@@ -1,9 +1,14 @@
 import { PgClient } from "@effect/sql-pg";
 import {
-  isModelProvider,
+  agentCredential,
+  AGENTS,
+  DEFAULT_AGENT,
+  isAgentId,
   MODEL_PROVIDERS,
+  snapshotsFor,
   Store,
   TokenCipher,
+  type AgentId,
   type RunRow,
   type RunSandbox,
 } from "@factory/core";
@@ -14,19 +19,38 @@ import { SCRUB_SCRIPT, withHome } from "./plan.js";
 import { makeRunLog } from "./run-log.js";
 import { Sandboxes } from "./sandbox.js";
 
-const NO_KEY =
-  "No usable API key saved. Add or re-save your key in Settings, then start the run again.";
+const noKey = (agent: AgentId) =>
+  `No usable key for ${AGENTS[agent].label}. Add or re-save it in Settings (or pick a sandbox snapshot that is signed in), then send a message to try again.`;
 
-/** Decrypts the run owner's own API keys into the env vars their agent reads. */
-const userKeyEnv = (userId: string) =>
+/**
+ * Decrypts the one credential of the run owner's that their agent should use
+ * (see AGENTS) into the env var it reads. Only that one goes in: Claude Code,
+ * for one, would pick an API key over a subscription token.
+ */
+const userKeyEnv = (userId: string, agent: AgentId) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const cipher = yield* TokenCipher;
-    const env: Record<string, string> = {};
-    for (const { provider, key_enc } of yield* store.encryptedApiKeys(userId)) {
-      if (isModelProvider(provider)) env[MODEL_PROVIDERS[provider].envVar] = yield* cipher.decrypt(key_enc);
-    }
-    return env;
+    const keys = yield* store.encryptedApiKeys(userId);
+    const provider = agentCredential(agent, keys.map((k) => k.provider));
+    const key = keys.find((k) => k.provider === provider);
+    if (!provider || !key) return {};
+    return { [MODEL_PROVIDERS[provider].envVar]: yield* cipher.decrypt(key.key_enc) };
+  });
+
+/**
+ * The sandbox snapshot the run owner picked, if SANDBOX_SNAPSHOTS still lets
+ * them use it. One taken away since is an error rather than silently ignored:
+ * it may be what signs their agent in.
+ */
+const userSnapshot = (userId: string) =>
+  Effect.gen(function* () {
+    const config = yield* RunnerConfig;
+    const user = yield* (yield* Store).getUser(userId);
+    const picked = Option.getOrUndefined(user)?.sandbox_snapshot ?? null;
+    if (Option.isNone(user) || picked === null) return { snapshot: undefined };
+    if (snapshotsFor(config.snapshots, user.value.github_login).includes(picked)) return { snapshot: picked };
+    return { snapshot: undefined, error: `The sandbox snapshot ${picked} is no longer available to you. Pick another one in Settings, then send a message to try again.` };
   });
 
 export const handleRun = (run: RunRow) =>
@@ -36,21 +60,35 @@ export const handleRun = (run: RunRow) =>
     const log = yield* makeRunLog(run.id);
     yield* log.info(`Claimed by runner ${config.workerId}`);
 
-    const keyEnv = yield* userKeyEnv(run.user_id).pipe(
+    const agent = isAgentId(run.agent) ? run.agent : DEFAULT_AGENT;
+    const fail = (error: string) =>
+      Effect.gen(function* () {
+        yield* log.error(error);
+        yield* log.flush;
+        yield* store.finishRun(run.id, "failed", error);
+      });
+
+    const { snapshot, error: snapshotError } = yield* userSnapshot(run.user_id);
+    if (snapshotError) return yield* fail(snapshotError);
+    const keyEnv = yield* userKeyEnv(run.user_id, agent).pipe(
       Effect.tapErrorCause((cause) => Effect.logError("Could not decrypt API keys", cause)),
       Effect.orElseSucceed((): Record<string, string> => ({})),
     );
-    if (Object.keys(keyEnv).length === 0) {
-      yield* log.error(NO_KEY);
-      yield* log.flush;
-      return yield* store.finishRun(run.id, "failed", NO_KEY);
-    }
+    // A snapshot can carry the agent's own sign-in, so it may stand in for a key.
+    if (Object.keys(keyEnv).length === 0 && !snapshot) return yield* fail(noKey(agent));
     Object.values(keyEnv).forEach(log.addSecret);
+    if (Object.keys(keyEnv).length === 0) yield* log.info(`No key saved for ${AGENTS[agent].label}, so it uses the sign-in in snapshot ${snapshot}`);
 
     const outcome = yield* executeRun(run, {
       log,
       // The user's own keys win over any platform-level passthrough of the same name.
-      agent: { ...config.agent, env: { ...config.agent.passthroughEnv, ...keyEnv } },
+      agent: {
+        id: agent,
+        ...config.agent.commands[agent],
+        timeoutSec: config.agent.timeoutSec,
+        env: { ...config.agent.passthroughEnv, ...keyEnv },
+      },
+      snapshot,
       git: config.git,
       harnessUrl: config.harnessUrl,
       heartbeatEvery: config.heartbeatInterval,

@@ -27,7 +27,7 @@ import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { answerText, isSubagentTool, repoPath, type Block, type ToolCall, type WorkItem } from "@/lib/activity";
-import { compact, describeCall, KIND_COLOR, laneColor, toolKind } from "@/lib/flow";
+import { compact, describeCall, fileChanges, KIND_COLOR, laneColor, toolKind } from "@/lib/flow";
 import { replacementLines, type DiffLine } from "@/lib/diff";
 import { ago, duration } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -195,6 +195,35 @@ function ToolLine({ call, live, latestPlan }: { call: ToolCall; live: boolean; l
           meta={<DiffStat additions={lines.length} deletions={0} />}
         >
           {result?.isError ? output : <DiffBox lines={lines} />}
+        </Expandable>
+      );
+    }
+    case "FileChange": {
+      // Codex reports which files a patch touched, not the lines; the Diff panel has those.
+      const changes = fileChanges(input);
+      const verb = { add: "Added", delete: "Deleted", update: "Edited" } as Record<string, string>;
+      const label =
+        changes.length === 1 ? (
+          <>
+            {verb[changes[0]!.kind] ?? "Changed"} <Path path={changes[0]!.path} />
+          </>
+        ) : (
+          `Changed ${changes.length} files`
+        );
+      return (
+        <Expandable {...common} icon={changes.every((c) => c.kind === "add") ? <FilePlusIcon /> : <PencilIcon />} label={label}>
+          {result?.isError ? (
+            output
+          ) : changes.length > 1 ? (
+            <ul className="space-y-0.5 text-xs">
+              {changes.map((c) => (
+                <li key={c.path} className="flex gap-2">
+                  <span className="w-14 shrink-0 text-muted-foreground">{verb[c.kind] ?? "Changed"}</span>
+                  <Path path={c.path} />
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </Expandable>
       );
     }
