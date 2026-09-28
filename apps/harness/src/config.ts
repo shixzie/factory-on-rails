@@ -1,4 +1,4 @@
-import { listConfig, previewSigningKeyConfig } from "@factory/core";
+import { listConfig, previewSigningKeyConfig, snapshotsConfig, type SandboxSnapshot } from "@factory/core";
 import { Config, Context, Effect, Layer, Option, Redacted } from "effect";
 
 export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
@@ -12,6 +12,10 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
      */
     readonly allowedLogins: ReadonlyArray<string>;
     readonly sessionTtlSeconds: number;
+    /** Sandbox snapshots users may start their runs from, and who may use each (SANDBOX_SNAPSHOTS). */
+    readonly snapshots: ReadonlyArray<SandboxSnapshot>;
+    /** The Railway project this runs in (Railway sets it), where the setup page creates the sandbox environment. */
+    readonly railwayProjectId: Option.Option<string>;
     /** Where previews of sandbox ports are served; none when the preview gateway isn't set up. */
     readonly preview: Option.Option<{ readonly domain: string; readonly signingKey: Redacted.Redacted<string> }>;
   }
@@ -48,11 +52,15 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
       if (Option.isSome(previewDomain) && Option.isNone(previewKey)) {
         yield* Effect.logWarning("PREVIEW_DOMAIN is set but PREVIEW_SIGNING_KEY is missing or shorter than 32 characters: previews are off.");
       }
+      const { snapshots, errors } = yield* snapshotsConfig;
+      for (const error of errors) yield* Effect.logWarning(`SANDBOX_SNAPSHOTS: ${error}`);
       return {
+        snapshots,
         preview,
         publicUrl: publicUrl.replace(/\/$/, ""),
         allowedLogins,
         sessionTtlSeconds: yield* Config.integer("SESSION_TTL_SECONDS").pipe(Config.withDefault(7 * 24 * 3600)),
+        railwayProjectId: yield* Config.option(Config.nonEmptyString("RAILWAY_PROJECT_ID")),
       };
     }),
   );

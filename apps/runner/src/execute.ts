@@ -1,8 +1,9 @@
-import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type RunRow } from "@factory/core";
+import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type RunRow } from "@factory/core";
 import { Data, Duration, Effect, Option, Redacted, Schedule } from "effect";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
-import type { AgentSettings, PreviewSettings } from "./config.js";
+import { makeCodexParser } from "./codex-stream.js";
+import type { AgentCommands, PreviewSettings } from "./config.js";
 import {
   AGENT_RAN_FILE,
   branchName,
@@ -46,8 +47,13 @@ export type RunOutcome =
 
 export interface ExecuteOptions {
   readonly log: RunLog;
-  /** Agent settings plus the env (the user's own keys) every sandbox gets. */
-  readonly agent: Omit<AgentSettings, "passthroughEnv"> & { readonly env: Record<string, string> };
+  /**
+   * The run's agent (Claude Code unless `id` says Codex), how to install and
+   * run it, and the env (the user's own keys) every sandbox gets.
+   */
+  readonly agent: AgentCommands & { readonly id?: AgentId; readonly timeoutSec: number; readonly env: Record<string, string> };
+  /** The prepared checkpoint a new sandbox boots from (the user's sandbox snapshot), if any. */
+  readonly snapshot?: string;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
   readonly harnessUrl: Option.Option<string>;
   /** Starts the sandbox's preview agent each turn when set. */
@@ -63,7 +69,7 @@ export interface ExecuteOptions {
  * The sandbox for this turn: the one the last turn left running, a new one
  * booted from the checkpoint of a stopped one, or a fresh one.
  */
-const acquireSandbox = (run: RunRow, env: Record<string, string>, log: RunLog) =>
+const acquireSandbox = (run: RunRow, env: Record<string, string>, snapshot: string | undefined, log: RunLog) =>
   Effect.gen(function* () {
     const sandboxes = yield* Sandboxes;
     if (run.sandbox_state === "running" && run.sandbox_id) {
@@ -86,8 +92,8 @@ const acquireSandbox = (run: RunRow, env: Record<string, string>, log: RunLog) =
       if (restored._tag === "Right") return { sandbox: restored.right, origin: "restored" as SandboxOrigin };
       yield* log.info(`${restored.left.message}. Starting a new sandbox from the branch instead`);
     }
-    yield* log.info("Creating Railway sandbox");
-    return { sandbox: yield* sandboxes.create(env), origin: "new" as SandboxOrigin };
+    yield* log.info(snapshot ? `Creating Railway sandbox from snapshot ${snapshot}` : "Creating Railway sandbox");
+    return { sandbox: yield* sandboxes.create(env, snapshot), origin: "new" as SandboxOrigin };
   });
 
 /** Opens the run's pull request, or finds it already open from an earlier turn. */
@@ -121,7 +127,7 @@ const openPullRequest = (run: RunRow, token: Redacted.Redacted<string>, branch: 
  */
 const work = (
   run: RunRow,
-  { log, agent, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions,
+  { log, agent, snapshot, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions,
 ) =>
   Effect.gen(function* () {
     const sandboxes = yield* Sandboxes;
@@ -153,7 +159,7 @@ const work = (
 
     // Kept for the next turn once it holds the checkout; destroyed if it never gets that far.
     let keep = false;
-    const { sandbox, origin } = yield* Effect.acquireRelease(acquireSandbox(run, { ...agent.env, IS_SANDBOX: "1" }, log), ({ sandbox }) =>
+    const { sandbox, origin } = yield* Effect.acquireRelease(acquireSandbox(run, { ...agent.env, IS_SANDBOX: "1" }, snapshot, log), ({ sandbox }) =>
       keep
         ? Effect.void
         : sandboxes.destroy(sandbox.id).pipe(
@@ -247,17 +253,21 @@ const work = (
     // events, the questions it is waiting on, and whether files may have changed.
     const asking = new Set<string>();
     let filesMayHaveChanged = false;
-    const stream = makeAgentStream({
-      event: (e) => {
-        if (e.kind === "tool_call" && e.data?.name === ASK_USER_TOOL) asking.add(String(e.data.id));
-        if (e.kind === "tool_result") {
-          asking.delete(String(e.data?.toolUseId));
-          filesMayHaveChanged = true;
-        }
-        log.push(e.kind, e.message, e.data);
+    const stream = makeAgentStream(
+      {
+        event: (e) => {
+          if (e.kind === "tool_call" && e.data?.name === ASK_USER_TOOL) asking.add(String(e.data.id));
+          if (e.kind === "tool_result") {
+            asking.delete(String(e.data?.toolUseId));
+            filesMayHaveChanged = true;
+          }
+          log.push(e.kind, e.message, e.data);
+        },
+        output: log.push,
       },
-      output: log.push,
-    });
+      // Codex prints its own JSON events; everything else is read as Claude Code's stream-json.
+      agent.id === "codex" ? makeCodexParser() : undefined,
+    );
 
     // Hands the user's messages to the agent (see agent-tools.ts) and keeps
     // `awaiting_input` in step with the agent's open questions.

@@ -12,6 +12,11 @@ export type RunStatus = typeof RunStatus.Type;
 export const SandboxState = Schema.Literal("none", "running", "stopping", "stopped", "deleted");
 export type SandboxState = typeof SandboxState.Type;
 
+/** The coding agent a run uses; see `AGENTS` in providers.ts. */
+export const AgentId = Schema.Literal("claude", "codex");
+export type AgentId = typeof AgentId.Type;
+export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex" };
+
 /** A finished run's sandbox is stopped (checkpointed, then destroyed) after this long without activity. */
 export const SANDBOX_IDLE_STOP_MINUTES = 5;
 /** A run with no activity for this long is deleted, with its sandbox. */
@@ -24,10 +29,25 @@ export const ApiUser = Schema.Struct({
 });
 export type ApiUser = typeof ApiUser.Type;
 
+/** An agent a user can pick for a run, and whether they can start one with it. */
+export const ApiAgent = Schema.Struct({
+  id: AgentId,
+  label: Schema.String,
+  /** The user saved a credential for it, or picked a sandbox snapshot that can carry one. */
+  ready: Schema.Boolean,
+});
+export type ApiAgent = typeof ApiAgent.Type;
+
 /** The signed-in user and what the UI needs to know before it can start a run. */
 export const Me = Schema.Struct({
   user: ApiUser,
+  /** At least one agent is ready, so a run can start. */
   hasApiKey: Schema.Boolean,
+  agents: Schema.optionalWith(Schema.Array(ApiAgent), {
+    default: () => [{ id: "claude" as const, label: "Claude Code", ready: false }],
+  }),
+  /** The sandbox snapshot the user's runs start from, if they picked one. */
+  snapshot: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   /** Where to install the GitHub App or grant it more repositories. */
   installUrl: Schema.String,
 });
@@ -54,6 +74,7 @@ export const ApiRun = Schema.Struct({
   repo: Schema.String,
   baseBranch: Schema.String,
   task: Schema.String,
+  agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
   pullRequestUrl: Schema.NullOr(Schema.String),
@@ -141,8 +162,13 @@ export type SendMessageBody = typeof SendMessageBody.Type;
 export const ApiKeySlot = Schema.Struct({
   provider: Schema.String,
   label: Schema.String,
+  description: Schema.optionalWith(Schema.String, { default: () => "" }),
+  /** The agent that uses it. */
+  agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   placeholder: Schema.String,
+  /** Where to get one. */
   consoleUrl: Schema.String,
+  consoleLabel: Schema.optionalWith(Schema.String, { default: () => "Get a key" }),
   saved: Schema.NullOr(Schema.Struct({ hint: Schema.String, updatedAt: Schema.Date })),
 });
 export type ApiKeySlot = typeof ApiKeySlot.Type;
@@ -152,6 +178,7 @@ export const CreateRunBody = Schema.Struct({
   repo: Schema.String,
   task: Schema.String,
   baseBranch: Schema.optional(Schema.String),
+  agent: Schema.optional(AgentId),
 });
 export type CreateRunBody = typeof CreateRunBody.Type;
 
@@ -181,9 +208,58 @@ export const SaveKeyBody = Schema.Struct({ key: Schema.String });
 export type SaveKeyBody = typeof SaveKeyBody.Type;
 
 /**
+ * The sandbox snapshots (prepared Railway checkpoints) this user may start
+ * runs from, and the one they picked. `null` means the platform's default.
+ */
+export const SnapshotSettings = Schema.Struct({
+  available: Schema.Array(Schema.String),
+  selected: Schema.NullOr(Schema.String),
+});
+export type SnapshotSettings = typeof SnapshotSettings.Type;
+
+export const SaveSnapshotBody = Schema.Struct({ snapshot: Schema.NullOr(Schema.String) });
+export type SaveSnapshotBody = typeof SaveSnapshotBody.Type;
+
+/**
+ * What a fresh deployment still needs, for the setup page (public: it works
+ * before anyone can sign in). A deployment configured with environment
+ * variables reports everything as ready.
+ */
+export const SetupStatus = Schema.Struct({
+  githubApp: Schema.NullOr(
+    Schema.Struct({
+      slug: Schema.String,
+      /** Configured with environment variables rather than created on the setup page. */
+      fromEnv: Schema.Boolean,
+      /** The account the setup page created it under. */
+      owner: Schema.NullOr(Schema.String),
+      installUrl: Schema.String,
+    }),
+  ),
+  sandboxes: Schema.Struct({ ready: Schema.Boolean, fromEnv: Schema.Boolean }),
+  /** The GitHub accounts named in ALLOWED_GITHUB_LOGINS, shown until the App exists (the App must belong to one). */
+  owners: Schema.Array(Schema.String),
+  /** The signed-in user, and whether they may finish setup (named in ALLOWED_GITHUB_LOGINS, or the App's owner). */
+  viewer: Schema.NullOr(Schema.Struct({ login: Schema.String, admin: Schema.Boolean })),
+});
+export type SetupStatus = typeof SetupStatus.Type;
+
+/** Creates the GitHub App under the signed-in GitHub account, or under an organization. */
+export const CreateGitHubAppBody = Schema.Struct({ organization: Schema.optional(Schema.String) });
+export type CreateGitHubAppBody = typeof CreateGitHubAppBody.Type;
+
+/** The form the browser posts to GitHub to register the App from its manifest. */
+export const GitHubAppForm = Schema.Struct({ action: Schema.String, manifest: Schema.String });
+export type GitHubAppForm = typeof GitHubAppForm.Type;
+
+/** A Railway account or workspace token, used once to set up the sandbox environment and never stored. */
+export const SetupSandboxesBody = Schema.Struct({ token: Schema.String });
+export type SetupSandboxesBody = typeof SetupSandboxesBody.Type;
+
+/**
  * Every non-2xx JSON answer. `code` is stable for the UI to branch on:
  * `unauthorized` (sign in), `reauth` (sign in again), `api_key_required`
- * (add a key in Settings), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
+ * (add a key for the agent in Settings, or pick a snapshot), `setup_required` (finish /setup), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
  */
 export const ApiError = Schema.Struct({ code: Schema.String, error: Schema.String });
 export type ApiError = typeof ApiError.Type;

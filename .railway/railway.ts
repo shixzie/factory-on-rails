@@ -34,6 +34,12 @@ export default defineRailway((ctx) => {
   const production = ctx.isEnvironment("production");
   const publicUrl = production ? "https://factory.shixzie.com" : "https://${{web.RAILWAY_PUBLIC_DOMAIN}}";
 
+  // Sandbox snapshots: prepared checkpoints in the agents environment that
+  // users can start their runs from (docs/setup.md, step 7). Entries are
+  // `name=login|login`, comma-separated, `*` for everyone. A snapshot holds
+  // the sign-in of whoever prepared it, so list only them unless it holds none.
+  const sandboxSnapshots = production ? "shixzie-agents=shixzie" : "";
+
   // Previews of servers running in sandboxes (packages/core/src/preview.ts):
   // each run's port gets its own origin, p<port>-<run>.preview.shixzie.com,
   // served by the preview gateway, which sandboxes dial out to at
@@ -72,6 +78,7 @@ export default defineRailway((ctx) => {
       // Any GitHub account can sign in (each user brings their own model key).
       // Set a comma-separated list of logins instead to restrict it.
       ALLOWED_GITHUB_LOGINS: "*",
+      SANDBOX_SNAPSHOTS: sandboxSnapshots,
     },
   });
 
@@ -117,6 +124,8 @@ export default defineRailway((ctx) => {
       SANDBOX_ENVIRONMENT_ID: ctx.shared.SANDBOX_ENVIRONMENT_ID,
       // Without a region Railway puts sandboxes in us-west2; keep them next to the factory.
       SANDBOX_REGION: "us-east4-eqdc4a",
+      // Checked again when a run starts, in case a snapshot was taken away.
+      SANDBOX_SNAPSHOTS: sandboxSnapshots,
       MAX_CONCURRENT_RUNS: ctx.isEnvironment("production") ? "5" : "1",
       ...previewEnv,
       ...inProduction({ PREVIEW_TUNNEL_URL: `wss://tunnel.${previewDomain}/connect` }),

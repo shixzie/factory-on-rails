@@ -27,6 +27,10 @@ export const cookieName = (publicUrl: string, name: string) => (publicUrl.starts
 /** `*` in the allowlist admits any GitHub account; otherwise logins match case-insensitively. */
 export const isAllowedLogin = (allowed: ReadonlyArray<string>, login: string): boolean =>
   allowed.includes("*") || allowed.includes(login.toLowerCase());
+
+/** Logins named in the allowlist itself: `*` lets anyone sign in, but names nobody. */
+export const namedLogins = (allowed: ReadonlyArray<string>): ReadonlyArray<string> => allowed.filter((l) => l !== "*");
+
 /** No signed-in user: send them to the sign-in page. */
 export class Unauthorized extends Data.TaggedError("Unauthorized") {}
 
@@ -36,14 +40,14 @@ export class ReauthRequired extends Data.TaggedError("ReauthRequired") {}
 /** Sign-in refused, with a message for the sign-in page. */
 export class LoginRejected extends Data.TaggedError("LoginRejected")<{ readonly status: 400 | 403; readonly message: string }> {}
 
-const baseCookieOptions = (publicUrl: string) => ({
+export const baseCookieOptions = (publicUrl: string) => ({
   httpOnly: true,
   secure: publicUrl.startsWith("https://"),
   sameSite: "lax" as const,
   path: "/",
 });
 
-const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
+export const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
   ...baseCookieOptions(publicUrl),
   maxAge: Duration.seconds(maxAgeSeconds),
 });
@@ -66,9 +70,11 @@ export const requireUser = Effect.flatMap(currentUser, Option.match({
 
 export const beginLogin = Effect.gen(function* () {
   const { publicUrl } = yield* HarnessConfig;
-  const github = yield* GitHubUserApi;
+  const app = yield* (yield* GitHubUserApi).app;
+  // Nothing to sign in with until the setup page has created the GitHub App.
+  if (Option.isNone(app)) return HttpServerResponse.redirect("/setup", { status: 302 });
   const state = randomToken(16);
-  return yield* HttpServerResponse.redirect(authorizeUrl(github.clientId, redirectUri(publicUrl), state)).pipe(
+  return yield* HttpServerResponse.redirect(authorizeUrl(app.value.clientId, redirectUri(publicUrl), state)).pipe(
     HttpServerResponse.setCookie(cookieName(publicUrl, STATE_COOKIE), state, cookieOptions(publicUrl, 600)),
   );
 });

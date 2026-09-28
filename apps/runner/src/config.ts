@@ -1,4 +1,4 @@
-import { Api, previewSigningKeyConfig } from "@factory/core";
+import { Api, previewSigningKeyConfig, snapshotsConfig, type AgentId, type SandboxSnapshot } from "@factory/core";
 import { Config, Context, Duration, Effect, Layer, Option, type Redacted } from "effect";
 import { hostname } from "node:os";
 
@@ -22,9 +22,35 @@ export const DEFAULT_AGENT_COMMAND = [
   '--append-system-prompt "$(cat "$FACTORY_SYSTEM_PROMPT_FILE")"',
 ].join(" ");
 
-export interface AgentSettings {
+export const DEFAULT_CODEX_SETUP = "command -v codex >/dev/null 2>&1 || npm install -g @openai/codex";
+/**
+ * Codex in non-interactive mode, printing JSON events (see codex-stream.ts).
+ * The factory's ask-the-user server, inbox hooks and instructions come in as
+ * `-c` overrides, one per line of FACTORY_CODEX_CONFIG (see agent-tools.ts).
+ * The task arrives on stdin, so one starting with "-" is never read as a
+ * flag. On a later turn in the same sandbox it resumes its last session.
+ * Codex's own sandbox and approvals are off: the Railway sandbox is the
+ * boundary, as with Claude Code's --dangerously-skip-permissions.
+ */
+export const DEFAULT_CODEX_COMMAND = [
+  "set --",
+  'while IFS= read -r line; do if [ -n "$line" ]; then set -- "$@" -c "$line"; fi; done < "$FACTORY_CODEX_CONFIG"',
+  [
+    "codex exec ${FACTORY_CONTINUE:+resume --last} --json",
+    "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check",
+    '"$@" - < "$FACTORY_TASK_FILE"',
+  ].join(" "),
+].join("\n");
+
+/** How to install and run one agent CLI in a sandbox. */
+export interface AgentCommands {
   readonly setupCommand: string;
   readonly command: string;
+}
+
+export interface AgentSettings {
+  /** Per agent: Claude Code (AGENT_SETUP_COMMAND, AGENT_COMMAND) and Codex (CODEX_SETUP_COMMAND, CODEX_COMMAND). */
+  readonly commands: Readonly<Record<AgentId, AgentCommands>>;
   readonly timeoutSec: number;
   /**
    * Extra runner env vars copied into every sandbox. Model API keys do not
@@ -50,6 +76,8 @@ export interface RunnerSettings {
   /** How often idle sandboxes and expired runs are looked for. */
   readonly lifecycleInterval: Duration.Duration;
   readonly agent: AgentSettings;
+  /** Sandbox snapshots users may pick, and who may use each (SANDBOX_SNAPSHOTS). */
+  readonly snapshots: ReadonlyArray<SandboxSnapshot>;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
   /** Where sandboxes' preview agents connect, and the key their grants are signed with; none turns previews off. */
   readonly preview: Option.Option<PreviewSettings>;
@@ -94,8 +122,16 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
         runRetentionDays: int("RUN_RETENTION_DAYS", Api.RUN_RETENTION_DAYS),
         lifecycleInterval: int("LIFECYCLE_INTERVAL_MS", 30_000).pipe(Config.map(Duration.millis)),
         agent: Config.all({
-          setupCommand: str("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP),
-          command: str("AGENT_COMMAND", DEFAULT_AGENT_COMMAND),
+          commands: Config.all({
+            claude: Config.all({
+              setupCommand: str("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP),
+              command: str("AGENT_COMMAND", DEFAULT_AGENT_COMMAND),
+            }),
+            codex: Config.all({
+              setupCommand: str("CODEX_SETUP_COMMAND", DEFAULT_CODEX_SETUP),
+              command: str("CODEX_COMMAND", DEFAULT_CODEX_COMMAND),
+            }),
+          }),
           timeoutSec: int("AGENT_TIMEOUT_SECONDS", 3600),
         }),
         git: Config.all({
@@ -103,9 +139,11 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
           authorEmail: str("GIT_AUTHOR_EMAIL", "factory-on-rails@users.noreply.github.com"),
         }),
       });
+      const { snapshots, errors } = yield* snapshotsConfig;
+      for (const error of errors) yield* Effect.logWarning(`SANDBOX_SNAPSHOTS: ${error}`);
       const tunnelUrl = Option.filter(yield* Config.option(Config.string("PREVIEW_TUNNEL_URL")), (u) => u.trim() !== "");
       const preview = Option.all({ tunnelUrl: Option.map(tunnelUrl, (u) => u.trim()), signingKey: yield* previewSigningKeyConfig });
-      return { ...settings, preview, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
+      return { ...settings, snapshots, preview, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
     }),
   );
 }

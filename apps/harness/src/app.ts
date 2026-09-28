@@ -1,8 +1,12 @@
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import {
+  agentCredential,
+  AGENTS,
   Api,
+  DEFAULT_AGENT,
   GitHubError,
   GitHubUserApi,
+  InstanceSettings,
   isModelProvider,
   keyHint,
   MODEL_PROVIDERS,
@@ -13,30 +17,24 @@ import {
   Store,
   TokenCipher,
   validateApiKey,
+  snapshotsFor,
+  type AgentId,
   type ModelProvider,
   type RunEventRow,
   type RunRow,
   type UserRow,
 } from "@factory/core";
-import { Data, Effect, Option, Redacted, Schema } from "effect";
+import { Effect, Option, Redacted, Schema } from "effect";
 import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from "./auth.js";
 import { HarnessConfig } from "./config.js";
+import { fail } from "./errors.js";
+import { appInstallUrl, setupRoutes } from "./setup.js";
 
 /**
  * The harness is the web app's API and auth backend. Pages live in apps/web,
  * which serves the public domain and forwards `/api/*` and `/auth/*` here, so
  * the session cookie, OAuth callback and Origin check all see one origin.
  */
-
-/** A request the API refuses, answered as `Api.ApiError` JSON. */
-export class ApiFailure extends Data.TaggedError("ApiFailure")<{
-  readonly status: 400 | 401 | 403 | 404 | 500;
-  readonly code: string;
-  readonly message: string;
-}> {}
-
-const fail = (status: ApiFailure["status"], code: string, message: string) =>
-  Effect.fail(new ApiFailure({ status, code, message }));
 
 const json =
   <A, I>(schema: Schema.Schema<A, I>) =>
@@ -54,6 +52,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   repo: r.repo_full_name,
   baseBranch: r.base_branch,
   task: r.task,
+  agent: r.agent === "codex" ? "codex" : "claude",
   status: r.status,
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
@@ -110,7 +109,9 @@ const accessibleRepos = (user: UserRow) =>
     return perInstallation.flat().sort((a, b) => a.fullName.localeCompare(b.fullName));
   });
 
-const installUrl = Effect.map(GitHubUserApi, (gh) => `https://github.com/apps/${gh.appSlug}/installations/new`);
+const installUrl = Effect.map(Effect.flatMap(GitHubUserApi, (gh) => gh.app), (app) =>
+  Option.match(app, { onNone: () => "/setup", onSome: ({ slug }) => appInstallUrl(slug) }),
+);
 
 const keySlots = (user: UserRow) =>
   Effect.gen(function* () {
@@ -121,12 +122,42 @@ const keySlots = (user: UserRow) =>
       return {
         provider,
         label: meta.label,
+        description: meta.description,
+        agent: (Object.keys(AGENTS) as AgentId[]).find((a) => (AGENTS[a].providers as ReadonlyArray<string>).includes(provider))!,
         placeholder: meta.placeholder,
-        consoleUrl: meta.consoleUrl,
+        consoleUrl: meta.helpUrl,
+        consoleLabel: meta.helpLabel,
         saved: key ? { hint: key.hint, updatedAt: key.updated_at } : null,
       };
     });
   });
+
+/** The snapshots this user may start runs from, and the one they picked if it is still theirs to use. */
+const snapshotSettings = (user: UserRow) =>
+  Effect.map(HarnessConfig, ({ snapshots }): Api.SnapshotSettings => {
+    const available = snapshotsFor(snapshots, user.github_login);
+    return { available, selected: user.sandbox_snapshot && available.includes(user.sandbox_snapshot) ? user.sandbox_snapshot : null };
+  });
+
+/**
+ * Which agents this user can start a run with: one needs a saved credential,
+ * or a sandbox snapshot, which can carry the agent's own sign-in.
+ */
+const agentsFor = (user: UserRow) =>
+  Effect.gen(function* () {
+    const saved = (yield* (yield* Store).listApiKeys(user.id)).map((k) => k.provider);
+    const { selected } = yield* snapshotSettings(user);
+    return (Object.keys(AGENTS) as AgentId[]).map(
+      (id): Api.ApiAgent => ({ id, label: AGENTS[id].label, ready: selected !== null || agentCredential(id, saved) !== undefined }),
+    );
+  });
+
+const agentNotReady = (agent: AgentId) =>
+  fail(
+    400,
+    "api_key_required",
+    `Add a key for ${AGENTS[agent].label} in Settings, or pick a sandbox snapshot, before starting a run with it.`,
+  );
 
 /** A run owned by the signed-in user, or a 404. */
 const ownedRun = Effect.gen(function* () {
@@ -143,7 +174,29 @@ const providerParam = Effect.flatMap(HttpRouter.schemaPathParams(ProviderParam),
   isModelProvider(provider) ? Effect.succeed(provider) : fail(404, "not_found", "Unknown provider."),
 );
 
-export const router = HttpRouter.empty.pipe(
+/**
+ * A one-time link that opens a port of the run's sandbox on its preview
+ * origin, for the run's owner only (see packages/core/src/preview.ts).
+ */
+const previewRoutes = HttpRouter.empty.pipe(
+  HttpRouter.post(
+    "/api/runs/:id/previews",
+    Effect.gen(function* () {
+      const { user, run } = yield* ownedRun;
+      const { preview } = yield* HarnessConfig;
+      if (Option.isNone(preview)) return yield* fail(404, "previews_disabled", "Previews are not set up on this factory.");
+      const { port, path } = yield* HttpServerRequest.schemaBodyJson(Api.OpenPreviewBody);
+      const origin = previewOrigin(preview.value.domain, run.id, port);
+      const token = signPreviewGrant(Redacted.value(preview.value.signingKey), openGrant(run.id, port, user.id));
+      const url = new URL(PREVIEW_OPEN_PATH, origin);
+      url.searchParams.set("token", token);
+      if (path?.startsWith("/")) url.searchParams.set("path", path);
+      return yield* json(Api.PreviewLink)({ url: url.toString(), origin });
+    }),
+  ),
+);
+
+const routes = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/healthz",
     Effect.gen(function* () {
@@ -157,15 +210,20 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.get("/auth/callback", completeLogin),
   HttpRouter.post("/auth/logout", logout),
 
+  // ---- first-run setup ------------------------------------------------------------
+  HttpRouter.concat(setupRoutes),
+
   // ---- session ----------------------------------------------------------------
   HttpRouter.get(
     "/api/me",
     Effect.gen(function* () {
       const user = yield* requireUser;
-      const keys = yield* (yield* Store).listApiKeys(user.id);
+      const agents = yield* agentsFor(user);
       return yield* json(Api.Me)({
         user: { login: user.github_login, name: user.name, avatarUrl: user.avatar_url },
-        hasApiKey: keys.length > 0,
+        hasApiKey: agents.some((a) => a.ready),
+        agents,
+        snapshot: (yield* snapshotSettings(user)).selected,
         installUrl: yield* installUrl,
       });
     }),
@@ -239,6 +297,25 @@ export const router = HttpRouter.empty.pipe(
     }),
   ),
 
+  // ---- sandbox snapshot -----------------------------------------------------------
+  HttpRouter.get(
+    "/api/settings/snapshot",
+    Effect.flatMap(requireUser, snapshotSettings).pipe(Effect.flatMap(json(Api.SnapshotSettings))),
+  ),
+
+  HttpRouter.put(
+    "/api/settings/snapshot",
+    Effect.gen(function* () {
+      const user = yield* requireUser;
+      const { snapshot } = yield* HttpServerRequest.schemaBodyJson(Api.SaveSnapshotBody);
+      if (snapshot !== null && !(yield* snapshotSettings(user)).available.includes(snapshot)) {
+        return yield* fail(400, "bad_request", "That snapshot isn't available to you.");
+      }
+      yield* (yield* Store).setSandboxSnapshot(user.id, snapshot);
+      return yield* json(Api.SnapshotSettings)(yield* snapshotSettings({ ...user, sandbox_snapshot: snapshot }));
+    }),
+  ),
+
   // ---- runs ---------------------------------------------------------------------
   HttpRouter.get(
     "/api/runs",
@@ -257,8 +334,10 @@ export const router = HttpRouter.empty.pipe(
       const body = yield* HttpServerRequest.schemaBodyJson(Api.CreateRunBody);
       const task = body.task.trim();
       if (!body.repo || !task) return yield* fail(400, "bad_request", "Pick a repository and describe the task.");
-      if ((yield* store.listApiKeys(user.id)).length === 0) {
-        return yield* fail(400, "api_key_required", "Add your model API key in Settings before starting a run.");
+      const agent = body.agent ?? DEFAULT_AGENT;
+      if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
+      if (!(yield* (yield* InstanceSettings).sandboxesReady).ready) {
+        return yield* fail(400, "setup_required", "Sandboxes aren't set up yet. Finish setup at /setup first.");
       }
 
       // Never trust the client: the repo must be one this user can reach through that installation.
@@ -273,6 +352,7 @@ export const router = HttpRouter.empty.pipe(
         installation_id: repo.installationId,
         base_branch: body.baseBranch?.trim() || repo.defaultBranch,
         task,
+        agent,
       });
       return yield* json(Api.ApiRun)(toApiRun(run), 201);
     }),
@@ -321,9 +401,8 @@ export const router = HttpRouter.empty.pipe(
         yield* store.addUserMessage(run.id, text);
       } else {
         // A finished run: the message starts the next turn, in the same sandbox when it is still there.
-        if ((yield* store.listApiKeys(user.id)).length === 0) {
-          return yield* fail(400, "api_key_required", "Add your model API key in Settings before continuing a run.");
-        }
+        const agent = toApiRun(run).agent;
+        if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
         yield* store.continueRun(run.id, text);
       }
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
@@ -345,22 +424,6 @@ export const router = HttpRouter.empty.pipe(
   // A one-time link that signs the owner's browser in to one port's preview
   // origin (see packages/core/src/preview.ts). The gateway checks the grant;
   // this is where ownership is checked.
-  HttpRouter.post(
-    "/api/runs/:id/previews",
-    Effect.gen(function* () {
-      const { user, run } = yield* ownedRun;
-      const { preview } = yield* HarnessConfig;
-      if (Option.isNone(preview)) return yield* fail(404, "previews_disabled", "Previews are not set up on this factory.");
-      const { port, path } = yield* HttpServerRequest.schemaBodyJson(Api.OpenPreviewBody);
-      const origin = previewOrigin(preview.value.domain, run.id, port);
-      const token = signPreviewGrant(Redacted.value(preview.value.signingKey), openGrant(run.id, port, user.id));
-      const url = new URL(PREVIEW_OPEN_PATH, origin);
-      url.searchParams.set("token", token);
-      if (path?.startsWith("/")) url.searchParams.set("path", path);
-      return yield* json(Api.PreviewLink)({ url: url.toString(), origin });
-    }),
-  ),
-
   HttpRouter.get(
     "/api/runs/:id/events",
     Effect.gen(function* () {
@@ -374,6 +437,8 @@ export const router = HttpRouter.empty.pipe(
     }),
   ),
 );
+
+export const router = HttpRouter.concat(routes, previewRoutes);
 
 /** Where the web app shows sign-in, with an optional error message. */
 const loginPage = (error?: string) =>
@@ -389,6 +454,8 @@ export const app = router.pipe(
     Unauthorized: () => Effect.succeed(errorJson(401, "unauthorized", "Sign in to continue.")),
     ReauthRequired: () => Effect.succeed(errorJson(401, "reauth", "Your GitHub sign-in expired. Sign in again.")),
     LoginRejected: (e) => Effect.succeed(loginPage(e.message)),
+    SetupRejected: (e) => Effect.succeed(HttpServerResponse.redirect(`/setup?error=${encodeURIComponent(e.message)}`, { status: 302 })),
+    RailwayError: (e) => Effect.succeed(errorJson(400, "railway", e.message)),
     RouteNotFound: () => Effect.succeed(errorJson(404, "not_found", "Not found.")),
     ParseError: () => Effect.succeed(errorJson(400, "bad_request", "Bad request.")),
     RequestError: () => Effect.succeed(errorJson(400, "bad_request", "Bad request.")),

@@ -23,6 +23,8 @@ export interface UserRow {
   access_token_expires_at: Date | null;
   refresh_token_enc: string | null;
   refresh_token_expires_at: Date | null;
+  /** The sandbox snapshot the user's runs start from (see SANDBOX_SNAPSHOTS); null for the platform default. */
+  sandbox_snapshot: string | null;
 }
 
 export type UserTokenColumns = Pick<
@@ -37,6 +39,8 @@ export interface RunRow {
   installation_id: string;
   base_branch: string;
   task: string;
+  /** The coding agent: `claude` or `codex` (see AGENTS). */
+  agent: string;
   status: RunStatus;
   branch: string | null;
   sandbox_id: string | null;
@@ -132,14 +136,16 @@ export type RunPatch = Partial<
 
 export interface StoreService {
   // users & sessions
-  readonly upsertUser: (u: Omit<UserRow, "id" | "github_id"> & { github_id: number }) => Q<UserRow>;
+  readonly upsertUser: (u: Omit<UserRow, "id" | "github_id" | "sandbox_snapshot"> & { github_id: number }) => Q<UserRow>;
+  readonly getUser: (userId: string) => Q<Option.Option<UserRow>>;
+  readonly setSandboxSnapshot: (userId: string, snapshot: string | null) => Q<void>;
   readonly updateUserTokens: (userId: string, t: UserTokenColumns) => Q<void>;
   readonly createSession: (tokenHash: string, userId: string, ttlSeconds: number) => Q<void>;
   readonly userForSession: (tokenHash: string) => Q<Option.Option<UserRow>>;
   readonly deleteSession: (tokenHash: string) => Q<void>;
   // runs
   readonly enqueueRun: (
-    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & { installation_id: number },
+    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & { installation_id: number; agent?: string },
   ) => Q<RunRow>;
   readonly listRuns: (userId: string, limit?: number) => Q<ReadonlyArray<RunRow>>;
   readonly getRun: (id: string) => Q<Option.Option<RunRow>>;
@@ -194,6 +200,11 @@ export interface StoreService {
   readonly deleteApiKey: (userId: string, provider: string) => Q<void>;
   /** Encrypted keys for the runner to decrypt and inject into a run's sandbox. */
   readonly encryptedApiKeys: (userId: string) => Q<ReadonlyArray<{ provider: string; key_enc: string }>>;
+  // instance settings (see instance.ts)
+  readonly getSetting: (key: string) => Q<Option.Option<unknown>>;
+  /** Saves a setting. With `onlyIfAbsent` an existing value is kept, and the result says whether this one was saved. */
+  readonly putSetting: (key: string, value: unknown, options?: { readonly onlyIfAbsent?: boolean }) => Q<boolean>;
+
   // previews (see preview.ts)
   /** What the sandbox's preview agent reports; null when it disconnects. */
   readonly setPreviewPorts: (runId: string, ports: ReadonlyArray<PreviewPort> | null) => Q<void>;
@@ -225,6 +236,11 @@ const make = Effect.gen(function* () {
           updated_at = now()
         returning *`.pipe(Effect.map((rows) => rows[0]!)),
 
+    getUser: (userId) => sql<UserRow>`select * from users where id = ${userId}`.pipe(Effect.map(Arr.head)),
+
+    setSandboxSnapshot: (userId, snapshot) =>
+      sql`update users set sandbox_snapshot = ${snapshot}, updated_at = now() where id = ${userId}`.pipe(Effect.asVoid),
+
     updateUserTokens: (userId, t) =>
       sql`update users set ${sql.update(t)}, updated_at = now() where id = ${userId}`.pipe(Effect.asVoid),
 
@@ -242,7 +258,7 @@ const make = Effect.gen(function* () {
 
     enqueueRun: (r) =>
       Effect.gen(function* () {
-        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert(r)} returning *`;
+        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert({ ...r, agent: r.agent ?? "claude" })} returning *`;
         yield* notifyQueued(row!.id);
         return row!;
       }),
@@ -415,6 +431,22 @@ const make = Effect.gen(function* () {
 
     encryptedApiKeys: (userId) =>
       sql<{ provider: string; key_enc: string }>`select provider, key_enc from user_api_keys where user_id = ${userId}`,
+
+    getSetting: (key) =>
+      sql<{ value: unknown }>`select value from instance_settings where key = ${key}`.pipe(
+        Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.value)),
+      ),
+
+    putSetting: (key, value, options) => {
+      const row = { key, value: JSON.stringify(value) };
+      const saved = options?.onlyIfAbsent
+        ? sql`insert into instance_settings ${sql.insert(row)} on conflict (key) do nothing returning key`
+        : sql`
+            insert into instance_settings ${sql.insert(row)}
+            on conflict (key) do update set value = excluded.value, updated_at = now()
+            returning key`;
+      return Effect.map(saved, (rows) => rows.length > 0);
+    },
 
     setPreviewPorts: (runId, ports) =>
       sql`

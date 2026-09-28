@@ -154,15 +154,19 @@ export interface AgentStreamSink {
   readonly output: (stream: "stdout" | "stderr", text: string) => void;
 }
 
+/** Parses one line of agent stdout into events, or `undefined` to keep it as plain output. */
+export type AgentLineParser = (line: string) => RunEvent[] | undefined;
+
 /**
- * Splits streamed stdout into lines (chunks can end mid-line) and parses each.
+ * Splits streamed stdout into lines (chunks can end mid-line) and parses each
+ * (Claude Code's stream-json by default; Codex has its own, see codex-stream.ts).
  * stderr is passed straight through. Call `end` when the command exits to
  * flush a last line without a newline.
  */
-export function makeAgentStream(sink: AgentStreamSink) {
+export function makeAgentStream(sink: AgentStreamSink, parse: AgentLineParser = parseAgentLine) {
   let buffer = "";
   const line = (text: string) => {
-    const events = parseAgentLine(text);
+    const events = parse(text);
     if (events) events.forEach(sink.event);
     else sink.output("stdout", `${text}\n`);
   };

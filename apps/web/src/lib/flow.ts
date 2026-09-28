@@ -48,9 +48,18 @@ const str = (v: unknown) => (typeof v === "string" ? v : "");
 const base = (path: string) => repoPath(path).split("/").pop() || repoPath(path);
 const clip = (s: string, n = 48) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
+/** FileChange is Codex's patch (see apps/runner/src/codex-stream.ts). */
+const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit", "FileChange"]);
 const READ_TOOLS = new Set(["Read", "Grep", "Glob", "LS"]);
 const WEB_TOOLS = new Set(["WebFetch", "WebSearch"]);
+
+/** The files a Codex FileChange call touched. */
+export function fileChanges(input: Record<string, unknown>): { path: string; kind: string }[] {
+  const changes = Array.isArray(input.changes) ? input.changes : [];
+  return changes
+    .filter((c): c is Record<string, unknown> => typeof c === "object" && c !== null)
+    .map((c) => ({ path: str(c.path), kind: str(c.kind) }));
+}
 
 /** A tool call as a few words in the present tense, for tickers. */
 export function describeCall(name: string, input: Record<string, unknown>): string {
@@ -65,6 +74,10 @@ export function describeCall(name: string, input: Record<string, unknown>): stri
       return `Editing ${base(str(input.file_path) || str(input.notebook_path))}`;
     case "Write":
       return `Writing ${base(str(input.file_path))}`;
+    case "FileChange": {
+      const changes = fileChanges(input);
+      return changes.length === 1 ? `Editing ${base(changes[0]!.path)}` : `Editing ${changes.length} files`;
+    }
     case "Grep":
       return `Searching for ${clip(str(input.pattern), 32)}`;
     case "Glob":
