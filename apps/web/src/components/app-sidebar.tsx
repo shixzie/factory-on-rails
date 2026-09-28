@@ -48,7 +48,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import type { Api } from "@/lib/api";
-import { shortAge, taskTitle } from "@/lib/format";
+import { runTitle, shortAge } from "@/lib/format";
 
 const RUNS_PER_REPO = 6;
 
@@ -95,7 +95,7 @@ function RepoRuns({ group, activeRunId }: { group: RepoGroup; activeRunId: strin
                 className="h-8 gap-2 pr-1.5"
               >
                 <StatusDot status={run.status} awaiting={run.awaitingInput} />
-                <span className="min-w-0 flex-1 truncate">{taskTitle(run.task, 60)}</span>
+                <span className="min-w-0 flex-1 truncate">{runTitle(run, 60)}</span>
                 <span className="ml-auto text-[11px] text-muted-foreground tabular-nums" suppressHydrationWarning>
                   {shortAge(run.createdAt)}
                 </span>

@@ -6,8 +6,9 @@ import { createServer } from "node:http";
 import { app, originCheck } from "./app.js";
 import { HarnessConfig } from "./config.js";
 import { RailwayApi } from "./railway.js";
+import { TitleModel } from "./titles.js";
 
-const ServicesLive = Layer.mergeAll(GitHubUserApi.Live, RailwayApi.Live, HarnessConfig.Live).pipe(
+const ServicesLive = Layer.mergeAll(GitHubUserApi.Live, RailwayApi.Live, HarnessConfig.Live, TitleModel.Live).pipe(
   Layer.provideMerge(InstanceSettings.Live),
   Layer.provideMerge(Layer.mergeAll(Store.Live, TokenCipher.Live)),
   Layer.provide(PgLive),
