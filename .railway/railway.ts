@@ -24,17 +24,17 @@ export default defineRailway((ctx) => {
   // The web app (apps/web, Next.js) is the public face. It forwards /api/*
   // and /auth/* to the harness over the private network, so the browser only
   // ever talks to one origin: PUBLIC_URL below is the web app's URL for both.
-  // Other environments use the web service's generated Railway domain.
+  // Production serves it on factory.shixzie.com (DNS via Cloudflare, SSL mode
+  // Full strict); other environments use its generated Railway domain.
   //
-  // Railway IaC can manage a custom domain but not register one on a service,
-  // so factory.shixzie.com stays declared on the harness (where it was added)
-  // until it is moved to `web` in the dashboard; a follow-up change then
-  // declares it on `web` instead. See docs/setup.md, step 5.
+  // Railway IaC can manage a custom domain but not register one on a service:
+  // add a new domain in the dashboard first, then declare it here. See
+  // docs/setup.md, step 5.
   const production = ctx.isEnvironment("production");
   const publicUrl = production ? "https://factory.shixzie.com" : "https://${{web.RAILWAY_PUBLIC_DOMAIN}}";
 
-  // API and auth backend for the web app, reached on the private network
-  // (listening on :: so the private DNS name resolves).
+  // API and auth backend for the web app. No public domain: only reached on
+  // the private network (listening on :: so the private DNS name resolves).
   const harness = service("harness", {
     source,
     build: {
@@ -46,8 +46,6 @@ export default defineRailway((ctx) => {
     preDeploy: "node packages/core/dist/db.js",
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
-    // Pin the port so the custom domain's target port always matches.
-    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
     env: {
       PORT: "8080",
       HOST: "::",
@@ -75,6 +73,8 @@ export default defineRailway((ctx) => {
     start: "cd apps/web && node node_modules/next/dist/bin/next start --hostname 0.0.0.0",
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
+    // Pin the port so the custom domain's target port always matches.
+    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
     env: {
       PORT: "8080",
       NEXT_TELEMETRY_DISABLED: "1",
