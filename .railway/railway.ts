@@ -20,6 +20,11 @@ export default defineRailway((ctx) => {
 
   const db = postgres("postgres");
 
+  // The harness is served on a custom domain in production (DNS via Cloudflare,
+  // SSL mode Full). Other environments use their generated Railway domain.
+  const production = ctx.isEnvironment("production");
+  const harnessUrl = production ? "https://factory.shixzie.com" : "https://${{harness.RAILWAY_PUBLIC_DOMAIN}}";
+
   const harness = service("harness", {
     source,
     build: {
@@ -31,13 +36,19 @@ export default defineRailway((ctx) => {
     preDeploy: "node packages/core/dist/db.js",
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
+    // Pin the port so the custom domain's target port always matches.
+    domains: production ? [{ domain: "factory.shixzie.com", port: 3000 }] : [],
     env: {
+      PORT: "3000",
+      PUBLIC_URL: harnessUrl,
       DATABASE_URL: db.env.DATABASE_URL,
       GITHUB_APP_SLUG: ctx.shared.GITHUB_APP_SLUG,
       GITHUB_APP_CLIENT_ID: ctx.shared.GITHUB_APP_CLIENT_ID,
       GITHUB_APP_CLIENT_SECRET: ctx.shared.GITHUB_APP_CLIENT_SECRET,
       TOKEN_ENCRYPTION_KEY: ctx.shared.TOKEN_ENCRYPTION_KEY,
-      ALLOWED_GITHUB_LOGINS: ctx.shared.ALLOWED_GITHUB_LOGINS,
+      // Any GitHub account can sign in (each user brings their own model key).
+      // Set a comma-separated list of logins instead to restrict it.
+      ALLOWED_GITHUB_LOGINS: "*",
     },
   });
 
@@ -52,7 +63,7 @@ export default defineRailway((ctx) => {
     env: {
       DATABASE_URL: db.env.DATABASE_URL,
       // Railway resolves ${{service.VAR}} inside literal values at deploy time.
-      HARNESS_URL: "https://${{harness.RAILWAY_PUBLIC_DOMAIN}}",
+      HARNESS_URL: harnessUrl,
       GITHUB_APP_ID: ctx.shared.GITHUB_APP_ID,
       GITHUB_APP_PRIVATE_KEY: ctx.shared.GITHUB_APP_PRIVATE_KEY,
       // Decrypts each user's own model API key (bring your own key).

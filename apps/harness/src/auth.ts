@@ -14,6 +14,10 @@ import { Data, Duration, Effect, Option, Schema } from "effect";
 import { HarnessConfig } from "./config.js";
 
 export const SESSION_COOKIE = "factory_session";
+
+/** `*` in the allowlist admits any GitHub account; otherwise logins match case-insensitively. */
+export const isAllowedLogin = (allowed: ReadonlyArray<string>, login: string): boolean =>
+  allowed.includes("*") || allowed.includes(login.toLowerCase());
 export const STATE_COOKIE = "factory_oauth_state";
 
 /** No signed-in user: send them to the sign-in page. */
@@ -81,7 +85,7 @@ export const completeLogin = Effect.gen(function* () {
 
   const tokens = yield* github.exchangeCode(code, redirectUri(config.publicUrl));
   const viewer = yield* github.viewer(tokens.accessToken);
-  if (!config.allowedLogins.includes(viewer.login.toLowerCase())) {
+  if (!isAllowedLogin(config.allowedLogins, viewer.login)) {
     return yield* new LoginRejected({ status: 403, message: `GitHub user ${viewer.login} is not allowed to use this factory.` });
   }
 
