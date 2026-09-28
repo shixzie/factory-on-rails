@@ -57,9 +57,27 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   createdAt: r.created_at,
   startedAt: r.started_at,
   finishedAt: r.finished_at,
+  awaitingInput: r.awaiting_input,
 });
 
-const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({ id: String(e.id), at: e.at, kind: e.kind, message: e.message });
+const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({
+  id: String(e.id),
+  at: e.at,
+  kind: e.kind,
+  message: e.message,
+  data: e.data,
+});
+
+/** Events per page; a run page asks for the next page while `hasMore` is true. */
+const EVENTS_PAGE = 1000;
+/** Longest message a user can send to a running agent. */
+const MAX_MESSAGE_CHARS = 20_000;
+
+const eventsPage = (runId: string, after = 0) =>
+  Effect.map(Effect.flatMap(Store, (store) => store.listEvents(runId, after, EVENTS_PAGE)), (rows) => ({
+    events: rows.map(toApiEvent),
+    hasMore: rows.length === EVENTS_PAGE,
+  }));
 
 const accessibleRepos = (user: UserRow) =>
   Effect.gen(function* () {
@@ -257,8 +275,43 @@ export const router = HttpRouter.empty.pipe(
     "/api/runs/:id",
     Effect.gen(function* () {
       const { run } = yield* ownedRun;
-      const events = yield* (yield* Store).listEvents(run.id);
-      return yield* json(Api.RunDetail)({ run: toApiRun(run), events: events.map(toApiEvent) });
+      const page = yield* eventsPage(run.id);
+      const diff = yield* (yield* Store).getDiff(run.id);
+      return yield* json(Api.RunDetail)({
+        run: toApiRun(run),
+        ...page,
+        diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
+      });
+    }),
+  ),
+
+  HttpRouter.get(
+    "/api/runs/:id/diff",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const diff = yield* (yield* Store).getDiff(run.id);
+      if (Option.isNone(diff)) return yield* fail(404, "not_found", "This run has not changed any files yet.");
+      const { patch, truncated, updated_at } = diff.value;
+      return yield* json(Api.ApiRunDiff)({ patch, truncated, updatedAt: updated_at });
+    }),
+  ),
+
+  HttpRouter.post(
+    "/api/runs/:id/messages",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const store = yield* Store;
+      const text = (yield* HttpServerRequest.schemaBodyJson(Api.SendMessageBody)).text.trim();
+      if (!text) return yield* fail(400, "bad_request", "Write a message first.");
+      if (text.length > MAX_MESSAGE_CHARS) return yield* fail(400, "bad_request", "That message is too long.");
+      if (run.status !== "queued" && run.status !== "running") {
+        return yield* fail(400, "bad_request", "This run is not running any more, so the agent cannot read messages.");
+      }
+      // The runner picks the message up and hands it to the agent; the answer clears the question.
+      yield* store.appendEvents(run.id, [{ kind: "user_message", message: text }]);
+      if (run.awaiting_input) yield* store.updateRun(run.id, { awaiting_input: false });
+      const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
+      return yield* json(Api.ApiRun)(toApiRun(updated), 201);
     }),
   ),
 
@@ -280,8 +333,9 @@ export const router = HttpRouter.empty.pipe(
       const { after } = yield* HttpServerRequest.schemaSearchParams(
         Schema.Struct({ after: Schema.optionalWith(Schema.NumberFromString, { default: () => 0 }) }),
       );
-      const events = yield* (yield* Store).listEvents(run.id, after);
-      return yield* json(Api.RunEventsPage)({ run: toApiRun(run), events: events.map(toApiEvent) });
+      const page = yield* eventsPage(run.id, after);
+      const diffUpdatedAt = yield* (yield* Store).diffUpdatedAt(run.id);
+      return yield* json(Api.RunEventsPage)({ run: toApiRun(run), ...page, diffUpdatedAt: Option.getOrNull(diffUpdatedAt) });
     }),
   ),
 );

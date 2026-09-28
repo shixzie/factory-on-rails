@@ -94,7 +94,13 @@ session cookie first-party, the GitHub callback at
 `https://factory.shixzie.com/auth/callback`, and the harness's Origin check
 unchanged. Server components call the harness directly with the visitor's
 cookie. The run page polls `/api/runs/:id/events` every two seconds while a run
-is live.
+is live, and fetches `/api/runs/:id/diff` whenever the page says the diff moved.
+
+A run page reads like a t3code turn (see "Watching and talking to the agent"
+below): the agent's messages as prose, the tool calls between them as one-line
+entries that expand to their input and output (commands with their output,
+edits as diffs, the agent's plan as a checklist), its questions as cards, and
+a diff panel beside the thread with every file the run changed.
 
 ## Infrastructure as Code
 
@@ -180,8 +186,9 @@ queued ──▶ running ──▶ succeeded | failed
    branch, and checks out `factory/run-<id>`.
 4. It runs `AGENT_SETUP_COMMAND` and then `AGENT_COMMAND` in the repo. The
    default agent is Claude Code in headless mode
-   (`claude -p "$(cat "$FACTORY_TASK_FILE")" --dangerously-skip-permissions`);
-   any CLI that edits files in the working tree works.
+   (`claude -p … --output-format stream-json`, plus the factory's
+   ask-the-user tool and inbox hook); any CLI that edits files in the working
+   tree works, and plain text output is shown as a log.
 5. It commits whatever the agent left uncommitted, pushes the branch if it
    moved, opens a pull request, and destroys the sandbox.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
@@ -193,6 +200,40 @@ queued ──▶ running ──▶ succeeded | failed
 
 Run output is stored in `run_events` (batched once a second, capped at 5 MB per
 run) and the run page polls it.
+
+## Watching and talking to the agent
+
+The runner turns the agent's stream into structured events and gives the
+agent a way to reach the user, so a run can be followed and steered from the
+run page while it works.
+
+- **Activity.** Claude Code's `stream-json` output is parsed line by line
+  (`apps/runner/src/agent-stream.ts`) into `message`, `thinking`, `tool_call`
+  (name and input), `tool_result` and `agent_result` events in `run_events`,
+  with details in its `data` column. Lines that aren't agent JSON stay
+  `stdout`, so other agent CLIs still get a log. Long tool inputs and outputs
+  are capped at 16 KB each, and everything counts toward the 5 MB budget.
+- **Files changed.** While the agent runs, the runner snapshots
+  `git diff` of the branch against the commit it started from (committed and
+  uncommitted work, new files included) a few seconds after each tool call,
+  staging into a throwaway index so it never touches the agent's own. The
+  latest patch (up to 1 MB, cut at a file boundary) replaces the previous one
+  in `run_diffs`, and one last snapshot is taken when the agent exits.
+- **Questions.** The sandbox gets a small MCP server (`ask_user`, see
+  `apps/runner/src/agent-tools.ts`). When the agent calls it, the run shows
+  "Needs input" in the sidebar and a question card (with the agent's
+  suggested answers as buttons); the call waits up to 30 minutes for the
+  user's reply, then tells the agent to carry on with its best judgment.
+- **Messages.** Anything the user sends to a live run
+  (`POST /api/runs/:id/messages`) is stored as a `user_message` event. The
+  runner polls for new ones every two seconds and drops each into an inbox
+  directory in the sandbox. The next `ask_user` call takes it as the answer;
+  otherwise a Claude Code hook hands it to the agent after its current tool
+  call, and a Stop hook keeps the agent going if a message arrives as it
+  finishes. Each message is delivered exactly once.
+
+All of this lives in `/workspace/.factory` in the sandbox, outside the
+repository, so none of it ends up in the pull request.
 
 ## GitHub login and repository access
 
@@ -242,7 +283,8 @@ key under **Settings**, and it is used for their runs only.
 - `users`: GitHub identity plus encrypted user tokens.
 - `sessions`: hashed session tokens with expiry.
 - `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat).
-- `run_events`: append-only log per run.
+- `run_events`: append-only log per run: runner steps, command output, and the agent's messages, tool calls and results, plus messages from the user (`003_run_activity.sql`).
+- `run_diffs`: the latest diff of each run's branch against its base commit.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
 
 ## What this foundation does not do yet

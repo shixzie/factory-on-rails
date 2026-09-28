@@ -38,17 +38,45 @@ export interface RunRow {
   created_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
+  awaiting_input: boolean;
 }
+
+/**
+ * What a run's log records. `info`/`error` are the runner's own steps and
+ * `stdout`/`stderr` raw command output. When the agent streams structured
+ * output (Claude Code's stream-json), it becomes `message`, `thinking`,
+ * `tool_call` (data: id, name, input), `tool_result` (data: toolUseId,
+ * isError) and a closing `agent_result`. `user_message` is something the user
+ * sent to the running agent.
+ */
+export type RunEventKind =
+  | "info"
+  | "error"
+  | "stdout"
+  | "stderr"
+  | "message"
+  | "thinking"
+  | "tool_call"
+  | "tool_result"
+  | "agent_result"
+  | "user_message";
 
 export interface RunEventRow {
   id: string;
   run_id: string;
   at: Date;
-  kind: "info" | "error" | "stdout" | "stderr";
+  kind: RunEventKind;
   message: string;
+  data: Record<string, unknown> | null;
 }
 
-export type RunEvent = Pick<RunEventRow, "kind" | "message">;
+export type RunEvent = Pick<RunEventRow, "kind" | "message"> & { data?: Record<string, unknown> | null };
+
+export interface RunDiffRow {
+  patch: string;
+  truncated: boolean;
+  updated_at: Date;
+}
 
 export interface ApiKeySummary {
   provider: string;
@@ -78,7 +106,10 @@ export interface StoreService {
   readonly claimNextRun: (workerId: string) => Q<Option.Option<RunRow>>;
   /** Records liveness and returns the run's current status (how the runner notices cancellation). */
   readonly heartbeat: (runId: string) => Q<Option.Option<RunStatus>>;
-  readonly updateRun: (runId: string, patch: Partial<Pick<RunRow, "branch" | "sandbox_id" | "pull_request_url">>) => Q<void>;
+  readonly updateRun: (
+    runId: string,
+    patch: Partial<Pick<RunRow, "branch" | "sandbox_id" | "pull_request_url" | "awaiting_input">>,
+  ) => Q<void>;
   readonly finishRun: (runId: string, status: Extract<RunStatus, "succeeded" | "failed" | "cancelled">, error?: string) => Q<void>;
   /** Marks a queued run cancelled, or asks the runner to stop a running one. */
   readonly requestCancel: (runId: string, userId: string) => Q<boolean>;
@@ -87,6 +118,13 @@ export interface StoreService {
   // events
   readonly appendEvents: (runId: string, events: ReadonlyArray<RunEvent>) => Q<void>;
   readonly listEvents: (runId: string, afterId?: number, limit?: number) => Q<ReadonlyArray<RunEventRow>>;
+  /** Messages the user sent to a run after `afterId` (what the runner hands to the agent). */
+  readonly listUserMessages: (runId: string, afterId: number) => Q<ReadonlyArray<RunEventRow>>;
+  // the files a run changed
+  readonly saveDiff: (runId: string, patch: string, truncated: boolean) => Q<void>;
+  readonly getDiff: (runId: string) => Q<Option.Option<RunDiffRow>>;
+  /** When the diff last changed, without loading it (what the run page polls). */
+  readonly diffUpdatedAt: (runId: string) => Q<Option.Option<Date>>;
   // bring-your-own API keys
   readonly upsertApiKey: (k: { user_id: string; provider: string; key_enc: string; hint: string }) => Q<void>;
   /** What the UI may show: never the key itself. */
@@ -164,7 +202,7 @@ const make = Effect.gen(function* () {
 
     finishRun: (runId, status, error) =>
       sql`
-        update runs set status = ${status}, error = ${error ?? null}, finished_at = now()
+        update runs set status = ${status}, error = ${error ?? null}, finished_at = now(), awaiting_input = false
         where id = ${runId} and status in ('running', 'cancelling')`.pipe(Effect.asVoid),
 
     requestCancel: (runId, userId) =>
@@ -185,14 +223,39 @@ const make = Effect.gen(function* () {
     appendEvents: (runId, events) =>
       events.length === 0
         ? Effect.void
-        : sql`insert into run_events ${sql.insert(events.map((e) => ({ run_id: runId, kind: e.kind, message: e.message })))}`.pipe(
-            Effect.asVoid,
-          ),
+        : sql`insert into run_events ${sql.insert(
+            events.map((e) => ({
+              run_id: runId,
+              kind: e.kind,
+              message: e.message,
+              data: e.data == null ? null : JSON.stringify(e.data),
+            })),
+          )}`.pipe(Effect.asVoid),
 
     listEvents: (runId, afterId = 0, limit = 500) =>
       sql<RunEventRow>`
         select * from run_events where run_id = ${runId} and id > ${afterId}
         order by id limit ${limit}`,
+
+    listUserMessages: (runId, afterId) =>
+      sql<RunEventRow>`
+        select * from run_events where run_id = ${runId} and kind = 'user_message' and id > ${afterId}
+        order by id`,
+
+    saveDiff: (runId, patch, truncated) =>
+      sql`
+        insert into run_diffs (run_id, patch, truncated) values (${runId}, ${patch}, ${truncated})
+        on conflict (run_id) do update set patch = excluded.patch, truncated = excluded.truncated, updated_at = now()`.pipe(
+        Effect.asVoid,
+      ),
+
+    getDiff: (runId) =>
+      sql<RunDiffRow>`select patch, truncated, updated_at from run_diffs where run_id = ${runId}`.pipe(Effect.map(Arr.head)),
+
+    diffUpdatedAt: (runId) =>
+      sql<{ updated_at: Date }>`select updated_at from run_diffs where run_id = ${runId}`.pipe(
+        Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.updated_at)),
+      ),
 
     upsertApiKey: (k) =>
       sql`

@@ -56,6 +56,9 @@ export const api = {
       Api.RunEventsPage,
     ),
   createRun: (body: Api.CreateRunBody) => call(json("POST", "/api/runs", body), Api.ApiRun),
+  runDiff: (id: string) => call(HttpClientRequest.get(`/api/runs/${encodeURIComponent(id)}/diff`), Api.ApiRunDiff),
+  sendMessage: (id: string, text: string) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),
   keys: call(HttpClientRequest.get("/api/settings/keys"), Schema.Array(Api.ApiKeySlot)),
   saveKey: (provider: string, key: string) =>

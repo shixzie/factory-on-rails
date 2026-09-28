@@ -45,23 +45,68 @@ export const ApiRun = Schema.Struct({
   createdAt: Schema.Date,
   startedAt: Schema.NullOr(Schema.Date),
   finishedAt: Schema.NullOr(Schema.Date),
+  /** The agent asked a question and is waiting for the user's answer. */
+  awaitingInput: Schema.optionalWith(Schema.Boolean, { default: () => false }),
 });
 export type ApiRun = typeof ApiRun.Type;
+
+/** See `RunEventKind` in the store for what each kind means and carries in `data`. */
+export const RunEventKind = Schema.Literal(
+  "info",
+  "error",
+  "stdout",
+  "stderr",
+  "message",
+  "thinking",
+  "tool_call",
+  "tool_result",
+  "agent_result",
+  "user_message",
+);
+export type RunEventKind = typeof RunEventKind.Type;
 
 export const ApiRunEvent = Schema.Struct({
   id: Schema.String,
   at: Schema.Date,
-  kind: Schema.Literal("info", "error", "stdout", "stderr"),
+  kind: RunEventKind,
   message: Schema.String,
+  data: Schema.optionalWith(Schema.NullOr(Schema.Record({ key: Schema.String, value: Schema.Unknown })), {
+    default: () => null,
+  }),
 });
 export type ApiRunEvent = typeof ApiRunEvent.Type;
 
-export const RunDetail = Schema.Struct({ run: ApiRun, events: Schema.Array(ApiRunEvent) });
+/** The run's changes as one unified diff against the commit it started from. */
+export const ApiRunDiff = Schema.Struct({
+  patch: Schema.String,
+  /** The patch was cut at a file boundary because it was too large to store. */
+  truncated: Schema.Boolean,
+  updatedAt: Schema.Date,
+});
+export type ApiRunDiff = typeof ApiRunDiff.Type;
+
+export const RunDetail = Schema.Struct({
+  run: ApiRun,
+  events: Schema.Array(ApiRunEvent),
+  /** More events exist after the last one; page through `/events?after=`. */
+  hasMore: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  diff: Schema.optionalWith(Schema.NullOr(ApiRunDiff), { default: () => null }),
+});
 export type RunDetail = typeof RunDetail.Type;
 
 /** New events after a cursor, with the run's latest state (what the run page polls). */
-export const RunEventsPage = Schema.Struct({ run: ApiRun, events: Schema.Array(ApiRunEvent) });
+export const RunEventsPage = Schema.Struct({
+  run: ApiRun,
+  events: Schema.Array(ApiRunEvent),
+  hasMore: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  /** When the diff last changed; fetch `/diff` again when this moves. */
+  diffUpdatedAt: Schema.optionalWith(Schema.NullOr(Schema.Date), { default: () => null }),
+});
 export type RunEventsPage = typeof RunEventsPage.Type;
+
+/** A message to a running agent: an answer to its question, or new direction. */
+export const SendMessageBody = Schema.Struct({ text: Schema.String });
+export type SendMessageBody = typeof SendMessageBody.Type;
 
 /** One provider a user can bring a key for, and the key saved for it (never the key itself). */
 export const ApiKeySlot = Schema.Struct({

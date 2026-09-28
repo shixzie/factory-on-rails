@@ -94,7 +94,7 @@ function RepoRuns({ group, activeRunId }: { group: RepoGroup; activeRunId: strin
                 render={<Link href={`/runs/${run.id}`} />}
                 className="h-8 gap-2 pr-1.5"
               >
-                <StatusDot status={run.status} />
+                <StatusDot status={run.status} awaiting={run.awaitingInput} />
                 <span className="min-w-0 flex-1 truncate">{taskTitle(run.task, 60)}</span>
                 <span className="ml-auto text-[11px] text-muted-foreground tabular-nums" suppressHydrationWarning>
                   {shortAge(run.createdAt)}

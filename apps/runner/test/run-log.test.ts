@@ -50,4 +50,27 @@ describe("makeRunLog", () => {
       ]);
     }),
   );
+
+  it.effect("merges consecutive output, redacts event data and counts agent events toward the limit", () =>
+    Effect.gen(function* () {
+      const store = recordingStore();
+      yield* Effect.gen(function* () {
+        const log = yield* makeRunLog("run-1", { maxOutputBytes: 200 });
+        log.addSecret("sk-ant-user-key");
+        log.push("stdout", "a");
+        log.push("stdout", "b");
+        log.push("stderr", "c");
+        log.push("tool_call", "Bash", { id: "t", name: "Bash", input: { command: "echo sk-ant-user-key" } });
+        log.push("tool_result", "x".repeat(300), { toolUseId: "t", isError: false });
+        log.push("agent_result", "done", { isError: false });
+      }).pipe(Effect.scoped, Effect.provide(store.layer));
+      expect(store.events).toEqual([
+        { kind: "stdout", message: "ab" },
+        { kind: "stderr", message: "c" },
+        { kind: "tool_call", message: "Bash", data: { id: "t", name: "Bash", input: { command: "echo [redacted]" } } },
+        { kind: "info", message: "Output limit reached; further agent output is not stored" },
+        { kind: "agent_result", message: "done", data: { isError: false } },
+      ]);
+    }),
+  );
 });

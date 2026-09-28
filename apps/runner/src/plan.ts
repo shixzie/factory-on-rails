@@ -5,6 +5,11 @@ export const REPO_DIR = `${WORKSPACE}/repo`;
 export const TASK_FILE = `${WORKSPACE}/TASK.md`;
 export const COMMIT_MSG_FILE = `${WORKSPACE}/COMMIT_MSG`;
 export const NO_CHANGES_MARKER = "FACTORY_NO_CHANGES";
+/** Outside the repo: the agent's tools, its inbox and the base commit (see agent-tools.ts). */
+export const FACTORY_DIR = `${WORKSPACE}/.factory`;
+export const BASE_SHA_FILE = `${FACTORY_DIR}/base-sha`;
+/** Largest diff stored per run; bigger ones are cut at a file boundary. */
+export const MAX_DIFF_BYTES = 1024 * 1024;
 
 /** POSIX single-quote escaping. */
 export function shellQuote(value: string): string {
@@ -59,7 +64,35 @@ export function cloneScript(p: { repo: string; baseBranch: string; branch: strin
     `git clone --depth 50 --branch ${shellQuote(p.baseBranch)} "https://x-access-token:$GH_TOKEN@github.com/${p.repo}.git" ${REPO_DIR}`,
     `cd ${REPO_DIR}`,
     `git checkout -b ${shellQuote(p.branch)}`,
+    `mkdir -p ${FACTORY_DIR}/inbox ${FACTORY_DIR}/delivered`,
+    `git rev-parse HEAD > ${BASE_SHA_FILE}`,
   ].join("\n");
+}
+
+/**
+ * Prints everything the run changed since the base commit (commits and
+ * uncommitted work, new files included) as one unified diff. It stages into a
+ * throwaway index so the agent's own index, and any git command it is
+ * running, is never touched.
+ */
+export function diffScript(): string {
+  return [
+    "set -eu",
+    `cd ${REPO_DIR}`,
+    `export GIT_INDEX_FILE=${FACTORY_DIR}/diff-index`,
+    `cp .git/index "$GIT_INDEX_FILE" 2>/dev/null || git read-tree HEAD`,
+    "git add -A",
+    `git diff --cached --no-color --no-ext-diff --no-textconv --find-renames "$(cat ${BASE_SHA_FILE})"`,
+  ].join("\n");
+}
+
+/** Keeps a patch under `maxBytes` by dropping whole files from the end. */
+export function capPatch(patch: string, maxBytes = MAX_DIFF_BYTES): { patch: string; truncated: boolean } {
+  if (Buffer.byteLength(patch) <= maxBytes) return { patch, truncated: false };
+  let cut = patch.slice(0, maxBytes);
+  while (Buffer.byteLength(cut) > maxBytes) cut = cut.slice(0, -1024);
+  const lastFile = cut.lastIndexOf("\ndiff --git ");
+  return { patch: lastFile > 0 ? cut.slice(0, lastFile + 1) : "", truncated: true };
 }
 
 /** Commits anything the agent left uncommitted, then pushes if the branch moved. */

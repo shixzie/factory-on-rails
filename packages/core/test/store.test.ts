@@ -137,6 +137,45 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
+    it.effect("stores structured event data and lists user messages", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "structured");
+        yield* store.appendEvents(run.id, [
+          { kind: "user_message", message: "use pnpm" },
+          { kind: "tool_call", message: "Bash", data: { id: "toolu_1", name: "Bash", input: { command: "ls" } } },
+          { kind: "user_message", message: "and add tests" },
+        ]);
+        const all = yield* store.listEvents(run.id);
+        expect(all.map((e) => e.data)).toEqual([null, { id: "toolu_1", name: "Bash", input: { command: "ls" } }, null]);
+        const messages = yield* store.listUserMessages(run.id, Number(all[0]!.id));
+        expect(messages.map((e) => e.message)).toEqual(["and add tests"]);
+      }),
+    );
+
+    it.effect("keeps one diff per run and clears awaiting_input when a run finishes", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const run = yield* enqueue(id, "diff");
+        expect(Option.isNone(yield* store.getDiff(run.id))).toBe(true);
+        yield* store.saveDiff(run.id, "diff --git a/x b/x\n", false);
+        yield* store.saveDiff(run.id, "diff --git a/y b/y\n", true);
+        const diff = Option.getOrThrow(yield* store.getDiff(run.id));
+        expect(diff).toMatchObject({ patch: "diff --git a/y b/y\n", truncated: true });
+        expect(Option.getOrThrow(yield* store.diffUpdatedAt(run.id))).toEqual(diff.updated_at);
+
+        yield* store.claimNextRun("w");
+        yield* store.updateRun(run.id, { awaiting_input: true });
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).awaiting_input).toBe(true);
+        yield* store.finishRun(run.id, "succeeded");
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).awaiting_input).toBe(false);
+      }),
+    );
+
     it.effect("stores API keys per user and provider without exposing them in listings", () =>
       Effect.gen(function* () {
         const store = yield* Store;
