@@ -29,6 +29,7 @@ import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from 
 import { HarnessConfig } from "./config.js";
 import { fail } from "./errors.js";
 import { appInstallUrl, setupRoutes } from "./setup.js";
+import { generateRunTitle } from "./titles.js";
 
 /**
  * The harness is the web app's API and auth backend. Pages live in apps/web,
@@ -52,6 +53,8 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   repo: r.repo_full_name,
   baseBranch: r.base_branch,
   task: r.task,
+  title: r.title,
+  titleByUser: r.title_by_user,
   agent: r.agent === "codex" ? "codex" : "claude",
   status: r.status,
   branch: r.branch,
@@ -316,6 +319,8 @@ const routes = HttpRouter.empty.pipe(
     }),
   ),
 
+  // A pipe takes at most 20 routes, so the run routes go in a second one.
+).pipe(
   // ---- runs ---------------------------------------------------------------------
   HttpRouter.get(
     "/api/runs",
@@ -354,6 +359,8 @@ const routes = HttpRouter.empty.pipe(
         task,
         agent,
       });
+      // Named in the background: the run starts without waiting, and a failed title never fails it.
+      yield* Effect.forkDaemon(generateRunTitle(run));
       return yield* json(Api.ApiRun)(toApiRun(run), 201);
     }),
   ),
@@ -371,6 +378,20 @@ const routes = HttpRouter.empty.pipe(
         diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
         previewsEnabled: Option.isSome(preview),
       });
+    }),
+  ),
+
+  HttpRouter.patch(
+    "/api/runs/:id",
+    Effect.gen(function* () {
+      const { user, run } = yield* ownedRun;
+      const title = (yield* HttpServerRequest.schemaBodyJson(Api.RenameRunBody)).title.replace(/\s+/g, " ").trim();
+      if (!title) return yield* fail(400, "bad_request", "Give the run a name.");
+      if (title.length > Api.RUN_TITLE_MAX_CHARS) {
+        return yield* fail(400, "bad_request", `Keep the name to ${Api.RUN_TITLE_MAX_CHARS} characters or fewer.`);
+      }
+      const renamed = yield* (yield* Store).renameRun(run.id, user.id, title);
+      return yield* json(Api.ApiRun)(toApiRun(Option.getOrElse(renamed, () => run)));
     }),
   ),
 

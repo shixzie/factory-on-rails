@@ -74,6 +74,10 @@ export const ApiRun = Schema.Struct({
   repo: Schema.String,
   baseBranch: Schema.String,
   task: Schema.String,
+  /** A short name for the run (generated from the task, or the user's). Null until one exists: show `task` instead. */
+  title: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
+  /** The user named the run themselves. */
+  titleByUser: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
@@ -181,6 +185,13 @@ export const CreateRunBody = Schema.Struct({
   agent: Schema.optional(AgentId),
 });
 export type CreateRunBody = typeof CreateRunBody.Type;
+
+/** The longest name a run can have. */
+export const RUN_TITLE_MAX_CHARS = 80;
+
+/** Renames a run. Generated titles never replace a name the user gave it. */
+export const RenameRunBody = Schema.Struct({ title: Schema.String });
+export type RenameRunBody = typeof RenameRunBody.Type;
 
 export const CreateRepoBody = Schema.Struct({
   name: Schema.String,

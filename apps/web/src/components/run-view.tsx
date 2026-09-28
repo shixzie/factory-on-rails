@@ -23,6 +23,7 @@ import { PageHeader } from "@/components/page-header";
 import { PreviewPane } from "@/components/preview-pane";
 import { RunActivity } from "@/components/run-activity";
 import { RunFlow } from "@/components/run-flow";
+import { RunTitle } from "@/components/run-title";
 import { isActive, SandboxLabel, sandboxHint, StatusLabel } from "@/components/run-status";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,7 +34,7 @@ import { useFollow } from "@/hooks/use-follow";
 import { openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
-import { ago, duration, taskTitle } from "@/lib/format";
+import { ago, duration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const POLL_MS = 2000;
@@ -283,6 +284,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     let stopped = false;
     let after = events.at(-1)?.id ?? "0";
     let diffAt = diff?.updatedAt.getTime() ?? 0;
+    let title = run.title;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       timer = undefined;
@@ -296,6 +298,11 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           setEvents((prev) => [...prev, ...page.events]);
         }
         setRun(page.run);
+        // A title is written just after the run starts; show it in the sidebar too.
+        if (page.run.title !== title) {
+          title = page.run.title;
+          router.refresh();
+        }
         if (page.diffUpdatedAt && page.diffUpdatedAt.getTime() !== diffAt) {
           const fresh = await runInBrowser(api.runDiff(run.id));
           if (stopped) return;
@@ -461,7 +468,13 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           </>
         }
       >
-        <span className="truncate font-medium">{taskTitle(run.task)}</span>
+        <RunTitle
+          run={run}
+          onRenamed={(renamed) => {
+            setRun(renamed);
+            router.refresh();
+          }}
+        />
         <Badge variant="outline" className="hidden shrink-0 font-normal text-muted-foreground sm:inline-flex">
           {run.repo}
         </Badge>

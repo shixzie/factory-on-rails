@@ -9,10 +9,12 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
     "@effect/platform": "0.97.2",
     "@effect/platform-node": "0.108.2",
     "@effect/sql": "0.52.1",
     "@factory/core": "workspace:*",
-    "effect": "3.22.2"
+    "effect": "3.22.2",
+    "openai": "^7.23.0"
   }
 }

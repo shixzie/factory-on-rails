@@ -39,6 +39,10 @@ export interface RunRow {
   installation_id: string;
   base_branch: string;
   task: string;
+  /** A short name for the run: written by a small model from the task, or by the user. Null until one exists. */
+  title: string | null;
+  /** The user named the run, so a generated title never replaces it. */
+  title_by_user: boolean;
   /** The coding agent: `claude` or `codex` (see AGENTS). */
   agent: string;
   status: RunStatus;
@@ -157,6 +161,10 @@ export interface StoreService {
   /** Records liveness and returns the run's current status (how the runner notices cancellation). */
   readonly heartbeat: (runId: string) => Q<Option.Option<RunStatus>>;
   readonly updateRun: (runId: string, patch: RunPatch) => Q<void>;
+  /** Stores a generated title, unless the user has named the run. Returns whether it was stored. */
+  readonly setGeneratedTitle: (runId: string, title: string) => Q<boolean>;
+  /** The user names their run; generated titles never replace it afterwards. None if it is not their run. */
+  readonly renameRun: (runId: string, userId: string, title: string) => Q<Option.Option<RunRow>>;
   /**
    * Ends a turn. A run that succeeded while the user sent a message the agent
    * never got goes straight back to the queue, so that message is answered.
@@ -295,6 +303,17 @@ const make = Effect.gen(function* () {
             update runs set ${sql.update(patch)}
               ${patch.sandbox_state ? sql`, sandbox_state_at = now()` : sql``}
             where id = ${runId}`.pipe(Effect.asVoid),
+
+    setGeneratedTitle: (runId, title) =>
+      sql`update runs set title = ${title} where id = ${runId} and not title_by_user returning id`.pipe(
+        Effect.map((rows) => rows.length > 0),
+      ),
+
+    renameRun: (runId, userId, title) =>
+      sql<RunRow>`
+        update runs set title = ${title}, title_by_user = true
+        where id = ${runId} and user_id = ${userId}
+        returning *`.pipe(Effect.map(Arr.head)),
 
     finishRun: (runId, status, error) =>
       Effect.gen(function* () {

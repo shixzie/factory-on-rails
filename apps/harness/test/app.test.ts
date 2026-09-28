@@ -18,6 +18,7 @@ import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { app, originCheck } from "../src/app.js";
 import { HarnessConfig } from "../src/config.js";
 import { RailwayApi, RailwayError } from "../src/railway.js";
+import { TitleError, TitleModel, type TitleProvider } from "../src/titles.js";
 
 const ORIGIN = "https://factory.example";
 const key = randomBytes(32);
@@ -73,9 +74,23 @@ const RailwayTest = Layer.succeed(RailwayApi, {
     }),
 });
 
+/** The title model: records what it was asked and answers with `titles.answer` (or fails when it is null). */
+const titles = {
+  calls: [] as Array<{ provider: TitleProvider; apiKey: string; task: string }>,
+  answer: 'Title: "Add a README."' as string | null,
+};
+const TitleTest = Layer.succeed(TitleModel, {
+  write: (provider, apiKey, task) =>
+    Effect.suspend(() => {
+      titles.calls.push({ provider, apiKey, task });
+      return titles.answer === null ? Effect.fail(new TitleError({ message: "overloaded" })) : Effect.succeed(titles.answer);
+    }),
+});
+
 const TestLayer = Layer.mergeAll(
   GitHubTest,
   RailwayTest,
+  TitleTest,
   Layer.succeed(HarnessConfig, {
     publicUrl: ORIGIN,
     allowedLogins: ["shixzie"],
@@ -411,6 +426,83 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect((await send("DELETE", "/api/settings/keys/anthropic", cookie)).status).toBe(200);
       const rows = await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`select 1 from user_api_keys`));
       expect(rows).toHaveLength(0);
+    });
+  });
+
+  describe("run titles", () => {
+    const repo = { id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" };
+    const runTitle = (id: string) => run(Effect.flatMap(Store, (s) => s.getRun(id))).then((r) => Option.getOrThrow(r).title);
+    /** Title generation runs in the background after the run is created. */
+    const eventually = async <A>(check: () => Promise<A>, done: (a: A) => boolean) => {
+      for (let i = 0; i < 50; i++) {
+        const value = await check();
+        if (done(value)) return value;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return check();
+    };
+
+    it("names a new run with the small model of the run's own provider", async () => {
+      const { cookie } = await signIn("titler", 20);
+      github.repos = [repo];
+      const openaiKey = "sk-proj-" + "t".repeat(30);
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-api03-" + "t".repeat(30) });
+      await send("PUT", "/api/settings/keys/openai", cookie, { key: openaiKey });
+      titles.calls.length = 0;
+      titles.answer = '**Title:** "Wire up the login page."';
+
+      const res = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "  the login page does nothing, wire it up  ", agent: "codex" });
+      expect(res.status).toBe(201);
+      const created = await json(res);
+      expect(created).toMatchObject({ title: null, titleByUser: false });
+      const title = await eventually(() => runTitle(created.id), (t) => t !== null);
+      expect(title).toBe("Wire up the login page");
+      expect(titles.calls).toEqual([{ provider: "openai", apiKey: openaiKey, task: "the login page does nothing, wire it up" }]);
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie } }));
+      expect(detail.run).toMatchObject({ title: "Wire up the login page", titleByUser: false });
+    });
+
+    it("leaves runs untitled, and running, when no key can name them or the model fails", async () => {
+      github.repos = [repo];
+      const subscriber = await signIn("subscriber", 21);
+      await send("PUT", "/api/settings/keys/claude_oauth", subscriber.cookie, { key: "sk-ant-oat01-" + "s".repeat(30) });
+      titles.calls.length = 0;
+      const first = await json(post("/api/runs", subscriber.cookie, { installationId: 1, repo: "shixzie/demo", task: "Fix the flaky test" }));
+      expect(first.status).toBe("queued");
+
+      const keyed = await signIn("keyed", 22);
+      await send("PUT", "/api/settings/keys/anthropic", keyed.cookie, { key: "sk-ant-api03-" + "k".repeat(30) });
+      titles.answer = null;
+      const second = await json(post("/api/runs", keyed.cookie, { installationId: 1, repo: "shixzie/demo", task: "Fix the flaky test" }));
+      expect(second.status).toBe("queued");
+
+      await eventually(async () => titles.calls.length, (n) => n > 0);
+      await new Promise((r) => setTimeout(r, 50));
+      titles.answer = 'Title: "Add a README."';
+      expect(titles.calls.map((c) => c.provider)).toEqual(["anthropic"]);
+      expect(await runTitle(first.id)).toBeNull();
+      expect(await runTitle(second.id)).toBeNull();
+    });
+
+    it("lets the owner rename a run, and keeps that name", async () => {
+      const owner = await signIn("namer", 23);
+      const other = await signIn("not-namer", 24);
+      const created = await run(
+        Effect.flatMap(Store, (store) =>
+          store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "x" }),
+        ),
+      );
+      expect(await run(Effect.flatMap(Store, (s) => s.setGeneratedTitle(created.id, "Generated")))).toBe(true);
+
+      expect((await send("PATCH", `/api/runs/${created.id}`, other.cookie, { title: "Mine now" })).status).toBe(404);
+      expect((await send("PATCH", `/api/runs/${created.id}`, owner.cookie, { title: "  \n " })).status).toBe(400);
+      expect((await send("PATCH", `/api/runs/${created.id}`, owner.cookie, { title: "x".repeat(81) })).status).toBe(400);
+      const renamed = await send("PATCH", `/api/runs/${created.id}`, owner.cookie, { title: "  Login   page\nfix " });
+      expect(renamed.status).toBe(200);
+      expect(await json(renamed)).toMatchObject({ title: "Login page fix", titleByUser: true });
+
+      expect(await run(Effect.flatMap(Store, (s) => s.setGeneratedTitle(created.id, "Generated again")))).toBe(false);
+      expect(await runTitle(created.id)).toBe("Login page fix");
     });
   });
 

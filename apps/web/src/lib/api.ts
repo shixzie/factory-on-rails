@@ -41,7 +41,7 @@ const call = <A, I>(request: HttpClientRequest.HttpClientRequest, schema: Schema
     }),
   );
 
-const json = (method: "POST" | "PUT", url: string, body: unknown) =>
+const json = (method: "POST" | "PUT" | "PATCH", url: string, body: unknown) =>
   HttpClientRequest.make(method)(url).pipe(HttpClientRequest.bodyUnsafeJson(body));
 
 export const api = {
@@ -61,6 +61,8 @@ export const api = {
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
   openPreview: (id: string, body: Api.OpenPreviewBody) =>
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/previews`, body), Api.PreviewLink),
+  renameRun: (id: string, title: string) =>
+    call(json("PATCH", `/api/runs/${encodeURIComponent(id)}`, { title }), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),
   keys: call(HttpClientRequest.get("/api/settings/keys"), Schema.Array(Api.ApiKeySlot)),
   saveKey: (provider: string, key: string) =>
