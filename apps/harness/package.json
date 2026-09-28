@@ -1,0 +1,16 @@
+{
+  "name": "@factory/harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@factory/core": "workspace:*",
+    "@hono/node-server": "^1.19.0",
+    "hono": "^4.9.0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "factory-on-rails",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b && tsc -p .railway/tsconfig.json",
+    "test": "vitest run",
+    "migrate": "pnpm build && node --env-file-if-exists=.env packages/core/dist/migrate.js",
+    "dev:harness": "pnpm build && node --env-file=.env apps/harness/dist/index.js",
+    "dev:runner": "pnpm build && node --env-file=.env apps/runner/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "railway": "^3.11.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

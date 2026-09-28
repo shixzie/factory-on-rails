@@ -1,0 +1,70 @@
+# Plans .railway/railway.ts on pull requests and applies the reviewed plan on
+# merge, using Railway's official action. See docs/setup.md for the
+# RAILWAY_TOKEN secret (a project token for the production environment).
+name: Railway config
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - ".railway/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  id-token: write
+
+env:
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+jobs:
+  plan:
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip until RAILWAY_TOKEN is configured
+        if: env.RAILWAY_TOKEN == ''
+        run: echo "::notice::RAILWAY_TOKEN secret is not set, skipping the Railway plan. See docs/setup.md."
+      - uses: actions/checkout@v4
+        if: env.RAILWAY_TOKEN != ''
+      - uses: pnpm/action-setup@v4
+        if: env.RAILWAY_TOKEN != ''
+      - uses: actions/setup-node@v4
+        if: env.RAILWAY_TOKEN != ''
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        if: env.RAILWAY_TOKEN != ''
+      - uses: railwayapp/config@v1
+        if: env.RAILWAY_TOKEN != ''
+        with:
+          command: plan
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}
+
+  apply:
+    if: github.event.action == 'closed' && github.event.pull_request.merged && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip until RAILWAY_TOKEN is configured
+        if: env.RAILWAY_TOKEN == ''
+        run: echo "::notice::RAILWAY_TOKEN secret is not set, skipping the Railway apply. See docs/setup.md."
+      - uses: actions/checkout@v4
+        if: env.RAILWAY_TOKEN != ''
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - uses: pnpm/action-setup@v4
+        if: env.RAILWAY_TOKEN != ''
+      - uses: actions/setup-node@v4
+        if: env.RAILWAY_TOKEN != ''
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        if: env.RAILWAY_TOKEN != ''
+      - uses: railwayapp/config@v1
+        if: env.RAILWAY_TOKEN != ''
+        with:
+          command: apply
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}

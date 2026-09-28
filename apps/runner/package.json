@@ -1,0 +1,15 @@
+{
+  "name": "@factory/runner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@factory/core": "workspace:*",
+    "railway": "^3.11.0"
+  }
+}
