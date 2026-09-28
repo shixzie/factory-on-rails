@@ -147,6 +147,7 @@ export default defineRailway((ctx) => {
     start: "node apps/preview/dist/index.js",
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
+    domains: production ? [{ domain: `*.${previewDomain}`, port: 8080 }] : [],
     env: {
       PORT: "8080",
       DATABASE_URL: db.env.DATABASE_URL,
