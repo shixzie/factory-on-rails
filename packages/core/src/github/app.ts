@@ -45,6 +45,13 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
       repoFullName: string,
       pr: { title: string; body: string; head: string; base: string },
     ) => Effect.Effect<PullRequest, GitHubError>;
+    /** Rewrites an open pull request's title and description. */
+    readonly updatePullRequest: (
+      token: Redacted.Redacted<string>,
+      repoFullName: string,
+      number: number,
+      pr: { title: string; body: string },
+    ) => Effect.Effect<PullRequest, GitHubError>;
   }
 >() {
   static readonly Live = Layer.effect(
@@ -76,6 +83,12 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
           ),
         createPullRequest: (token, repoFullName, pr) =>
           githubRequest("POST", `/repos/${repoFullName}/pulls`).pipe(
+            HttpClientRequest.bearerToken(Redacted.value(token)),
+            HttpClientRequest.bodyUnsafeJson(pr),
+            executeJson(client, PullRequest),
+          ),
+        updatePullRequest: (token, repoFullName, number, pr) =>
+          githubRequest("PATCH", `/repos/${repoFullName}/pulls/${number}`).pipe(
             HttpClientRequest.bearerToken(Redacted.value(token)),
             HttpClientRequest.bodyUnsafeJson(pr),
             executeJson(client, PullRequest),
