@@ -1,6 +1,27 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Fiber } from "effect";
-import { wrapSandbox, type SandboxLike } from "../src/sandbox.js";
+import { Deferred, Effect, Fiber, Schedule } from "effect";
+import { ExecInterruptedError } from "railway";
+import { waitUntilReady, wrapSandbox, type SandboxLike } from "../src/sandbox.js";
+
+/** A sandbox whose exec answers from `outcomes` in order (the last one repeats). */
+const scriptedSandbox = (outcomes: Array<"ok" | Error>) => {
+  const calls: string[] = [];
+  const sandbox: SandboxLike = {
+    id: "sbx",
+    exec: (command) => {
+      calls.push(command);
+      const outcome = outcomes[Math.min(calls.length - 1, outcomes.length - 1)]!;
+      const result =
+        outcome === "ok" ? Promise.resolve({ exitCode: 0, stdout: "", timedOut: false }) : Promise.reject(outcome);
+      return Object.assign(result, { kill: async () => true });
+    },
+    files: { write: async () => undefined },
+  };
+  return { sandbox, calls };
+};
+
+const stillCreating = () =>
+  new ExecInterruptedError({ closeCode: 1008, reason: "Sandbox is not running (status: CREATING). ", stdout: "", stderr: "" });
 
 describe("wrapSandbox", () => {
   it.effect("streams output and returns the result", () =>
@@ -55,6 +76,36 @@ describe("wrapSandbox", () => {
       expect(execError._tag).toBe("SandboxError");
       const writeError = yield* Effect.flip(wrapSandbox(sandbox).writeFile("/tmp/x", "y"));
       expect(writeError.message).toBe("Could not write /tmp/x: disk full");
+    }),
+  );
+});
+
+describe("waitUntilReady", () => {
+  const fast = Schedule.recurs(5);
+
+  it.effect("retries while Railway still reports the sandbox as CREATING", () =>
+    Effect.gen(function* () {
+      const { sandbox, calls } = scriptedSandbox([stillCreating(), stillCreating(), "ok"]);
+      yield* waitUntilReady(sandbox, fast);
+      expect(calls).toEqual(["true", "true", "true"]);
+    }),
+  );
+
+  it.effect("gives up with a clear error if the sandbox never starts", () =>
+    Effect.gen(function* () {
+      const { sandbox, calls } = scriptedSandbox([stillCreating()]);
+      const error = yield* Effect.flip(waitUntilReady(sandbox, fast));
+      expect(calls).toHaveLength(6);
+      expect(error.message).toMatch(/^Sandbox sbx did not start accepting commands: .*status: CREATING/);
+    }),
+  );
+
+  it.effect("does not retry other failures", () =>
+    Effect.gen(function* () {
+      const { sandbox, calls } = scriptedSandbox([new Error("auth failed")]);
+      const error = yield* Effect.flip(waitUntilReady(sandbox, fast));
+      expect(calls).toHaveLength(1);
+      expect(error.message).toBe("Sandbox sbx did not start accepting commands: auth failed");
     }),
   );
 });

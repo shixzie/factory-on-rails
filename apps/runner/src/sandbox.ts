@@ -1,5 +1,5 @@
-import { Config, Context, Data, Effect, Layer, Option, Redacted } from "effect";
-import { Sandbox } from "railway";
+import { Config, Context, Data, Duration, Effect, Layer, Option, Redacted, Schedule } from "effect";
+import { ExecInterruptedError, Sandbox } from "railway";
 
 export class SandboxError extends Data.TaggedError("SandboxError")<{ message: string; cause?: unknown }> {}
 
@@ -43,6 +43,8 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
         authType: "project-token" as const,
         environmentId: config.environmentId,
       };
+      const destroy = (id: string) =>
+        attempt(`Could not destroy sandbox ${id}`, async () => (await Sandbox.connect(id, auth)).destroy());
       return {
         create: (env) =>
           attempt("Could not create a sandbox", () => {
@@ -58,9 +60,12 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
               onNone: () => Sandbox.create(options),
               onSome: (checkpoint) => Sandbox.create(checkpoint, options),
             });
-          }).pipe(Effect.map(wrapSandbox)),
-        destroy: (id) =>
-          attempt(`Could not destroy sandbox ${id}`, async () => (await Sandbox.connect(id, auth)).destroy()),
+          }).pipe(
+            // Don't leak a sandbox that never starts taking commands.
+            Effect.tap((sandbox) => waitUntilReady(sandbox).pipe(Effect.tapError(() => Effect.ignore(destroy(sandbox.id))))),
+            Effect.map(wrapSandbox),
+          ),
+        destroy,
       };
     }),
   );
@@ -74,6 +79,26 @@ export const SandboxConfig = Config.all({
   checkpoint: Config.option(Config.nonEmptyString("SANDBOX_CHECKPOINT")),
   idleTimeoutMinutes: Config.integer("SANDBOX_IDLE_TIMEOUT_MINUTES").pipe(Config.withDefault(15)),
 });
+
+/**
+ * `Sandbox.create` resolves once the API reports RUNNING, but the exec gateway
+ * can still see the sandbox as CREATING for a moment and closes the session
+ * with 1008 before running anything. That refusal is safe to retry.
+ */
+export const isStillStarting = (cause: unknown): boolean =>
+  cause instanceof ExecInterruptedError && cause.closeCode === 1008 && /status: CREATING/.test(cause.message);
+
+const READY_SCHEDULE = Schedule.exponential("250 millis").pipe(
+  Schedule.either(Schedule.spaced("2 seconds")),
+  Schedule.upTo(Duration.minutes(2)),
+);
+
+/** Runs a no-op until the sandbox accepts commands, so the first real step never races its startup. */
+export const waitUntilReady = (sandbox: SandboxLike, schedule: Schedule.Schedule<unknown, SandboxError> = READY_SCHEDULE) =>
+  attempt(`Sandbox ${sandbox.id} did not start accepting commands`, async () => sandbox.exec("true", {})).pipe(
+    Effect.retry({ schedule, while: (err) => isStillStarting(err.cause) }),
+    Effect.asVoid,
+  );
 
 const attempt = <A>(context: string, f: () => Promise<A>) =>
   Effect.tryPromise({
