@@ -131,6 +131,8 @@ Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"
 1. `Sandbox.create({ environmentId, env, region, networkIsolation: "ISOLATED", idleTimeoutMinutes })`,
    or `Sandbox.create(checkpointName, …)` when `SANDBOX_CHECKPOINT` is set.
    `SANDBOX_REGION` pins sandboxes to the factory's region (Railway's default is us-west2).
+   The runner then runs `true` until the exec gateway accepts commands: it can still
+   refuse with "status: CREATING" (close code 1008) just after the API reports RUNNING.
 2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
    agent, commit and push, with `onStdout` / `onStderr` streaming into
    `run_events`. Every command starts with `export HOME="${HOME:-/root}"`,
