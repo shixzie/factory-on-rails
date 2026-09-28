@@ -42,14 +42,43 @@ export const DEFAULT_CODEX_COMMAND = [
   ].join(" "),
 ].join("\n");
 
+/**
+ * Claude Code writing the pull request once the work is pushed (see
+ * describePrompt in plan.ts). It continues the run's session, so it knows why
+ * it made each change, without saving this exchange to it: the next turn
+ * continues the work, not the write-up. It gets tools to read the repo and
+ * git history but none that edit files, and its reply is the PR.
+ */
+export const DEFAULT_AGENT_DESCRIBE_COMMAND = [
+  'claude --continue --no-session-persistence -p "$(cat "$FACTORY_DESCRIBE_FILE")"',
+  '--dangerously-skip-permissions --tools "Bash,Read,Grep,Glob"',
+  '> "$FACTORY_PR_FILE"',
+].join(" ");
+
+/** The same for Codex: resume its last session without saving to it, and keep its last message. */
+export const DEFAULT_CODEX_DESCRIBE_COMMAND = [
+  "codex exec resume --last --ephemeral",
+  "--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check",
+  '-o "$FACTORY_PR_FILE" - < "$FACTORY_DESCRIBE_FILE"',
+].join(" ");
+
 /** How to install and run one agent CLI in a sandbox. */
 export interface AgentCommands {
   readonly setupCommand: string;
   readonly command: string;
+  /**
+   * Asks the agent for the pull request's title and description after the
+   * push; the reply goes to $FACTORY_PR_FILE. Without one (or when it fails)
+   * the PR is titled after the task.
+   */
+  readonly describeCommand?: string;
 }
 
 export interface AgentSettings {
-  /** Per agent: Claude Code (AGENT_SETUP_COMMAND, AGENT_COMMAND) and Codex (CODEX_SETUP_COMMAND, CODEX_COMMAND). */
+  /**
+   * Per agent: Claude Code (AGENT_SETUP_COMMAND, AGENT_COMMAND,
+   * AGENT_DESCRIBE_COMMAND) and Codex (the same with CODEX_).
+   */
   readonly commands: Readonly<Record<AgentId, AgentCommands>>;
   readonly timeoutSec: number;
   /**
@@ -118,10 +147,12 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
             claude: Config.all({
               setupCommand: str("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP),
               command: str("AGENT_COMMAND", DEFAULT_AGENT_COMMAND),
+              describeCommand: str("AGENT_DESCRIBE_COMMAND", DEFAULT_AGENT_DESCRIBE_COMMAND),
             }),
             codex: Config.all({
               setupCommand: str("CODEX_SETUP_COMMAND", DEFAULT_CODEX_SETUP),
               command: str("CODEX_COMMAND", DEFAULT_CODEX_COMMAND),
+              describeCommand: str("CODEX_DESCRIBE_COMMAND", DEFAULT_CODEX_DESCRIBE_COMMAND),
             }),
           }),
           timeoutSec: int("AGENT_TIMEOUT_SECONDS", 3600),

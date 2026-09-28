@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { agentToolEnv, agentToolFiles, deliverMessageScript, SYSTEM_PROMPT } from "../src/agent-tools.js";
-import { DEFAULT_CODEX_COMMAND } from "../src/config.js";
+import { DEFAULT_AGENT_DESCRIBE_COMMAND, DEFAULT_CODEX_COMMAND, DEFAULT_CODEX_DESCRIBE_COMMAND } from "../src/config.js";
 
 /** Writes the agent tools into a temp dir, as the runner does in the sandbox. */
 function setup() {
@@ -69,6 +69,56 @@ describe("agent tools", () => {
 
     const later = await invoke({ FACTORY_CONTINUE: "1" });
     expect(later.args.slice(0, 4)).toEqual(["exec", "resume", "--last", "--json"]);
+  });
+
+  it("asks each agent for the pull request in its own session, without saving the exchange, and keeps the reply", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "factory-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    // Stand-ins that reply with their arguments and prompt: Claude Code on
+    // stdout, Codex in the file named after -o.
+    writeFileSync(
+      join(bin, "claude"),
+      `#!/usr/bin/env node\nconsole.log(JSON.stringify({ args: process.argv.slice(2) }));\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(bin, "codex"),
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nlet stdin = "";\nprocess.stdin.on("data", (d) => (stdin += d)).on("end", () => fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ args, stdin })));\n`,
+      { mode: 0o755 },
+    );
+    const prompt = join(dir, "describe-prompt.md");
+    writeFileSync(prompt, "Write the PR");
+    const pr = join(dir, "pull-request.md");
+    const describe = async (command: string) => {
+      await run("sh", ["-c", command], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FACTORY_DESCRIBE_FILE: prompt, FACTORY_PR_FILE: pr } });
+      return JSON.parse(readFileSync(pr, "utf8")) as { args: string[]; stdin?: string };
+    };
+
+    const claude = await describe(DEFAULT_AGENT_DESCRIBE_COMMAND);
+    expect(claude.args).toEqual([
+      "--continue",
+      "--no-session-persistence",
+      "-p",
+      "Write the PR",
+      "--dangerously-skip-permissions",
+      "--tools",
+      "Bash,Read,Grep,Glob",
+    ]);
+
+    const codex = await describe(DEFAULT_CODEX_DESCRIBE_COMMAND);
+    expect(codex.args).toEqual([
+      "exec",
+      "resume",
+      "--last",
+      "--ephemeral",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--skip-git-repo-check",
+      "-o",
+      pr,
+      "-",
+    ]);
+    expect(codex.stdin).toBe("Write the PR");
   });
 
   it("points Claude Code at the MCP server and the hooks", () => {

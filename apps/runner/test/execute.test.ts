@@ -428,4 +428,92 @@ describe("executeRun", () => {
       }),
     );
   });
+
+  describe("the pull request text", () => {
+    const describing = { agent: { ...agent, describeCommand: "describe-pr" } };
+    const READ_REPLY = "cat /workspace/.factory/pull-request.md";
+    const reply = "# Add a README with a heading\n\nThe repo had no README.\n\n## Changes\n- README.md: title and one paragraph\n";
+
+    it.effect("is written by the agent after the push, from its session and the final diff", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ [READ_REPLY]: { stdout: reply } });
+        const { outcome, github, events } = yield* execute(sandboxes, recordingStore(), describing);
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        const lines = firstLines(sandboxes.state.commands);
+        // After the push (the last "set -eu"), before the PR.
+        expect(lines.slice(-3)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
+        expect(sandboxes.state.commands.at(-2)).toContain("\ndescribe-pr");
+        expect(sandboxes.state.envs.at(-2)).toEqual({
+          FACTORY_DESCRIBE_FILE: "/workspace/.factory/describe-prompt.md",
+          FACTORY_PR_FILE: "/workspace/.factory/pull-request.md",
+        });
+        expect(sandboxes.state.files["/workspace/.factory/describe-prompt.md"]).toContain("git diff 'origin/main'...HEAD");
+        expect(events).toContain("info:Writing the pull request description");
+        const [, , , pr] = github[1] as [string, string, string, { title: string; body: string }];
+        expect(pr.title).toBe("Add a README with a heading");
+        expect(pr.body).toMatch(/^The repo had no README\.\n\n## Changes\n- README\.md: title and one paragraph\n\n---\n/);
+        expect(pr.body).toContain("<details><summary>Task</summary>\n\nAdd a README\n\nWith a heading.\n\n</details>");
+      }),
+    );
+
+    it.effect("falls back to the task when the agent can't write it", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ "describe-pr": { exitCode: 1 } });
+        const { outcome, github, events } = yield* execute(sandboxes, recordingStore(), describing);
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(events).toContain(
+          "info:Could not write the pull request description (Writing the pull request description: exited with code 1), so the PR is titled after the task",
+        );
+        expect(github[1]).toEqual([
+          "createPullRequest",
+          "ghs_repo_token",
+          "shixzie/demo",
+          expect.objectContaining({ title: "Add a README", body: expect.stringContaining("### Task") }),
+        ]);
+      }),
+    );
+
+    it.effect("falls back to the task when the reply is empty, and never leaks a key into it", () =>
+      Effect.gen(function* () {
+        const empty = fakeSandboxes({ [READ_REPLY]: { stdout: "\n" } });
+        const first = yield* execute(empty, recordingStore(), describing);
+        expect(first.events).toContain("info:Could not write the pull request description (the agent's reply had no title), so the PR is titled after the task");
+
+        const leaky = fakeSandboxes({ [READ_REPLY]: { stdout: `Add a README\n\nUsed sk-ant-user-key to test.` } });
+        const second = yield* execute(leaky, recordingStore(), describing);
+        const [, , , pr] = second.github[1] as [string, string, string, { body: string }];
+        expect(pr.body).not.toContain("sk-ant-user-key");
+      }),
+    );
+
+    it.effect("replaces the open PR's title and description on a later turn", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ [READ_REPLY]: { stdout: reply } }, { alive: ["sbx_live"] });
+        const turn = followUp({ sandbox_state: "running", sandbox_id: "sbx_live" });
+        const { outcome, github, events } = yield* execute(sandboxes, withMessage(), describing, { turn, prOpen: true });
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.files["/workspace/.factory/describe-prompt.md"]).toContain("already has a pull request");
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "updatePullRequest"]);
+        expect(github[2]).toEqual([
+          "updatePullRequest",
+          "ghs_repo_token",
+          "shixzie/demo",
+          1,
+          { title: "Add a README with a heading", body: expect.stringMatching(/^The repo had no README\./) },
+        ]);
+        expect(events).toContain(`info:Pushed the changes to ${PR} and updated its description`);
+      }),
+    );
+
+    it.effect("isn't asked for when nothing was pushed", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ "git push": { stdout: `${NO_CHANGES_MARKER}\n` } });
+        yield* execute(sandboxes, recordingStore(), describing);
+        expect(sandboxes.state.commands.some((c) => c.includes("describe-pr"))).toBe(false);
+      }),
+    );
+  });
 });

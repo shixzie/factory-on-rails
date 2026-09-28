@@ -21,6 +21,10 @@ export const BASE_SHA_FILE = `${FACTORY_DIR}/base-sha`;
 export const TOKEN_FILE = `${FACTORY_DIR}/gh-token`;
 /** Written when the agent starts, so a later turn knows there is a session to continue. */
 export const AGENT_RAN_FILE = `${FACTORY_DIR}/agent-ran`;
+/** What the agent is asked when it writes the pull request (see describePrompt). */
+export const DESCRIBE_FILE = `${FACTORY_DIR}/describe-prompt.md`;
+/** Where the agent's pull request title and description land. */
+export const PR_FILE = `${FACTORY_DIR}/pull-request.md`;
 /** Largest diff stored per run; bigger ones are cut at a file boundary. */
 export const MAX_DIFF_BYTES = 1024 * 1024;
 
@@ -193,7 +197,86 @@ export function commitMessage(task: string, runId: string): string {
   return `${summarizeTask(task)}\n\nFactory run ${runId}\n`;
 }
 
-export function pullRequestBody(p: { task: string; runId: string; runUrl?: string }): string {
+/** GitHub's own limit on a pull request title. */
+const MAX_TITLE = 256;
+/** Keeps a description a reviewer will read; the prompt asks for far less. */
+export const MAX_DESCRIPTION = 12_000;
+
+/**
+ * What the run's agent is asked once its work is pushed: the pull request's
+ * title and description, as its whole reply. It continues its own session,
+ * so it knows why it did what it did, and it reads the final diff for what
+ * actually changed. On a later turn the PR already exists and the new text
+ * replaces the old, so it covers the whole branch, not only the new commits.
+ */
+export function describePrompt(p: { baseBranch: string; existing: boolean }): string {
+  const base = shellQuote(`origin/${p.baseBranch}`);
+  return [
+    p.existing
+      ? "Your work is pushed, and this branch already has a pull request from an earlier round. Write its title and description again so they cover everything the branch changes now, not only this latest round."
+      : "Your work is pushed. Now write the title and description of the pull request for it.",
+    "",
+    `First look at what the branch changes: \`git log --oneline ${base}..HEAD\` and \`git diff --stat ${base}...HEAD\`, then \`git diff ${base}...HEAD\` for the parts you need to describe accurately. Don't change any files.`,
+    "",
+    "Reply with the pull request and nothing else, no preamble and no code fence:",
+    "",
+    "- Line 1 is the title: under 72 characters, imperative mood, specific about what changes (\"Retry sandbox exec while the sandbox is still starting\", not \"Fix bug\" or \"Update files\"). Use a prefix like \"feat:\" only if the repository's commit history does.",
+    "- Then a blank line, then the description in GitHub Markdown.",
+    "",
+    "If the repository has a pull request template (.github/pull_request_template.md, .github/PULL_REQUEST_TEMPLATE.md, a file in .github/PULL_REQUEST_TEMPLATE/, PULL_REQUEST_TEMPLATE.md or docs/pull_request_template.md), use its headings and fill in each section. Otherwise use this shape:",
+    "",
+    "1. One or two sentences on what changes and why, for someone who hasn't seen the task.",
+    "2. `## Changes`: one bullet per meaningful change, naming the files, modules or behaviour involved. Group small related edits into one bullet.",
+    "3. `## How to verify`: the commands to run or the behaviour to check, including tests you added or ran and their result.",
+    "4. `## Notes`: assumptions you made, anything left undone, follow-ups or risks. Leave the section out when there is nothing to say.",
+    "",
+    "Be detailed but not verbose. Each line should tell a reviewer something the diff doesn't make obvious at a glance. Aim for under 250 words, more only for a large change. Don't restate the task word for word, narrate your attempts, or pad with filler.",
+  ].join("\n");
+}
+
+/**
+ * The agent's reply read as a pull request: its first line (without a
+ * heading mark, "Title:" or quotes) as the title and the rest as the
+ * description. Undefined when there is no usable title.
+ */
+export function parsePullRequest(text: string): { title: string; description: string } | undefined {
+  let lines = text.replace(/\r\n?/g, "\n").trim().split("\n");
+  // A reply wrapped in a code fence despite the prompt.
+  if (/^```/.test(lines[0] ?? "") && /^```\s*$/.test(lines.at(-1) ?? "")) lines = lines.slice(1, -1);
+  const start = lines.findIndex((l) => l.trim() !== "");
+  if (start < 0) return undefined;
+  const title = lines[start]!
+    .trim()
+    .replace(/^#+\s*/, "")
+    .replace(/^\*\*(.*)\*\*$/, "$1")
+    .replace(/^title:\s*/i, "")
+    .replace(/^(["'`])(.*)\1$/, "$2")
+    .trim();
+  if (!title) return undefined;
+  let description = lines.slice(start + 1).join("\n").trim();
+  if (description.length > MAX_DESCRIPTION) description = `${description.slice(0, MAX_DESCRIPTION).trimEnd()}\n\n…`;
+  return { title: title.length > MAX_TITLE ? `${title.slice(0, MAX_TITLE - 1)}…` : title, description };
+}
+
+/**
+ * The pull request description: the agent's own when it wrote one, then a
+ * footer linking the run with the task folded away; without one, the task.
+ */
+export function pullRequestBody(p: { task: string; runId: string; runUrl?: string; description?: string }): string {
   const link = p.runUrl ? `[${p.runId}](${p.runUrl})` : p.runId;
-  return `Opened by Factory on Rails, run ${link}.\n\n### Task\n\n${p.task.trim()}\n`;
+  if (!p.description) return `Opened by Factory on Rails, run ${link}.\n\n### Task\n\n${p.task.trim()}\n`;
+  return [
+    p.description.trim(),
+    "",
+    "---",
+    "",
+    `Opened by Factory on Rails, run ${link}.`,
+    "",
+    "<details><summary>Task</summary>",
+    "",
+    p.task.trim(),
+    "",
+    "</details>",
+    "",
+  ].join("\n");
 }
