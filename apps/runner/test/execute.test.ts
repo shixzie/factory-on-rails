@@ -43,7 +43,11 @@ const execute = (
   sandboxes: ReturnType<typeof fakeSandboxes>,
   store = recordingStore(),
   extra: Partial<ExecuteOptions> = {},
-  { turn = run, prOpen = false }: { turn?: RunRow; prOpen?: boolean } = {},
+  {
+    turn = run,
+    prOpen = false,
+    grantedPermissions,
+  }: { turn?: RunRow; prOpen?: boolean; grantedPermissions?: string[] } = {},
 ) => {
   const github: unknown[][] = [];
   return Effect.gen(function* () {
@@ -52,7 +56,10 @@ const execute = (
     const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ...extra });
     yield* log.flush;
     return { outcome, github, events: store.events.map((e) => `${e.kind}:${e.message}`) };
-  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { prOpen }))));
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { grantedPermissions, prOpen }))),
+  );
 };
 
 /** The line each command ran after the shared prelude (HOME and the GitHub token). */
@@ -69,7 +76,10 @@ describe("executeRun", () => {
       expect(github[0]).toEqual([
         "installationToken",
         42,
-        { repositories: ["demo"], permissions: { contents: "write", pull_requests: "write", metadata: "read" } },
+        {
+          repositories: ["demo"],
+          permissions: { contents: "write", pull_requests: "write", metadata: "read", workflows: "write" },
+        },
       ]);
       expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", IS_SANDBOX: "1" });
       // The token goes in a file each turn (it expires), readable only by its owner.
@@ -154,6 +164,44 @@ describe("executeRun", () => {
       // It never got a checkout, so it is no use to a later turn.
       expect(sandboxes.state.destroyed).toBe(true);
       expect(events.at(-1)).toBe("info:Sandbox destroyed");
+    }),
+  );
+
+  it.effect("runs without workflow access when the App was never granted it", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes();
+      const store = recordingStore();
+      const { outcome, github, events } = yield* execute(sandboxes, store, {}, {
+        grantedPermissions: ["contents", "pull_requests", "metadata"],
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "installationToken").map((c) => Object.keys((c[2] as { permissions: object }).permissions))).toEqual([
+        ["contents", "pull_requests", "metadata", "workflows"],
+        ["contents", "pull_requests", "metadata"],
+      ]);
+      expect(events).toContain(
+        "info:The GitHub App has no Workflows permission, so this run can't change files in .github/workflows",
+      );
+    }),
+  );
+
+  it.effect("explains a push GitHub refused for touching workflows", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes({
+        "git push": {
+          exitCode: 1,
+          stdout:
+            " ! [remote rejected] HEAD -> factory/run-0123abcd (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)\n",
+        },
+      });
+      const { outcome } = yield* execute(sandboxes);
+      expect(outcome).toEqual({
+        status: "failed",
+        error:
+          'Committing and pushing: GitHub refused the push because the agent changed a file in .github/workflows and the GitHub App has no Workflows permission. Give the App "Workflows: Read and write", accept it on the installation, then run again.',
+      });
+      // Kept, so a message retries the push once the App has the permission.
+      expect(sandboxes.state.destroyed).toBe(false);
     }),
   );
 

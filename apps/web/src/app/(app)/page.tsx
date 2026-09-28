@@ -4,13 +4,14 @@ import { Composer } from "@/components/composer";
 import { ComposerSkeleton } from "@/components/composer-skeleton";
 import { Logo } from "@/components/logo";
 import { PageHeader } from "@/components/page-header";
-import { getMe, getRepos } from "@/lib/server";
+import { getMe, getRepos, getRuns } from "@/lib/server";
 
 export const metadata: Metadata = { title: "New run" };
 
 async function NewRunComposer() {
-  const [me, { repos, error }] = await Promise.all([getMe(), getRepos()]);
-  return <Composer me={me} repos={repos} reposError={error} autoFocus />;
+  const [me, { repos, error }, runs] = await Promise.all([getMe(), getRepos(), getRuns()]);
+  // Runs come newest first, so start on the repository used last.
+  return <Composer me={me} repos={repos} reposError={error} defaultRepo={runs[0]?.repo} autoFocus />;
 }
 
 export default function NewRunPage() {

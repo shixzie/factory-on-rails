@@ -135,7 +135,7 @@ export function DiffPanel({
   }, [focus]);
 
   return (
-    <aside className="fixed inset-x-0 top-12 bottom-0 z-20 flex flex-col border-l bg-background lg:sticky lg:inset-auto lg:top-12 lg:z-auto lg:self-start lg:h-[calc(100svh-3rem)] lg:w-[min(46rem,48%)] lg:shrink-0">
+    <aside className="fixed inset-x-0 top-12 bottom-0 z-20 flex flex-col border-l bg-background lg:sticky lg:inset-auto lg:top-12 lg:z-auto lg:min-w-0 lg:self-start lg:h-[calc(100svh-3rem)] lg:w-[min(46rem,48%)] lg:shrink-0">
       <div className="flex h-11 shrink-0 items-center gap-2 border-b px-3 text-xs">
         <FileCodeIcon className="size-3.5 text-muted-foreground" />
         <span className="font-medium">
