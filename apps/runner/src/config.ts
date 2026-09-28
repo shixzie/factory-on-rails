@@ -1,87 +1,74 @@
+import { Config, Context, Duration, Effect, Layer, Option } from "effect";
 import { hostname } from "node:os";
-import { intEnv, optionalEnv, parseEncryptionKey, pemFromEnv, requireEnv } from "@factory/core";
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
 export const DEFAULT_AGENT_COMMAND = 'claude -p "$(cat "$FACTORY_TASK_FILE")" --dangerously-skip-permissions';
 
-export interface RunnerConfig {
-  databaseUrl: string;
-  /** Harness origin, used to link PRs back to their run page. */
-  harnessUrl?: string;
-  workerId: string;
-  maxConcurrentRuns: number;
-  pollIntervalMs: number;
-  /** A run whose heartbeat is older than this is considered abandoned. */
-  staleRunSeconds: number;
-  github: { appId: string; privateKeyPem: string };
-  /** Decrypts users' own API keys (bring your own key). Same key the harness encrypts with. */
-  encryptionKey: Buffer;
-  sandbox: {
-    /**
-     * Railway project token for the environment sandboxes live in. Kept
-     * separate from RAILWAY_TOKEN so the runner can never touch the
-     * environment its own services run in.
-     */
-    token: string;
-    environmentId: string;
-    region?: string;
-    /** Boot from a named checkpoint (e.g. one with the agent CLI preinstalled) instead of a blank sandbox. */
-    checkpoint?: string;
-    idleTimeoutMinutes: number;
-  };
-  agent: {
-    setupCommand: string;
-    command: string;
-    timeoutSec: number;
-    /**
-     * Extra runner env vars copied into every sandbox. Model API keys do not
-     * belong here: each user brings their own (see packages/core/src/providers.ts).
-     */
-    passthroughEnv: Record<string, string>;
-  };
-  git: { authorName: string; authorEmail: string };
+export interface AgentSettings {
+  readonly setupCommand: string;
+  readonly command: string;
+  readonly timeoutSec: number;
+  /**
+   * Extra runner env vars copied into every sandbox. Model API keys do not
+   * belong here: each user brings their own (see packages/core/src/providers.ts).
+   */
+  readonly passthroughEnv: Readonly<Record<string, string>>;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
-  const passthroughNames = (env.AGENT_ENV_PASSTHROUGH ?? "")
+export interface RunnerSettings {
+  /** Harness origin, used to link PRs back to their run page. */
+  readonly harnessUrl: Option.Option<string>;
+  readonly workerId: string;
+  readonly maxConcurrentRuns: number;
+  readonly pollInterval: Duration.Duration;
+  /** A run whose heartbeat is older than this is considered abandoned. */
+  readonly staleRunSeconds: number;
+  /** How often a run records liveness and checks for cancellation. */
+  readonly heartbeatInterval: Duration.Duration;
+  readonly agent: AgentSettings;
+  readonly git: { readonly authorName: string; readonly authorEmail: string };
+}
+
+const int = (name: string, fallback: number) => Config.integer(name).pipe(Config.withDefault(fallback));
+const str = (name: string, fallback: string) => Config.string(name).pipe(Config.withDefault(fallback));
+
+/** Reads each variable named in AGENT_ENV_PASSTHROUGH from the runner's own env. */
+const passthroughEnv = Effect.gen(function* () {
+  const names = (yield* str("AGENT_ENV_PASSTHROUGH", ""))
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const passthroughEnv: Record<string, string> = {};
-  for (const name of passthroughNames) {
-    const value = env[name];
-    if (value) passthroughEnv[name] = value;
-    else console.warn(`AGENT_ENV_PASSTHROUGH names ${name}, but it is not set on the runner`);
+  const env: Record<string, string> = {};
+  for (const name of names) {
+    const value = yield* Config.option(Config.nonEmptyString(name));
+    if (Option.isSome(value)) env[name] = value.value;
+    else yield* Effect.logWarning(`AGENT_ENV_PASSTHROUGH names ${name}, but it is not set on the runner`);
   }
+  return env;
+});
 
-  return {
-    databaseUrl: requireEnv("DATABASE_URL", env),
-    harnessUrl: env.HARNESS_URL?.trim().replace(/\/$/, "") || undefined,
-    workerId: optionalEnv("RAILWAY_REPLICA_ID", hostname(), env),
-    maxConcurrentRuns: intEnv("MAX_CONCURRENT_RUNS", 3, env),
-    pollIntervalMs: intEnv("POLL_INTERVAL_MS", 5000, env),
-    staleRunSeconds: intEnv("STALE_RUN_SECONDS", 180, env),
-    github: {
-      appId: requireEnv("GITHUB_APP_ID", env),
-      privateKeyPem: pemFromEnv("GITHUB_APP_PRIVATE_KEY", env),
-    },
-    encryptionKey: parseEncryptionKey(requireEnv("TOKEN_ENCRYPTION_KEY", env)),
-    sandbox: {
-      token: requireEnv("RAILWAY_SANDBOX_TOKEN", env),
-      environmentId: requireEnv("SANDBOX_ENVIRONMENT_ID", env),
-      region: env.SANDBOX_REGION?.trim() || undefined,
-      checkpoint: env.SANDBOX_CHECKPOINT?.trim() || undefined,
-      idleTimeoutMinutes: intEnv("SANDBOX_IDLE_TIMEOUT_MINUTES", 15, env),
-    },
-    agent: {
-      setupCommand: optionalEnv("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP, env),
-      command: optionalEnv("AGENT_COMMAND", DEFAULT_AGENT_COMMAND, env),
-      timeoutSec: intEnv("AGENT_TIMEOUT_SECONDS", 3600, env),
-      passthroughEnv,
-    },
-    git: {
-      authorName: optionalEnv("GIT_AUTHOR_NAME", "Factory on Rails", env),
-      authorEmail: optionalEnv("GIT_AUTHOR_EMAIL", "factory-on-rails@users.noreply.github.com", env),
-    },
-  };
+export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerConfig, RunnerSettings>() {
+  static readonly Live = Layer.effect(
+    RunnerConfig,
+    Effect.gen(function* () {
+      const settings = yield* Config.all({
+        harnessUrl: Config.option(Config.nonEmptyString("HARNESS_URL").pipe(Config.map((u) => u.trim().replace(/\/$/, "")))),
+        workerId: str("RAILWAY_REPLICA_ID", hostname()),
+        maxConcurrentRuns: int("MAX_CONCURRENT_RUNS", 3),
+        pollInterval: int("POLL_INTERVAL_MS", 5000).pipe(Config.map(Duration.millis)),
+        staleRunSeconds: int("STALE_RUN_SECONDS", 180),
+        heartbeatInterval: int("HEARTBEAT_INTERVAL_MS", 10_000).pipe(Config.map(Duration.millis)),
+        agent: Config.all({
+          setupCommand: str("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP),
+          command: str("AGENT_COMMAND", DEFAULT_AGENT_COMMAND),
+          timeoutSec: int("AGENT_TIMEOUT_SECONDS", 3600),
+        }),
+        git: Config.all({
+          authorName: str("GIT_AUTHOR_NAME", "Factory on Rails"),
+          authorEmail: str("GIT_AUTHOR_EMAIL", "factory-on-rails@users.noreply.github.com"),
+        }),
+      });
+      return { ...settings, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
+    }),
+  );
 }

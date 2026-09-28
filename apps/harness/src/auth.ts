@@ -1,137 +1,128 @@
+import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import {
-  createSession,
-  decrypt,
-  deleteSession,
-  encrypt,
-  exchangeCode,
-  randomToken,
-  refreshUserToken,
-  sha256,
-  updateUserTokens,
-  upsertUser,
-  UserGitHub,
-  userForSession,
   authorizeUrl,
-  type Sql,
+  GitHubUserApi,
+  randomToken,
+  sha256,
+  Store,
+  TokenCipher,
   type UserRow,
+  type UserTokenColumns,
   type UserTokens,
 } from "@factory/core";
-import type { Context, MiddlewareHandler } from "hono";
-import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import type { HarnessConfig } from "./config.js";
+import { Data, Duration, Effect, Option, Schema } from "effect";
+import { HarnessConfig } from "./config.js";
 
 export const SESSION_COOKIE = "factory_session";
 export const STATE_COOKIE = "factory_oauth_state";
 
-export type Env = { Variables: { user: UserRow | null } };
+/** No signed-in user: send them to the sign-in page. */
+export class Unauthorized extends Data.TaggedError("Unauthorized") {}
 
-export class ReauthRequired extends Error {
-  constructor() {
-    super("GitHub authorization expired; sign in again");
-  }
-}
+/** The user's GitHub authorization expired and can't be refreshed: sign in again. */
+export class ReauthRequired extends Data.TaggedError("ReauthRequired") {}
 
-function cookieOptions(config: HarnessConfig, maxAge: number) {
-  return {
-    httpOnly: true,
-    secure: config.publicUrl.startsWith("https://"),
-    sameSite: "Lax" as const,
-    path: "/",
-    maxAge,
-  };
-}
+/** Sign-in refused, with a message for the sign-in page. */
+export class LoginRejected extends Data.TaggedError("LoginRejected")<{ readonly status: 400 | 403; readonly message: string }> {}
 
-export const redirectUri = (config: HarnessConfig) => `${config.publicUrl}/auth/callback`;
+const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
+  httpOnly: true,
+  secure: publicUrl.startsWith("https://"),
+  sameSite: "lax" as const,
+  path: "/",
+  maxAge: Duration.seconds(maxAgeSeconds),
+});
 
-/** Loads the signed-in user (or null) from the session cookie. */
-export function sessionMiddleware(sql: Sql): MiddlewareHandler<Env> {
-  return async (c, next) => {
-    const token = getCookie(c, SESSION_COOKIE);
-    c.set("user", token ? ((await userForSession(sql, sha256(token))) ?? null) : null);
-    await next();
-  };
-}
+export const redirectUri = (publicUrl: string) => `${publicUrl}/auth/callback`;
 
-/**
- * Rejects state-changing requests whose Origin is not ours. Together with
- * SameSite=Lax cookies this is the CSRF defence for the HTML forms.
- */
-export function originCheck(config: HarnessConfig): MiddlewareHandler {
-  const expected = new URL(config.publicUrl).origin;
-  return async (c, next) => {
-    if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
-      const origin = c.req.header("origin");
-      if (origin !== expected) return c.text("Cross-origin request rejected", 403);
-    }
-    await next();
-  };
-}
+/** The signed-in user, from the session cookie. */
+export const currentUser = Effect.gen(function* () {
+  const req = yield* HttpServerRequest.HttpServerRequest;
+  const token = req.cookies[SESSION_COOKIE];
+  if (!token) return Option.none<UserRow>();
+  return yield* (yield* Store).userForSession(sha256(token));
+});
 
-export function beginLogin(c: Context, config: HarnessConfig): Response {
+export const requireUser = Effect.flatMap(currentUser, Option.match({
+  onNone: () => Effect.fail(new Unauthorized()),
+  onSome: Effect.succeed,
+}));
+
+export const beginLogin = Effect.gen(function* () {
+  const { publicUrl } = yield* HarnessConfig;
+  const github = yield* GitHubUserApi;
   const state = randomToken(16);
-  setCookie(c, STATE_COOKIE, state, cookieOptions(config, 600));
-  return c.redirect(authorizeUrl(config.github, redirectUri(config), state));
-}
+  return yield* HttpServerResponse.redirect(authorizeUrl(github.clientId, redirectUri(publicUrl), state)).pipe(
+    HttpServerResponse.setCookie(STATE_COOKIE, state, cookieOptions(publicUrl, 600)),
+  );
+});
 
-function encryptTokens(t: UserTokens, key: Buffer) {
-  return {
-    access_token_enc: encrypt(t.accessToken, key),
-    access_token_expires_at: t.accessTokenExpiresAt,
-    refresh_token_enc: t.refreshToken ? encrypt(t.refreshToken, key) : null,
-    refresh_token_expires_at: t.refreshTokenExpiresAt,
-  };
-}
+const encryptTokens = (cipher: TokenCipher["Type"], t: UserTokens): UserTokenColumns => ({
+  access_token_enc: cipher.encrypt(t.accessToken),
+  access_token_expires_at: t.accessTokenExpiresAt,
+  refresh_token_enc: t.refreshToken ? cipher.encrypt(t.refreshToken) : null,
+  refresh_token_expires_at: t.refreshTokenExpiresAt,
+});
 
-export async function completeLogin(
-  c: Context,
-  sql: Sql,
-  config: HarnessConfig,
-): Promise<{ ok: true } | { ok: false; status: 400 | 403; message: string }> {
-  const expectedState = getCookie(c, STATE_COOKIE);
-  deleteCookie(c, STATE_COOKIE, { path: "/" });
-  const { code, state } = c.req.query();
+export const completeLogin = Effect.gen(function* () {
+  const config = yield* HarnessConfig;
+  const github = yield* GitHubUserApi;
+  const store = yield* Store;
+  const cipher = yield* TokenCipher;
+  const req = yield* HttpServerRequest.HttpServerRequest;
+
+  const expectedState = req.cookies[STATE_COOKIE];
+  const { code, state } = yield* HttpServerRequest.schemaSearchParams(
+    Schema.Struct({ code: Schema.optional(Schema.String), state: Schema.optional(Schema.String) }),
+  );
   if (!code || !state || !expectedState || state !== expectedState) {
-    return { ok: false, status: 400, message: "Sign-in failed: the login state did not match. Try again." };
+    return yield* new LoginRejected({ status: 400, message: "Sign-in failed: the login state did not match. Try again." });
   }
 
-  const tokens = await exchangeCode(config.github, code, redirectUri(config));
-  const viewer = await new UserGitHub(tokens.accessToken).viewer();
+  const tokens = yield* github.exchangeCode(code, redirectUri(config.publicUrl));
+  const viewer = yield* github.viewer(tokens.accessToken);
   if (!config.allowedLogins.includes(viewer.login.toLowerCase())) {
-    return { ok: false, status: 403, message: `GitHub user ${viewer.login} is not allowed to use this factory.` };
+    return yield* new LoginRejected({ status: 403, message: `GitHub user ${viewer.login} is not allowed to use this factory.` });
   }
 
-  const user = await upsertUser(sql, {
+  const user = yield* store.upsertUser({
     github_id: viewer.id,
     github_login: viewer.login,
     name: viewer.name,
     avatar_url: viewer.avatar_url,
-    ...encryptTokens(tokens, config.encryptionKey),
+    ...encryptTokens(cipher, tokens),
   });
   const sessionToken = randomToken();
-  await createSession(sql, sha256(sessionToken), user.id, config.sessionTtlSeconds);
-  setCookie(c, SESSION_COOKIE, sessionToken, cookieOptions(config, config.sessionTtlSeconds));
-  return { ok: true };
-}
+  yield* store.createSession(sha256(sessionToken), user.id, config.sessionTtlSeconds);
+  return yield* HttpServerResponse.redirect("/").pipe(
+    HttpServerResponse.setCookie(SESSION_COOKIE, sessionToken, cookieOptions(config.publicUrl, config.sessionTtlSeconds)),
+    Effect.flatMap(HttpServerResponse.expireCookie(STATE_COOKIE, { path: "/" })),
+  );
+});
 
-export async function logout(c: Context, sql: Sql): Promise<void> {
-  const token = getCookie(c, SESSION_COOKIE);
-  if (token) await deleteSession(sql, sha256(token));
-  deleteCookie(c, SESSION_COOKIE, { path: "/" });
-}
+export const logout = Effect.gen(function* () {
+  const req = yield* HttpServerRequest.HttpServerRequest;
+  const token = req.cookies[SESSION_COOKIE];
+  if (token) yield* (yield* Store).deleteSession(sha256(token));
+  return yield* HttpServerResponse.redirect("/").pipe(HttpServerResponse.expireCookie(SESSION_COOKIE, { path: "/" }));
+});
 
-/** Returns a usable user access token, refreshing it if it is about to expire. */
-export async function userAccessToken(sql: Sql, config: HarnessConfig, user: UserRow): Promise<string> {
-  const soon = Date.now() + 60_000;
-  if (!user.access_token_expires_at || user.access_token_expires_at.getTime() > soon) {
-    return decrypt(user.access_token_enc, config.encryptionKey);
-  }
-  const refreshValid =
-    user.refresh_token_enc && (!user.refresh_token_expires_at || user.refresh_token_expires_at.getTime() > soon);
-  if (!refreshValid) throw new ReauthRequired();
+/** A usable user access token, refreshed when it is about to expire. */
+export const userAccessToken = (user: UserRow) =>
+  Effect.gen(function* () {
+    const cipher = yield* TokenCipher;
+    const soon = Date.now() + 60_000;
+    if (!user.access_token_expires_at || user.access_token_expires_at.getTime() > soon) {
+      return yield* cipher.decrypt(user.access_token_enc);
+    }
+    const refreshValid =
+      user.refresh_token_enc && (!user.refresh_token_expires_at || user.refresh_token_expires_at.getTime() > soon);
+    if (!refreshValid) return yield* new ReauthRequired();
 
-  const tokens = await refreshUserToken(config.github, decrypt(user.refresh_token_enc!, config.encryptionKey));
-  const enc = encryptTokens(tokens, config.encryptionKey);
-  await updateUserTokens(sql, user.id, enc);
-  Object.assign(user, enc);
-  return tokens.accessToken;
-}
+    const refreshToken = yield* cipher.decrypt(user.refresh_token_enc!);
+    const tokens = yield* (yield* GitHubUserApi).refresh(refreshToken);
+    const enc = encryptTokens(cipher, tokens);
+    yield* (yield* Store).updateUserTokens(user.id, enc);
+    Object.assign(user, enc);
+    return tokens.accessToken;
+  });

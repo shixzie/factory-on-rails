@@ -28,3 +28,15 @@ describe("token encryption", () => {
     expect(parseEncryptionKey(randomBytes(32).toString("base64"))).toHaveLength(32);
   });
 });
+
+describe("TokenCipher", () => {
+  it("encrypts and decrypts through the service, failing with DecryptError on garbage", async () => {
+    const { Effect } = await import("effect");
+    const { TokenCipher } = await import("../src/crypto.js");
+    const cipher = TokenCipher.fromKey(randomBytes(32));
+    const payload = cipher.encrypt("sk-ant-secret");
+    expect(await Effect.runPromise(cipher.decrypt(payload))).toBe("sk-ant-secret");
+    const error = await Effect.runPromise(Effect.flip(cipher.decrypt("v1.nope.nope.nope")));
+    expect(error._tag).toBe("DecryptError");
+  });
+});

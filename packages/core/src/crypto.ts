@@ -1,4 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { Config, ConfigError, Context, Data, Effect, Either, Layer, Redacted } from "effect";
 
 const VERSION = "v1";
 
@@ -17,7 +18,7 @@ export function encrypt(plaintext: string, key: Buffer): string {
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return [VERSION, iv, tag, ciphertext].map((p) => (typeof p === "string" ? p : p.toString("base64url"))).join(".");
+  return [VERSION, iv.toString("base64url"), tag.toString("base64url"), ciphertext.toString("base64url")].join(".");
 }
 
 export function decrypt(payload: string, key: Buffer): string {
@@ -27,10 +28,7 @@ export function decrypt(payload: string, key: Buffer): string {
   }
   const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(iv, "base64url"));
   decipher.setAuthTag(Buffer.from(tag, "base64url"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(ciphertext, "base64url")),
-    decipher.final(),
-  ]).toString("utf8");
+  return Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString("utf8");
 }
 
 export function randomToken(bytes = 32): string {
@@ -39,4 +37,38 @@ export function randomToken(bytes = 32): string {
 
 export function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+/** TOKEN_ENCRYPTION_KEY, validated as a base64 32-byte key. */
+export const encryptionKeyConfig: Config.Config<Redacted.Redacted<Buffer>> = Config.redacted("TOKEN_ENCRYPTION_KEY").pipe(
+  Config.mapOrFail((raw) => {
+    try {
+      return Either.right(Redacted.make(parseEncryptionKey(Redacted.value(raw))));
+    } catch (err) {
+      return Either.left(ConfigError.InvalidData(["TOKEN_ENCRYPTION_KEY"], (err as Error).message));
+    }
+  }),
+);
+
+export class DecryptError extends Data.TaggedError("DecryptError")<{ readonly cause: unknown }> {}
+
+/** Encrypts secrets at rest (GitHub user tokens, users' own API keys). */
+export class TokenCipher extends Context.Tag("@factory/TokenCipher")<
+  TokenCipher,
+  {
+    readonly encrypt: (plaintext: string) => string;
+    readonly decrypt: (payload: string) => Effect.Effect<string, DecryptError>;
+  }
+>() {
+  static fromKey(key: Buffer): Context.Tag.Service<TokenCipher> {
+    return {
+      encrypt: (plaintext) => encrypt(plaintext, key),
+      decrypt: (payload) => Effect.try({ try: () => decrypt(payload, key), catch: (cause) => new DecryptError({ cause }) }),
+    };
+  }
+
+  static readonly Live = Layer.effect(
+    TokenCipher,
+    Effect.map(encryptionKeyConfig, (key) => TokenCipher.fromKey(Redacted.value(key))),
+  );
 }

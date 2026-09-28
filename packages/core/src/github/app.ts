@@ -1,5 +1,9 @@
+import { HttpClient, HttpClientRequest } from "@effect/platform";
+import { Config, Context, Effect, Layer, Redacted } from "effect";
 import { createSign } from "node:crypto";
-import { githubRequest } from "./http.js";
+import { pemConfig } from "../config.js";
+import { executeJson, GitHubError, githubRequest } from "./http.js";
+import { InstallationTokenResponse, PullRequest } from "./schemas.js";
 
 export interface GitHubAppCredentials {
   appId: string;
@@ -22,24 +26,60 @@ export function createAppJwt(creds: GitHubAppCredentials, nowSeconds = Math.floo
   return `${header}.${payload}.${b64url(signer.sign(creds.privateKeyPem))}`;
 }
 
-export interface InstallationToken {
-  token: string;
-  expiresAt: string;
-}
+export const GitHubAppConfig = Config.all({
+  appId: Config.string("GITHUB_APP_ID"),
+  privateKey: pemConfig("GITHUB_APP_PRIVATE_KEY"),
+});
 
-/**
- * Mints an installation access token, optionally narrowed to specific repos
- * and permissions. Agents only ever see tokens scoped to the one repo they
- * work on, valid for an hour.
- */
-export async function createInstallationToken(
-  creds: GitHubAppCredentials,
-  installationId: number,
-  scope: { repositories?: string[]; permissions?: Record<string, "read" | "write"> } = {},
-): Promise<InstallationToken> {
-  const res = await githubRequest<{ token: string; expires_at: string }>(
-    `/app/installations/${installationId}/access_tokens`,
-    { method: "POST", token: createAppJwt(creds), body: scope },
+/** GitHub as the App: repo-scoped installation tokens, and PRs opened with them. */
+export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
+  GitHubAppApi,
+  {
+    /**
+     * Mints an installation access token narrowed to specific repos and
+     * permissions. Agents only ever see tokens scoped to the one repo they
+     * work on, valid for an hour.
+     */
+    readonly installationToken: (
+      installationId: number,
+      scope: { repositories?: string[]; permissions?: Record<string, "read" | "write"> },
+    ) => Effect.Effect<Redacted.Redacted<string>, GitHubError>;
+    readonly createPullRequest: (
+      token: Redacted.Redacted<string>,
+      repoFullName: string,
+      pr: { title: string; body: string; head: string; base: string },
+    ) => Effect.Effect<PullRequest, GitHubError>;
+  }
+>() {
+  static readonly Live = Layer.effect(
+    GitHubAppApi,
+    Effect.gen(function* () {
+      const config = yield* GitHubAppConfig;
+      const client = yield* HttpClient.HttpClient;
+      const creds = { appId: config.appId, privateKeyPem: Redacted.value(config.privateKey) };
+
+      return {
+        installationToken: (installationId, scope) =>
+          Effect.try({
+            try: () => createAppJwt(creds),
+            catch: (cause) => new GitHubError({ status: 0, message: `Could not sign the GitHub App JWT (check GITHUB_APP_PRIVATE_KEY): ${String(cause)}` }),
+          }).pipe(
+            Effect.flatMap((jwt) =>
+              githubRequest("POST", `/app/installations/${installationId}/access_tokens`).pipe(
+                HttpClientRequest.bearerToken(jwt),
+                HttpClientRequest.bodyUnsafeJson(scope),
+                executeJson(client, InstallationTokenResponse),
+              ),
+            ),
+            Effect.map((res) => Redacted.make(res.token)),
+          ),
+        createPullRequest: (token, repoFullName, pr) =>
+          githubRequest("POST", `/repos/${repoFullName}/pulls`).pipe(
+            HttpClientRequest.bearerToken(Redacted.value(token)),
+            HttpClientRequest.bodyUnsafeJson(pr),
+            executeJson(client, PullRequest),
+          ),
+      };
+    }),
   );
-  return { token: res.token, expiresAt: res.expires_at };
 }

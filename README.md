@@ -2,7 +2,8 @@
 
 A software factory hosted entirely on [Railway](https://railway.com). Sign in with
 GitHub, pick or create a repository, describe a change, and a coding agent does
-the work in a disposable Railway sandbox and opens a pull request.
+the work in a disposable Railway sandbox and opens a pull request. Written in
+TypeScript with [Effect](https://effect.website).
 
 ```
 .railway/railway.ts     Railway infrastructure as code (services, database)

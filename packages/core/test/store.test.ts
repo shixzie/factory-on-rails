@@ -1,128 +1,156 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createDb, type Sql } from "../src/db.js";
-import { migrate } from "../src/migrate.js";
-import * as store from "../src/store.js";
+import { describe, expect, layer } from "@effect/vitest";
+import { SqlClient } from "@effect/sql";
+import { Effect, Layer, Option } from "effect";
+import { migrate } from "../src/db.js";
+import { Store } from "../src/store.js";
+import { NodeContext } from "@effect/platform-node";
+import { TestDbLive, testDatabaseUrl } from "./db.js";
 
-// Integration tests: run against a disposable database, e.g.
-//   TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/factory_test pnpm test
-const url = process.env.TEST_DATABASE_URL;
+const StoreTest = Store.Live.pipe(Layer.provideMerge(TestDbLive));
 
-describe.skipIf(!url)("store (Postgres)", () => {
-  let sql: Sql;
-  let userId: string;
+describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
+  layer(StoreTest, { timeout: 30_000 })((it) => {
+    const user = Effect.flatMap(Store, (store) =>
+      store.upsertUser({
+        github_id: 1,
+        github_login: "octo",
+        name: null,
+        avatar_url: null,
+        access_token_enc: "enc",
+        access_token_expires_at: null,
+        refresh_token_enc: null,
+        refresh_token_expires_at: null,
+      }),
+    );
+    const enqueue = (userId: string, task: string) =>
+      Effect.flatMap(Store, (store) =>
+        store.enqueueRun({ user_id: userId, repo_full_name: "o/r", installation_id: 7, base_branch: "main", task }),
+      );
 
-  beforeAll(async () => {
-    sql = createDb(url!, { max: 4 });
-    await sql`drop schema public cascade`;
-    await sql`create schema public`;
-    await migrate(sql, () => {});
-    const user = await store.upsertUser(sql, {
-      github_id: 1,
-      github_login: "octo",
-      name: null,
-      avatar_url: null,
-      access_token_enc: "enc",
-      access_token_expires_at: null,
-      refresh_token_enc: null,
-      refresh_token_expires_at: null,
-    });
-    userId = user.id;
-  });
+    it.effect("migrations are idempotent", () =>
+      Effect.gen(function* () {
+        expect(yield* migrate.pipe(Effect.provide(NodeContext.layer))).toEqual([]);
+      }),
+    );
 
-  afterAll(async () => {
-    await sql?.end();
-  });
+    it.effect("upserts users by GitHub id", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const first = yield* user;
+        const again = yield* store.upsertUser({
+          github_id: 1,
+          github_login: "octo-renamed",
+          name: "Octo",
+          avatar_url: null,
+          access_token_enc: "enc2",
+          access_token_expires_at: null,
+          refresh_token_enc: null,
+          refresh_token_expires_at: null,
+        });
+        expect(again.id).toBe(first.id);
+        expect(again.github_login).toBe("octo-renamed");
+      }),
+    );
 
-  const enqueue = (task: string) =>
-    store.enqueueRun(sql, { user_id: userId, repo_full_name: "o/r", installation_id: 7, base_branch: "main", task });
+    it.effect("resolves live sessions only", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        yield* store.createSession("live", id, 60);
+        yield* store.createSession("expired", id, -1);
+        expect(Option.map(yield* store.userForSession("live"), (u) => u.id)).toEqual(Option.some(id));
+        expect(Option.isNone(yield* store.userForSession("expired"))).toBe(true);
+        yield* store.deleteSession("live");
+        expect(Option.isNone(yield* store.userForSession("live"))).toBe(true);
+      }),
+    );
 
-  it("migrations are idempotent", async () => {
-    expect(await migrate(sql, () => {})).toEqual([]);
-  });
+    it.effect("hands each queued run to exactly one claimer, oldest first", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const a = yield* enqueue(id, "a");
+        const b = yield* enqueue(id, "b");
+        const claims = yield* Effect.all(
+          [1, 2, 3].map((i) => store.claimNextRun(`w${i}`)),
+          { concurrency: "unbounded" },
+        );
+        const claimed = claims.flatMap(Option.toArray);
+        expect(claimed.map((r) => r.id).sort()).toEqual([a.id, b.id].sort());
+        expect(claimed.every((r) => r.status === "running")).toBe(true);
+        expect(Option.isNone(yield* store.claimNextRun("w4"))).toBe(true);
+      }),
+    );
 
-  it("upserts users by GitHub id", async () => {
-    const again = await store.upsertUser(sql, {
-      github_id: 1,
-      github_login: "octo-renamed",
-      name: "Octo",
-      avatar_url: null,
-      access_token_enc: "enc2",
-      access_token_expires_at: null,
-      refresh_token_enc: null,
-      refresh_token_expires_at: null,
-    });
-    expect(again.id).toBe(userId);
-    expect(again.github_login).toBe("octo-renamed");
-  });
+    it.effect("cancels queued runs directly and asks running ones to stop", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const queued = yield* enqueue(id, "q");
+        expect(yield* store.requestCancel(queued.id, id)).toBe(true);
+        expect(Option.map(yield* store.getRun(queued.id), (r) => r.status)).toEqual(Option.some("cancelled"));
 
-  it("resolves live sessions only", async () => {
-    await store.createSession(sql, "live", userId, 60);
-    await store.createSession(sql, "expired", userId, -1);
-    expect((await store.userForSession(sql, "live"))?.id).toBe(userId);
-    expect(await store.userForSession(sql, "expired")).toBeUndefined();
-    await store.deleteSession(sql, "live");
-    expect(await store.userForSession(sql, "live")).toBeUndefined();
-  });
+        const running = yield* enqueue(id, "r");
+        yield* store.claimNextRun("w");
+        expect(yield* store.requestCancel(running.id, id)).toBe(true);
+        expect(yield* store.heartbeat(running.id)).toEqual(Option.some("cancelling"));
+        yield* store.finishRun(running.id, "cancelled");
+        const done = Option.getOrThrow(yield* store.getRun(running.id));
+        expect(done.status).toBe("cancelled");
+        expect(done.finished_at).toBeInstanceOf(Date);
+        expect(yield* store.requestCancel(running.id, id)).toBe(false);
+      }),
+    );
 
-  it("hands each queued run to exactly one claimer, oldest first", async () => {
-    await sql`delete from runs`;
-    const a = await enqueue("a");
-    const b = await enqueue("b");
-    const claims = await Promise.all([1, 2, 3].map((i) => store.claimNextRun(sql, `w${i}`)));
-    const ids = claims.filter(Boolean).map((r) => r!.id);
-    expect(ids.sort()).toEqual([a.id, b.id].sort());
-    expect(claims.filter(Boolean).every((r) => r!.status === "running")).toBe(true);
-    expect(await store.claimNextRun(sql, "w4")).toBeUndefined();
-  });
+    it.effect("reaps runs that stopped heartbeating", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const run = yield* enqueue(id, "stale");
+        yield* store.claimNextRun("w");
+        yield* store.updateRun(run.id, { sandbox_id: "sbx_9" });
+        yield* sql`update runs set heartbeat_at = now() - interval '10 minutes' where id = ${run.id}`;
+        expect(yield* store.reapStaleRuns(60)).toEqual([{ id: run.id, sandbox_id: "sbx_9" }]);
+        expect(Option.map(yield* store.getRun(run.id), (r) => r.status)).toEqual(Option.some("failed"));
+      }),
+    );
 
-  it("cancels queued runs directly and asks running ones to stop", async () => {
-    const queued = await enqueue("q");
-    expect(await store.requestCancel(sql, queued.id, userId)).toBe(true);
-    expect((await store.getRun(sql, queued.id))?.status).toBe("cancelled");
+    it.effect("appends and pages events", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "events");
+        yield* store.appendEvents(run.id, [
+          { kind: "info", message: "one" },
+          { kind: "stdout", message: "two" },
+        ]);
+        const all = yield* store.listEvents(run.id);
+        expect(all.map((e) => e.message)).toEqual(["one", "two"]);
+        const after = yield* store.listEvents(run.id, Number(all[0]!.id));
+        expect(after.map((e) => e.message)).toEqual(["two"]);
+      }),
+    );
 
-    await sql`delete from runs where status = 'queued'`;
-    const running = await enqueue("r");
-    await store.claimNextRun(sql, "w");
-    expect(await store.requestCancel(sql, running.id, userId)).toBe(true);
-    expect(await store.heartbeat(sql, running.id)).toBe("cancelling");
-    await store.finishRun(sql, running.id, "cancelled");
-    const done = await store.getRun(sql, running.id);
-    expect(done?.status).toBe("cancelled");
-    expect(done?.finished_at).toBeInstanceOf(Date);
-    expect(await store.requestCancel(sql, running.id, userId)).toBe(false);
-  });
-
-  it("reaps runs that stopped heartbeating", async () => {
-    await sql`delete from runs`;
-    const run = await enqueue("stale");
-    await store.claimNextRun(sql, "w");
-    await store.updateRun(sql, run.id, { sandbox_id: "sbx_9" });
-    await sql`update runs set heartbeat_at = now() - interval '10 minutes' where id = ${run.id}`;
-    expect(await store.reapStaleRuns(sql, 60)).toEqual([{ id: run.id, sandbox_id: "sbx_9" }]);
-    expect((await store.getRun(sql, run.id))?.status).toBe("failed");
-  });
-
-  it("appends and pages events", async () => {
-    const run = await enqueue("events");
-    await store.appendEvents(sql, run.id, [
-      { kind: "info", message: "one" },
-      { kind: "stdout", message: "two" },
-    ]);
-    const all = await store.listEvents(sql, run.id);
-    expect(all.map((e) => e.message)).toEqual(["one", "two"]);
-    const after = await store.listEvents(sql, run.id, Number(all[0]!.id));
-    expect(after.map((e) => e.message)).toEqual(["two"]);
-  });
-
-  it("stores API keys per user and provider without exposing them in listings", async () => {
-    await store.upsertApiKey(sql, { user_id: userId, provider: "anthropic", key_enc: "enc-1", hint: "1111" });
-    await store.upsertApiKey(sql, { user_id: userId, provider: "anthropic", key_enc: "enc-2", hint: "2222" });
-    const listed = await store.listApiKeys(sql, userId);
-    expect(listed).toHaveLength(1);
-    expect(listed[0]).toMatchObject({ provider: "anthropic", hint: "2222" });
-    expect(listed[0]).not.toHaveProperty("key_enc");
-    expect(await store.encryptedApiKeys(sql, userId)).toEqual([{ provider: "anthropic", key_enc: "enc-2" }]);
-    await store.deleteApiKey(sql, userId, "anthropic");
-    expect(await store.listApiKeys(sql, userId)).toEqual([]);
+    it.effect("stores API keys per user and provider without exposing them in listings", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        yield* store.upsertApiKey({ user_id: id, provider: "anthropic", key_enc: "enc-1", hint: "1111" });
+        yield* store.upsertApiKey({ user_id: id, provider: "anthropic", key_enc: "enc-2", hint: "2222" });
+        const listed = yield* store.listApiKeys(id);
+        expect(listed).toHaveLength(1);
+        expect(listed[0]).toMatchObject({ provider: "anthropic", hint: "2222" });
+        expect(listed[0]).not.toHaveProperty("key_enc");
+        expect(yield* store.encryptedApiKeys(id)).toEqual([{ provider: "anthropic", key_enc: "enc-2" }]);
+        yield* store.deleteApiKey(id, "anthropic");
+        expect(yield* store.listApiKeys(id)).toEqual([]);
+      }),
+    );
   });
 });

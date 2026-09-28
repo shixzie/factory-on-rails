@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "rootDir": ".",
+    "types": [
+      "node"
+    ],
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx"
+  },
+  "include": [
+    "packages/*/test/**/*.ts",
+    "apps/*/test/**/*.ts",
+    "apps/*/test/**/*.tsx"
+  ]
+}

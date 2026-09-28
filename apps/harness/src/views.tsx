@@ -1,4 +1,12 @@
-import { MODEL_PROVIDERS, type ApiKeySummary, type GitHubRepo, type ModelProvider, type RunEventRow, type RunRow, type UserRow } from "@factory/core";
+import {
+  MODEL_PROVIDERS,
+  type ApiKeySummary,
+  type GitHubRepo,
+  type ModelProvider,
+  type RunEventRow,
+  type RunRow,
+  type UserRow,
+} from "@factory/core";
 import type { Child } from "hono/jsx";
 
 export interface RepoOption {
@@ -79,8 +87,8 @@ function Status(props: { status: string }) {
 
 export function Dashboard(props: {
   user: UserRow;
-  repos: RepoOption[];
-  runs: RunRow[];
+  repos: ReadonlyArray<RepoOption>;
+  runs: ReadonlyArray<RunRow>;
   installUrl: string;
   hasApiKey: boolean;
 }) {
@@ -168,7 +176,7 @@ async function poll() {
 poll();
 `;
 
-export function RunPage(props: { user: UserRow; run: RunRow; events: RunEventRow[] }) {
+export function RunPage(props: { user: UserRow; run: RunRow; events: ReadonlyArray<RunEventRow> }) {
   const { run } = props;
   const active = ["queued", "running"].includes(run.status);
   const lastId = props.events.at(-1)?.id ?? "0";
@@ -228,7 +236,7 @@ export function MessagePage(props: { title: string; user?: UserRow | null; child
   );
 }
 
-export function SettingsPage(props: { user: UserRow; keys: ApiKeySummary[]; error?: string; notice?: string }) {
+export function SettingsPage(props: { user: UserRow; keys: ReadonlyArray<ApiKeySummary>; error?: string; notice?: string }) {
   const byProvider = new Map(props.keys.map((k) => [k.provider, k]));
   return (
     <Layout title="Settings" user={props.user}>

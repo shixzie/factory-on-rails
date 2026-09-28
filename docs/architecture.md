@@ -12,7 +12,7 @@ repository, how the pieces fit, and what comes next.
 flowchart LR
   user([You, in a browser]) -->|GitHub login, tasks| harness
   subgraph production["Railway project: factory-on-rails / environment: production"]
-    harness["harness<br/>(Hono web app + API)"]
+    harness["harness<br/>(Effect HTTP app)"]
     runner["runner<br/>(worker)"]
     db[("postgres")]
     harness -- runs, users, sessions --> db
@@ -36,11 +36,38 @@ flowchart LR
 | `packages/core` | Library | Postgres schema and data access, GitHub App auth, token encryption. |
 | Railway Sandboxes | `agents` environment | Isolated VMs the agent runs in. Created and destroyed per run by the runner. |
 
-Stack: TypeScript on Node 22, pnpm workspaces, Hono for HTTP, `postgres` for
-the database, and Railway's own `railway` npm package for both IaC and
-sandboxes. TypeScript was chosen because Railway's IaC (`railway/iac`) and
-Sandbox SDK are TypeScript-first (Python and Go IaC are beta; the Sandbox SDK
-is TypeScript only), so the whole platform is one language.
+Stack: TypeScript on Node 22, pnpm workspaces, [Effect](https://effect.website)
+throughout, and Railway's own `railway` npm package for both IaC and sandboxes.
+TypeScript was chosen because Railway's IaC (`railway/iac`) and Sandbox SDK are
+TypeScript-first (Python and Go IaC are beta; the Sandbox SDK is TypeScript
+only), so the whole platform is one language.
+
+### Effect
+
+All application code is written with Effect 3:
+
+- **Services and layers.** Every dependency is a `Context.Tag` service with a
+  `Live` layer: `Store` (data access), `TokenCipher` (encryption),
+  `GitHubUserApi` and `GitHubAppApi` (GitHub), `Sandboxes` (Railway), plus
+  `HarnessConfig` and `RunnerConfig`. Each app's `index.ts` wires the live
+  layers; tests swap in stubs with `Layer.succeed`.
+- **Config** comes from `Config` (secrets as `Config.redacted`), so a missing
+  or malformed variable fails at startup with its name.
+- **Errors are typed.** `GitHubError`, `SandboxError`, `DecryptError`,
+  `StepFailed` and the harness's `Unauthorized`/`ReauthRequired`/`LoginRejected`
+  are `Data.TaggedError`s handled with `catchTag`; unexpected defects are logged.
+- **Postgres** goes through `@effect/sql` and `@effect/sql-pg` (`SqlClient`,
+  `PgClient.listen`), and migrations run with `@effect/sql`'s `Migrator` from
+  the plain `.sql` files in `packages/core/migrations`.
+- **HTTP.** The harness is an `@effect/platform` `HttpRouter` served by
+  `@effect/platform-node`; request bodies, query strings and path params are
+  decoded with `Schema`. Pages are rendered with `hono/jsx`, used only as a
+  templating engine. GitHub calls use `HttpClient` with `Schema`-decoded responses.
+- **Resources and cancellation.** A run's sandbox is a scoped resource
+  (`acquireRelease`), so it is destroyed however the run ends. Cancelling a run,
+  or stopping the runner, interrupts the fiber, which kills the command in the
+  sandbox and releases the sandbox on the way out.
+- **Tests** use `@effect/vitest`.
 
 ## Infrastructure as Code
 
@@ -76,8 +103,8 @@ Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"
    `onStdout` / `onStderr` streaming into `run_events`.
 3. `sandbox.files.write(...)` for the task text and commit message, so user
    input never has to be quoted into a shell command.
-4. `sandbox.destroy()` in a `finally`, plus a reaper that destroys sandboxes
-   left behind by a runner that died mid-run.
+4. `sandbox.destroy()` as the release step of a scoped resource, plus a reaper
+   that destroys sandboxes left behind by a runner that died mid-run.
 
 Decisions:
 
@@ -122,8 +149,11 @@ queued ──▶ running ──▶ succeeded | failed
 5. It commits whatever the agent left uncommitted, pushes the branch if it
    moved, opens a pull request, and destroys the sandbox.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
-   sees `cancelling` and kills the agent process. If a runner stops
-   heartbeating, another replica's reaper fails the run and destroys its sandbox.
+   sees `cancelling` and interrupts the run, which kills the agent process and
+   destroys the sandbox. When a runner is stopped (redeploy, scale down), it
+   interrupts its runs the same way and marks them failed so they can be
+   started again. If a runner dies without stopping cleanly, another
+   replica's reaper fails its runs and destroys their sandboxes.
 
 Run output is stored in `run_events` (batched once a second, capped at 5 MB per
 run) and the run page polls it.

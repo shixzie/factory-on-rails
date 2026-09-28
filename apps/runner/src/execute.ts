@@ -1,4 +1,6 @@
-import type { RunRow, RunStatus } from "@factory/core";
+import { GitHubAppApi, Store, type RunRow } from "@factory/core";
+import { Data, Duration, Effect, Option, Redacted, Schedule } from "effect";
+import type { AgentSettings } from "./config.js";
 import {
   branchName,
   cloneScript,
@@ -11,162 +13,131 @@ import {
   summarizeTask,
   TASK_FILE,
 } from "./plan.js";
+import type { RunLog } from "./run-log.js";
+import { Sandboxes, type ExecOptions, type SandboxHandle } from "./sandbox.js";
 
-/** The slice of the Railway `Sandbox` API a run needs (lets tests substitute a fake). */
-export interface ExecResultLike {
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  timedOut: boolean;
-}
-export interface ExecHandleLike extends PromiseLike<ExecResultLike> {
-  kill(signal?: "TERM" | "KILL"): Promise<unknown>;
-}
-export interface SandboxLike {
-  id: string;
-  exec(
-    command: string,
-    options?: {
-      cwd?: string;
-      env?: Record<string, string>;
-      timeoutSec?: number;
-      onStdout?: (chunk: string) => void;
-      onStderr?: (chunk: string) => void;
-    },
-  ): ExecHandleLike;
-  files: { write(path: string, content: string): Promise<unknown> };
-  destroy(): Promise<void>;
-}
-
-export interface RunDeps {
-  createSandbox(env: Record<string, string>): Promise<SandboxLike>;
-  mintRepoToken(installationId: number, repoFullName: string): Promise<string>;
-  createPullRequest(
-    token: string,
-    repoFullName: string,
-    pr: { title: string; body: string; head: string; base: string },
-  ): Promise<string>;
-  report: {
-    info(message: string): void;
-    error(message: string): void;
-    output(stream: "stdout" | "stderr", chunk: string): void;
-    /** Registers a value that must never appear in stored logs. */
-    secret(value: string): void;
-    update(patch: { branch?: string; sandbox_id?: string; pull_request_url?: string }): Promise<void>;
-    /** Records liveness and returns the run's current status (used to notice cancellation). */
-    heartbeat(): Promise<RunStatus | undefined>;
-  };
-  agent: { setupCommand: string; command: string; timeoutSec: number; env: Record<string, string> };
-  git: { authorName: string; authorEmail: string };
-  harnessUrl?: string;
-  heartbeatIntervalMs?: number;
-}
+export class StepFailed extends Data.TaggedError("StepFailed")<{ message: string }> {}
+class Cancelled extends Data.TaggedError("Cancelled") {}
 
 export type RunOutcome =
   | { status: "succeeded"; pullRequestUrl?: string }
   | { status: "failed"; error: string }
   | { status: "cancelled" };
 
-class Cancelled extends Error {}
+export interface ExecuteOptions {
+  readonly log: RunLog;
+  /** Agent settings plus the env (the user's own keys) every sandbox gets. */
+  readonly agent: Omit<AgentSettings, "passthroughEnv"> & { readonly env: Record<string, string> };
+  readonly git: { readonly authorName: string; readonly authorEmail: string };
+  readonly harnessUrl: Option.Option<string>;
+  readonly heartbeatEvery?: Duration.DurationInput;
+}
 
-/**
- * Drives one run end to end: sandbox up, clone, agent, push, PR, sandbox down.
- * Never throws; every failure becomes a `failed` outcome.
- */
-export async function executeRun(run: RunRow, deps: RunDeps): Promise<RunOutcome> {
-  const { report } = deps;
-  const branch = branchName(run.id);
-  let sandbox: SandboxLike | undefined;
-  let current: ExecHandleLike | undefined;
-  let cancelled = false;
+/** Everything a run does, inside a scope that owns its sandbox. */
+const work = (run: RunRow, { log, agent, git, harnessUrl }: ExecuteOptions) =>
+  Effect.gen(function* () {
+    const sandboxes = yield* Sandboxes;
+    const github = yield* GitHubAppApi;
+    const store = yield* Store;
+    const branch = branchName(run.id);
 
-  const beat = setInterval(() => {
-    void report.heartbeat().then((status) => {
-      if (status === "cancelling" && !cancelled) {
-        cancelled = true;
-        report.info("Cancellation requested, stopping the agent");
-        void current?.kill("TERM");
-      }
-    }, () => {});
-  }, deps.heartbeatIntervalMs ?? 10_000);
-
-  const step = async (label: string, command: string, opts: { cwd?: string; env?: Record<string, string>; timeoutSec?: number } = {}) => {
-    if (cancelled) throw new Cancelled();
-    report.info(label);
-    current = sandbox!.exec(command, {
-      ...opts,
-      onStdout: (chunk) => report.output("stdout", chunk),
-      onStderr: (chunk) => report.output("stderr", chunk),
+    const token = yield* github.installationToken(Number(run.installation_id), {
+      repositories: [run.repo_full_name.split("/")[1]!],
+      permissions: { contents: "write", pull_requests: "write", metadata: "read" },
     });
-    const result = await current;
-    current = undefined;
-    if (cancelled) throw new Cancelled();
-    if (result.timedOut) throw new Error(`${label}: timed out after ${opts.timeoutSec}s`);
-    if (result.exitCode !== 0) throw new Error(`${label}: exited with code ${result.exitCode}`);
-    return result;
-  };
+    log.addSecret(Redacted.value(token));
 
-  try {
-    const installationId = Number(run.installation_id);
-    const token = await deps.mintRepoToken(installationId, run.repo_full_name);
-    report.secret(token);
-
-    report.info("Creating Railway sandbox");
-    sandbox = await deps.createSandbox({ ...deps.agent.env, GH_TOKEN: token, IS_SANDBOX: "1" });
-    await report.update({ sandbox_id: sandbox.id, branch });
-    report.info(`Sandbox ${sandbox.id} is running`);
-
-    await step(
-      `Cloning ${run.repo_full_name}@${run.base_branch}`,
-      cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...deps.git }),
+    yield* log.info("Creating Railway sandbox");
+    const sandbox: SandboxHandle = yield* Effect.acquireRelease(
+      sandboxes.create({ ...agent.env, GH_TOKEN: Redacted.value(token), IS_SANDBOX: "1" }),
+      (sbx) =>
+        sandboxes.destroy(sbx.id).pipe(
+          Effect.zipRight(log.info("Sandbox destroyed")),
+          Effect.catchAll((err) => log.error(err.message)),
+        ),
     );
-    await sandbox.files.write(TASK_FILE, run.task);
-    await sandbox.files.write(COMMIT_MSG_FILE, commitMessage(run.task, run.id));
+    yield* store.updateRun(run.id, { sandbox_id: sandbox.id, branch });
+    yield* log.info(`Sandbox ${sandbox.id} is running`);
 
-    await step("Preparing the agent", deps.agent.setupCommand);
-    await step("Running the agent", deps.agent.command, {
+    const step = (label: string, command: string, opts: Omit<ExecOptions, "onOutput"> = {}) =>
+      Effect.gen(function* () {
+        yield* log.info(label);
+        const result = yield* sandbox.exec(command, { ...opts, onOutput: log.push });
+        if (result.timedOut) return yield* new StepFailed({ message: `${label}: timed out after ${opts.timeoutSec}s` });
+        if (result.exitCode !== 0) return yield* new StepFailed({ message: `${label}: exited with code ${result.exitCode}` });
+        return result;
+      });
+
+    yield* step(
+      `Cloning ${run.repo_full_name}@${run.base_branch}`,
+      cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...git }),
+    );
+    yield* sandbox.writeFile(TASK_FILE, run.task);
+    yield* sandbox.writeFile(COMMIT_MSG_FILE, commitMessage(run.task, run.id));
+
+    yield* step("Preparing the agent", agent.setupCommand);
+    yield* step("Running the agent", agent.command, {
       cwd: REPO_DIR,
       env: { FACTORY_TASK_FILE: TASK_FILE, FACTORY_RUN_ID: run.id },
-      timeoutSec: deps.agent.timeoutSec,
+      timeoutSec: agent.timeoutSec,
     });
 
-    const published = await step("Committing and pushing", publishScript({ baseBranch: run.base_branch, branch }));
+    const published = yield* step("Committing and pushing", publishScript({ baseBranch: run.base_branch, branch }));
     if (published.stdout.includes(NO_CHANGES_MARKER)) {
-      report.info("The agent made no changes, so there is nothing to open a PR for");
-      return { status: "succeeded" };
+      yield* log.info("The agent made no changes, so there is nothing to open a PR for");
+      return { status: "succeeded" } as const;
     }
 
-    report.info("Opening pull request");
-    const url = await deps.createPullRequest(token, run.repo_full_name, {
+    yield* log.info("Opening pull request");
+    const pr = yield* github.createPullRequest(token, run.repo_full_name, {
       title: summarizeTask(run.task),
       body: pullRequestBody({
         task: run.task,
         runId: run.id,
-        runUrl: deps.harnessUrl ? `${deps.harnessUrl}/runs/${run.id}` : undefined,
+        runUrl: Option.getOrUndefined(Option.map(harnessUrl, (url) => `${url}/runs/${run.id}`)),
       }),
       head: branch,
       base: run.base_branch,
     });
-    await report.update({ pull_request_url: url });
-    report.info(`Opened ${url}`);
-    return { status: "succeeded", pullRequestUrl: url };
-  } catch (err) {
-    if (err instanceof Cancelled || cancelled) {
-      report.info("Run cancelled");
-      return { status: "cancelled" };
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    report.error(message);
-    return { status: "failed", error: message };
-  } finally {
-    clearInterval(beat);
-    if (sandbox) {
-      try {
-        await sandbox.destroy();
-        report.info("Sandbox destroyed");
-      } catch (err) {
-        report.error(`Could not destroy sandbox ${sandbox.id}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-  }
-}
+    yield* store.updateRun(run.id, { pull_request_url: pr.html_url });
+    yield* log.info(`Opened ${pr.html_url}`);
+    return { status: "succeeded", pullRequestUrl: pr.html_url } as const;
+  }).pipe(
+    // Logged before the scope closes, so the log reads "error" then "Sandbox destroyed".
+    Effect.tapError((err) => log.error(err.message)),
+    Effect.scoped,
+  );
+
+/**
+ * Drives one run end to end: sandbox up, clone, agent, push, PR, sandbox down.
+ * Never fails; every error becomes a `failed` outcome. A heartbeat runs
+ * alongside the work, and when it sees the run was cancelled the work is
+ * interrupted, which kills the command in the sandbox and destroys it.
+ */
+export const executeRun = (
+  run: RunRow,
+  options: ExecuteOptions,
+): Effect.Effect<RunOutcome, never, Sandboxes | GitHubAppApi | Store> =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const { log } = options;
+
+    const watchForCancel = store.heartbeat(run.id).pipe(
+      Effect.orElseSucceed(() => Option.none()),
+      Effect.repeat({
+        schedule: Schedule.spaced(options.heartbeatEvery ?? Duration.seconds(10)),
+        until: Option.contains("cancelling"),
+      }),
+      Effect.zipRight(log.info("Cancellation requested, stopping the agent")),
+      Effect.zipRight(Effect.fail(new Cancelled())),
+    );
+
+    return yield* work(run, options).pipe(
+      Effect.raceFirst(watchForCancel),
+      Effect.map((outcome): RunOutcome => outcome),
+      Effect.catchTag("Cancelled", () =>
+        log.info("Run cancelled").pipe(Effect.as<RunOutcome>({ status: "cancelled" })),
+      ),
+      Effect.catchAll((err) => Effect.succeed<RunOutcome>({ status: "failed", error: err.message })),
+    );
+  });

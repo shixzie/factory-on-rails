@@ -1,23 +1,21 @@
-import { serve } from "@hono/node-server";
-import { createDb } from "@factory/core";
-import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
+import { HttpMiddleware, HttpServer } from "@effect/platform";
+import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node";
+import { GitHubUserApi, PgLive, Store, TokenCipher } from "@factory/core";
+import { Config, Layer } from "effect";
+import { createServer } from "node:http";
+import { app, originCheck } from "./app.js";
+import { HarnessConfig } from "./config.js";
 
-const config = loadConfig();
-const sql = createDb(config.databaseUrl);
-const app = createApp(sql, config);
+const ServicesLive = Layer.mergeAll(Store.Live, TokenCipher.Live, GitHubUserApi.Live, HarnessConfig.Live).pipe(
+  Layer.provide(PgLive),
+  Layer.provide(NodeHttpClient.layerUndici),
+);
 
-if (config.allowedLogins.length === 0) {
-  console.warn("ALLOWED_GITHUB_LOGINS is empty: nobody will be able to sign in.");
-}
-
-const server = serve({ fetch: app.fetch, port: config.port, hostname: process.env.HOST ?? "0.0.0.0" }, (info) => {
-  console.log(`harness listening on :${info.port} (${config.publicUrl})`);
+const ServerLive = NodeHttpServer.layerConfig(createServer, {
+  port: Config.integer("PORT").pipe(Config.withDefault(3000)),
+  host: Config.string("HOST").pipe(Config.withDefault("0.0.0.0")),
 });
 
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    server.close();
-    void sql.end({ timeout: 5 }).then(() => process.exit(0));
-  });
-}
+const HttpLive = app.pipe(originCheck, HttpMiddleware.logger, HttpServer.serve(), HttpServer.withLogAddress);
+
+HttpLive.pipe(Layer.provide(ServerLive), Layer.provide(ServicesLive), Layer.launch, NodeRuntime.runMain);
