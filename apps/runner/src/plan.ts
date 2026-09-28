@@ -25,6 +25,9 @@ export function summarizeTask(task: string, max = 72): string {
   return first.length > max ? `${first.slice(0, max - 1)}…` : first;
 }
 
+/** Part of git's push error when the App token can't touch `.github/workflows`. */
+export const WORKFLOWS_PERMISSION_REFUSAL = "without `workflows` permission";
+
 /** Printed by Railway when a sandbox VM boots without outbound network. */
 export const RECOVERY_CONSOLE_BANNER = "Railway recovery console";
 
