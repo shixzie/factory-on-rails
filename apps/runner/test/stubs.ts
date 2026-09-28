@@ -1,6 +1,6 @@
-import { GitHubAppApi, Store, type RunEvent, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, Store, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
-import { SandboxError, Sandboxes, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
+import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
 /** A Store with only the given methods; anything else dies loudly. */
 export const stubStore = (impl: Partial<StoreService>) =>
@@ -16,12 +16,17 @@ export const stubStore = (impl: Partial<StoreService>) =>
 export const recordingStore = (status: () => RunStatus = () => "running") => {
   const events: RunEvent[] = [];
   const updates: object[] = [];
+  const diffs: { patch: string; truncated: boolean }[] = [];
+  /** Messages the user "sent"; the runner reads them with listUserMessages. */
+  const userMessages: RunEventRow[] = [];
   const layer = stubStore({
     appendEvents: (_runId, batch) => Effect.sync(() => void events.push(...batch)),
     updateRun: (_runId, patch) => Effect.sync(() => void updates.push(patch)),
     heartbeat: () => Effect.sync(() => Option.some(status())),
+    listUserMessages: (_runId, afterId) => Effect.sync(() => userMessages.filter((m) => Number(m.id) > afterId)),
+    saveDiff: (_runId, patch, truncated) => Effect.sync(() => void diffs.push({ patch, truncated })),
   });
-  return { events, updates, layer };
+  return { events, updates, diffs, userMessages, layer };
 };
 
 export const fakeGitHub = (calls: unknown[][] = []) =>
@@ -38,8 +43,14 @@ export const fakeGitHub = (calls: unknown[][] = []) =>
       }),
   });
 
+/** A command that streams output as it goes, e.g. an agent. */
+export type Scripted = (onOutput: NonNullable<ExecOptions["onOutput"]>) => Effect.Effect<Partial<ExecResult>>;
+
 export interface FakeSandbox {
   commands: string[];
+  /** The env each command ran with, in the same order as `commands`. */
+  envs: (Record<string, string> | undefined)[];
+  files: Record<string, string>;
   createdWith?: Record<string, string>;
   destroyed: boolean;
   killed: boolean;
@@ -50,23 +61,35 @@ export interface FakeSandbox {
  * substring of the command; `hang` names a command that never finishes.
  */
 export const fakeSandboxes = (
-  results: Record<string, Partial<ExecResult>> = {},
+  results: Record<string, Partial<ExecResult> | Effect.Effect<Partial<ExecResult>> | Scripted> = {},
   { hang, failCreate }: { hang?: string; failCreate?: string } = {},
 ) => {
-  const state: FakeSandbox = { commands: [], destroyed: false, killed: false };
+  const state: FakeSandbox = { commands: [], envs: [], files: {}, destroyed: false, killed: false };
   const handle: SandboxHandle = {
     id: "sbx_1",
     exec: (command, options) => {
       state.commands.push(command);
+      state.envs.push(options?.env);
       if (hang && command.includes(hang)) {
         return Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (state.killed = true))));
       }
       const key = Object.keys(results).find((k) => command.includes(k));
-      const result = { exitCode: 0, stdout: "", timedOut: false, ...(key ? results[key] : {}) };
-      if (result.stdout) options?.onOutput?.("stdout", result.stdout);
-      return Effect.succeed(result);
+      const planned = key ? results[key]! : {};
+      const effect =
+        typeof planned === "function"
+          ? planned(options?.onOutput ?? (() => {}))
+          : Effect.isEffect(planned)
+            ? planned
+            : Effect.succeed(planned);
+      return effect.pipe(
+        Effect.map((partial) => {
+          const result = { exitCode: 0, stdout: "", timedOut: false, ...partial };
+          if (result.stdout) options?.onOutput?.("stdout", result.stdout);
+          return result;
+        }),
+      );
     },
-    writeFile: () => Effect.void,
+    writeFile: (path, content) => Effect.sync(() => void (state.files[path] = content)),
   };
   const layer = Layer.succeed(Sandboxes, {
     create: (env) =>

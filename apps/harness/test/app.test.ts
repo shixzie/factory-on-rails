@@ -181,6 +181,42 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(status._tag === "Some" && status.value.status).toBe("cancelled");
   });
 
+  it("takes messages for a live run, shows its activity and its diff", async () => {
+    const owner = await signIn("owner", 1);
+    const created = await run(
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const r = yield* store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "t" });
+        yield* store.appendEvents(r.id, [
+          { kind: "tool_call", message: "mcp__factory__ask_user", data: { id: "toolu_1", name: "mcp__factory__ask_user", input: { question: "Which?" } } },
+        ]);
+        yield* store.updateRun(r.id, { awaiting_input: true });
+        return r;
+      }),
+    );
+    expect((await request(`/api/runs/${created.id}/diff`, { headers: { cookie: owner.cookie } })).status).toBe(404);
+    expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "  " })).status).toBe(400);
+
+    const sent = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "The second one" });
+    expect(sent.status).toBe(201);
+    expect((await json(sent)).awaitingInput).toBe(false);
+
+    await run(Effect.flatMap(Store, (store) => store.saveDiff(created.id, "diff --git a/x b/x\n", false)));
+    const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+    expect(detail.events.map((e: { kind: string; data: unknown }) => [e.kind, e.data])).toEqual([
+      ["tool_call", { id: "toolu_1", name: "mcp__factory__ask_user", input: { question: "Which?" } }],
+      ["user_message", null],
+    ]);
+    expect(detail.hasMore).toBe(false);
+    expect(detail.diff).toMatchObject({ patch: "diff --git a/x b/x\n", truncated: false });
+    const page = await json(request(`/api/runs/${created.id}/events?after=${detail.events[0].id}`, { headers: { cookie: owner.cookie } }));
+    expect(page.events.map((e: { message: string }) => e.message)).toEqual(["The second one"]);
+    expect(page.diffUpdatedAt).toBe(detail.diff.updatedAt);
+
+    await post(`/api/runs/${created.id}/cancel`, owner.cookie);
+    expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "too late" })).status).toBe(400);
+  });
+
   describe("bring your own key", () => {
     it("refuses to start a run for users without a key", async () => {
       const { cookie } = await signIn("byok", 3);

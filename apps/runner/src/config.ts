@@ -2,7 +2,20 @@ import { Config, Context, Duration, Effect, Layer, Option } from "effect";
 import { hostname } from "node:os";
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
-export const DEFAULT_AGENT_COMMAND = 'claude -p "$(cat "$FACTORY_TASK_FILE")" --dangerously-skip-permissions';
+/**
+ * Claude Code in headless mode, streaming JSON so the run page can show each
+ * message and tool call, with the factory's ask-the-user tool and inbox hook
+ * (see agent-tools.ts). Any CLI that edits the working tree works as
+ * AGENT_COMMAND; plain text output is shown as a log.
+ */
+export const DEFAULT_AGENT_COMMAND = [
+  'claude -p "$(cat "$FACTORY_TASK_FILE")"',
+  "--dangerously-skip-permissions",
+  "--output-format stream-json --verbose",
+  '--mcp-config "$FACTORY_MCP_CONFIG"',
+  '--settings "$FACTORY_SETTINGS_FILE"',
+  '--append-system-prompt "$(cat "$FACTORY_SYSTEM_PROMPT_FILE")"',
+].join(" ");
 
 export interface AgentSettings {
   readonly setupCommand: string;

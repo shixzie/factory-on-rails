@@ -1,8 +1,9 @@
 import type { RunRow } from "@factory/core";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Option } from "effect";
+import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
-import { NO_CHANGES_MARKER } from "../src/plan.js";
+import { MAX_DIFF_BYTES, NO_CHANGES_MARKER } from "../src/plan.js";
 import { makeRunLog } from "../src/run-log.js";
 import { fakeGitHub, fakeSandboxes, recordingStore } from "./stubs.js";
 
@@ -64,7 +65,17 @@ describe("executeRun", () => {
         "setup-agent",
         "run-agent",
         "set -eu",
+        "set -eu",
       ]);
+      expect(sandboxes.state.commands[4]).toContain("git diff --cached");
+      expect(Object.keys(sandboxes.state.files)).toEqual(
+        expect.arrayContaining(["/workspace/.factory/ask-server.mjs", "/workspace/.factory/settings.json", "/workspace/.factory/mcp.json"]),
+      );
+      expect(sandboxes.state.envs[3]).toMatchObject({
+        FACTORY_TASK_FILE: "/workspace/TASK.md",
+        FACTORY_MCP_CONFIG: "/workspace/.factory/mcp.json",
+        FACTORY_SETTINGS_FILE: "/workspace/.factory/settings.json",
+      });
       expect(store.updates).toEqual([
         { sandbox_id: "sbx_1", branch: "factory/run-0123abcd" },
         { pull_request_url: "https://github.com/shixzie/demo/pull/1" },
@@ -132,6 +143,77 @@ describe("executeRun", () => {
       expect(sandboxes.state.commands).not.toContainEqual(expect.stringContaining("git push"));
       expect(sandboxes.state.destroyed).toBe(true);
       expect(events).toContain("info:Run cancelled");
+    }),
+  );
+
+  it.effect("stores the agent's stream as structured events and records the final diff", () =>
+    Effect.gen(function* () {
+      const stream = [
+        { type: "system", subtype: "init", model: "claude-x" },
+        { type: "assistant", message: { content: [{ type: "text", text: "Adding it." }, { type: "tool_use", id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } }] } },
+        { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "Wrote sk-ant-user-key" }] } },
+        { type: "result", subtype: "success", is_error: false, result: "Added a README." },
+      ]
+        .map((m) => JSON.stringify(m))
+        .join("\n");
+      const patch = "diff --git a/README.md b/README.md\nnew file mode 100644\n+# Hi\n";
+      const sandboxes = fakeSandboxes({ "run-agent": { stdout: `${stream}\nplain text\n` }, "git diff --cached": { stdout: patch } });
+      const store = recordingStore();
+      const { events } = yield* execute(sandboxes, store);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          "info:Agent started (claude-x)",
+          "message:Adding it.",
+          "tool_call:Write",
+          "tool_result:Wrote [redacted]",
+          "agent_result:Added a README.",
+          "stdout:plain text\n",
+        ]),
+      );
+      expect(store.events.find((e) => e.kind === "tool_call")!.data).toEqual({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
+      expect(store.diffs).toEqual([{ patch, truncated: false }]);
+    }),
+  );
+
+  it.effect("records the diff even when the agent fails, and caps a huge one", () =>
+    Effect.gen(function* () {
+      const big = ["a", "b"].map((f) => `diff --git a/${f} b/${f}\n+${"x".repeat(MAX_DIFF_BYTES / 2 + 10)}\n`).join("");
+      const store = recordingStore();
+      const { outcome } = yield* execute(fakeSandboxes({ "run-agent": { exitCode: 1 }, "git diff --cached": { stdout: big } }), store);
+      expect(outcome.status).toBe("failed");
+      expect(store.diffs).toHaveLength(1);
+      expect(store.diffs[0]!.truncated).toBe(true);
+      expect(store.diffs[0]!.patch.startsWith("diff --git a/a b/a")).toBe(true);
+      expect(store.diffs[0]!.patch).not.toContain("diff --git a/b");
+    }),
+  );
+
+  it.live("hands the user's messages to the agent and flags when it waits for an answer", () =>
+    Effect.gen(function* () {
+      const store = recordingStore();
+      store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "Use pnpm", data: null });
+      const ask = { type: "assistant", message: { content: [{ type: "tool_use", id: "q1", name: ASK_USER_TOOL, input: { question: "Which?" } }] } };
+      const answered = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "q1", content: "The user answered: A" }] } };
+      const sandboxes = fakeSandboxes({
+        "run-agent": (onOutput) =>
+          Effect.gen(function* () {
+            onOutput("stdout", `${JSON.stringify(ask)}\n`);
+            yield* Effect.sleep("150 millis");
+            onOutput("stdout", `${JSON.stringify(answered)}\n`);
+            yield* Effect.sleep("150 millis");
+            return {};
+          }),
+      });
+      yield* execute(sandboxes, store, { inboxEvery: "10 millis", diffEvery: "10 millis" });
+
+      const delivered = sandboxes.state.commands.findIndex((c) => c.includes("FACTORY_MESSAGE"));
+      expect(delivered).toBeGreaterThan(0);
+      expect(sandboxes.state.commands[delivered]).toContain("/workspace/.factory/inbox/0000000000000007.json");
+      expect(JSON.parse(sandboxes.state.envs[delivered]!.FACTORY_MESSAGE!)).toMatchObject({ text: "Use pnpm" });
+      // Delivered once, however many times the inbox was checked.
+      expect(sandboxes.state.commands.filter((c) => c.includes("FACTORY_MESSAGE"))).toHaveLength(1);
+      const flags = store.updates.filter((u) => "awaiting_input" in u);
+      expect(flags).toEqual([{ awaiting_input: true }, { awaiting_input: false }]);
     }),
   );
 });

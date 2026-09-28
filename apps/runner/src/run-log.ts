@@ -10,9 +10,16 @@ export function redact(message: string, secrets: Iterable<string>): string {
   return out;
 }
 
+/** Kinds that count toward a run's output budget: everything the agent produces. */
+const BUDGETED: ReadonlySet<RunEvent["kind"]> = new Set(["stdout", "stderr", "message", "thinking", "tool_call", "tool_result"]);
+/** Consecutive output chunks are merged into one event up to this size. */
+const MAX_MERGED_OUTPUT = 64 * 1024;
+
 export interface RunLog {
   /** Synchronous so SDK output callbacks can call it directly. */
-  readonly push: (kind: RunEvent["kind"], message: string) => void;
+  readonly push: (kind: RunEvent["kind"], message: string, data?: RunEvent["data"]) => void;
+  /** Scrubs the run's secrets from text stored elsewhere (the diff). */
+  readonly redact: (text: string) => string;
   /**
    * Values (the user's API keys, the repo token) scrubbed from everything
    * stored. A secret split across two output chunks can slip through, so this
@@ -42,18 +49,25 @@ export const makeRunLog = (
     let outputBytes = 0;
     let truncated = false;
 
-    const push = (kind: RunEvent["kind"], raw: string) => {
+    const push = (kind: RunEvent["kind"], raw: string, rawData?: RunEvent["data"]) => {
       const message = redact(raw, secrets);
-      if (kind === "stdout" || kind === "stderr") {
+      const data = rawData == null ? null : (JSON.parse(redact(JSON.stringify(rawData), secrets)) as RunEvent["data"]);
+      if (BUDGETED.has(kind)) {
         if (truncated) return;
-        outputBytes += Buffer.byteLength(message);
+        outputBytes += Buffer.byteLength(message) + (data ? Buffer.byteLength(JSON.stringify(data)) : 0);
         if (outputBytes > maxOutputBytes) {
           truncated = true;
           pending.push({ kind: "info", message: "Output limit reached; further agent output is not stored" });
           return;
         }
       }
-      pending.push({ kind, message });
+      // Raw output arrives in many small chunks; store runs of it as one event.
+      const last = pending.at(-1);
+      if ((kind === "stdout" || kind === "stderr") && last?.kind === kind && last.message.length < MAX_MERGED_OUTPUT) {
+        pending[pending.length - 1] = { kind, message: last.message + message };
+        return;
+      }
+      pending.push(data ? { kind, message, data } : { kind, message });
     };
 
     const flush = lock.withPermits(1)(
@@ -69,6 +83,7 @@ export const makeRunLog = (
 
     return {
       push,
+      redact: (text) => redact(text, secrets),
       addSecret: (value) => {
         if (value.length >= 8) secrets.add(value);
       },

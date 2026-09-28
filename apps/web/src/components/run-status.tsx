@@ -30,16 +30,29 @@ const DOT: Record<Api.RunStatus, string> = {
 
 export const isActive = (status: Api.RunStatus) => status === "queued" || status === "running" || status === "cancelling";
 
-export function StatusDot({ status, className }: { status: Api.RunStatus; className?: string }) {
-  return <span aria-hidden className={cn("inline-block size-1.5 shrink-0 rounded-full", DOT[status], className)} />;
+/** A live run whose agent asked a question and is waiting for the user. */
+const needsInput = (status: Api.RunStatus, awaiting?: boolean) => !!awaiting && status === "running";
+
+export function StatusDot({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-block size-1.5 shrink-0 rounded-full",
+        needsInput(status, awaiting) ? "bg-warning animate-pulse" : DOT[status],
+        className,
+      )}
+    />
+  );
 }
 
 /** A dot and a word, colored by state, the way t3code labels a thread. */
-export function StatusLabel({ status, className }: { status: Api.RunStatus; className?: string }) {
+export function StatusLabel({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+  const input = needsInput(status, awaiting);
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-xs font-medium", TONE[status], className)}>
-      <StatusDot status={status} />
-      {LABEL[status]}
+    <span className={cn("inline-flex items-center gap-1.5 text-xs font-medium", input ? "text-warning" : TONE[status], className)}>
+      <StatusDot status={status} awaiting={awaiting} />
+      {input ? "Needs input" : LABEL[status]}
     </span>
   );
 }
