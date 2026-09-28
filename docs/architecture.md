@@ -2,8 +2,9 @@
 
 Factory on Rails is a software factory that runs entirely on Railway. You sign in
 with GitHub, pick a repository (or create one), describe a change, and a coding
-agent does the work in a disposable Railway sandbox and hands it back as a pull
-request. This document describes the first foundation: what exists in this
+agent does the work in a Railway sandbox and hands it back as a pull request.
+A run is a conversation: send it another message and the agent carries on in
+the same sandbox. This document describes the first foundation: what exists in this
 repository, how the pieces fit, and what comes next.
 
 ## Components
@@ -24,7 +25,7 @@ flowchart LR
     sbx1["sandbox (run A)"]
     sbx2["sandbox (run B)"]
   end
-  runner -- "Sandbox.create / exec / destroy<br/>(railway SDK, project token)" --> agents
+  runner -- "Sandbox.create / exec / checkpoint / destroy<br/>(railway SDK, project token)" --> agents
   harness -- "user access token<br/>(list repos, create repos)" --> gh[(GitHub)]
   runner -- "installation token<br/>(scoped to one repo)" --> gh
   sbx1 -- "clone / push" --> gh
@@ -37,7 +38,7 @@ flowchart LR
 | `apps/harness` | Railway service, private | JSON API and GitHub sign-in: repository list and creation, starting and cancelling runs, run logs, API keys. |
 | `apps/runner` | Railway service, private | Claims queued runs, drives one Railway sandbox per run, pushes the branch and opens the PR. |
 | `packages/core` | Library | Postgres schema and data access, GitHub App auth, token encryption. |
-| Railway Sandboxes | `agents` environment | Isolated VMs the agent runs in. Created and destroyed per run by the runner. |
+| Railway Sandboxes | `agents` environment | Isolated VMs the agent runs in. One per run, kept between its turns, stopped when idle and deleted with the run. |
 
 Stack: TypeScript on Node 22, pnpm workspaces, [Effect](https://effect.website)
 throughout, and Railway's own `railway` npm package for both IaC and sandboxes.
@@ -70,10 +71,11 @@ All application code is written with Effect 3:
 - **The web app** decodes the same `@factory/core/api` schemas with an
   `@effect/platform` `HttpClient` (`apps/web/src/lib/api.ts`), both in server
   components and in the browser. React stays plain React.
-- **Resources and cancellation.** A run's sandbox is a scoped resource
-  (`acquireRelease`), so it is destroyed however the run ends. Cancelling a run,
-  or stopping the runner, interrupts the fiber, which kills the command in the
-  sandbox and releases the sandbox on the way out.
+- **Resources and cancellation.** A turn's sandbox is a scoped resource
+  (`acquireRelease`): once it holds the checkout it is kept for the next turn,
+  and before that it is destroyed however the turn ends. Cancelling a run, or
+  stopping the runner, interrupts the fiber, which kills the command in the
+  sandbox.
 - **Tests** use `@effect/vitest`.
 
 ## The web app
@@ -94,7 +96,10 @@ session cookie first-party, the GitHub callback at
 `https://factory.shixzie.com/auth/callback`, and the harness's Origin check
 unchanged. Server components call the harness directly with the visitor's
 cookie. The run page polls `/api/runs/:id/events` every two seconds while a run
-is live, and fetches `/api/runs/:id/diff` whenever the page says the diff moved.
+is live (and every 15 seconds while a finished run's sandbox is up, to show
+when it stops), and fetches `/api/runs/:id/diff` whenever the page says the
+diff moved. Its composer continues the run, and the header says whether the
+sandbox is running, stopped or deleted.
 
 A run page reads like a t3code turn (see "Watching and talking to the agent"
 below): the agent's messages as prose, the tool calls between them as one-line
@@ -142,11 +147,55 @@ Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"
 2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
    agent, commit and push, with `onStdout` / `onStderr` streaming into
    `run_events`. Every command starts with `export HOME="${HOME:-/root}"`,
-   because exec can start a shell without HOME and git needs it.
-3. `sandbox.files.write(...)` for the task text and commit message, so user
-   input never has to be quoted into a shell command.
-4. `sandbox.destroy()` as the release step of a scoped resource, plus a reaper
-   that destroys sandboxes left behind by a runner that died mid-run.
+   because exec can start a shell without HOME and git needs it, and exports
+   the current GitHub token as `GH_TOKEN` (see below).
+3. `sandbox.files.write(...)` for the task text, commit message and token, so
+   user input never has to be quoted into a shell command.
+4. `sandbox.checkpoint(name)` then `sandbox.destroy()` to stop a sandbox that
+   sat idle, and `Sandbox.create(name)` to boot it again (see below).
+
+### Stopping and resuming a sandbox
+
+Railway can't pause a sandbox: one is running until it is destroyed. So the
+factory "stops" a sandbox by saving its disk as a checkpoint and destroying
+the VM, and resumes it by booting a new sandbox from that checkpoint. Files
+survive (the checkout, uncommitted work, the agent's session in `~/.claude`);
+running processes don't, which is fine because nothing runs between turns.
+
+```
+new run ──▶ running ──(5 min idle)──▶ stopping ──▶ stopped
+               ▲                                     │
+               └──────────── next message ◀──────────┘
+   (7 days without activity: the run, its events, diff and sandbox or checkpoint are deleted)
+```
+
+- **After a turn** the sandbox stays `running`, so a quick follow-up starts
+  instantly. Every heartbeat, user message and turn bumps the run's
+  `last_activity_at`.
+- **Idle stop.** Every 30 seconds each runner claims finished runs whose
+  sandbox has had no activity for `SANDBOX_IDLE_STOP_MINUTES` (5), marking
+  them `stopping` so only one runner takes each. It deletes the token file,
+  checkpoints the disk as `run-<run id>-<time>` and destroys the VM. A
+  sandbox that can't be saved is destroyed anyway (billing stops either way)
+  and the run notes that the next turn starts from the branch.
+  `SANDBOX_IDLE_TIMEOUT_MINUTES` (Railway's own idle timeout, 15) stays as a
+  backstop if no runner is around.
+- **Resume.** The next message queues the run again. The runner connects to
+  the sandbox if it is still running, or boots one from the checkpoint and
+  then deletes the checkpoint. If neither works it creates a new sandbox and
+  checks out the run's branch from GitHub, so pushed work is never lost.
+- **Retention.** Runs with no activity for `RUN_RETENTION_DAYS` (7) are
+  deleted, with their events, diff, and sandbox or checkpoint. The sandbox or
+  checkpoint goes first, so a failure leaves the run to be tried again rather
+  than leaking a checkpoint.
+- **Checkpoint limit.** An environment holds as many checkpoints as its plan
+  allows sandboxes (50 on Hobby, 100 on Pro), so that caps how many runs can
+  be stopped at once. Past it, stopping falls back to destroying.
+- **Tokens.** Installation tokens expire after an hour and a sandbox can live
+  far longer, so the token is not baked into the sandbox env. Each turn writes
+  a fresh one to `/workspace/.factory/gh-token` (mode 0600); every command
+  exports it as `GH_TOKEN`, and git reads it through a credential helper, so it
+  never lands in `.git/config` or a checkpoint.
 
 Decisions:
 
@@ -157,10 +206,10 @@ Decisions:
   Hobby, 100 on Pro) don't compete with anything else.
 - **`ISOLATED` networking.** Sandboxes get internet egress but no route to the
   factory's private network, so agents cannot reach Postgres.
-- **Secrets at create time.** The GitHub token and the user's own model API key
-  are passed as sandbox `env` when the sandbox is created (not per `exec`),
-  which keeps them out of `ps` inside the VM. The runner also scrubs both
-  values from stored run output.
+- **Secrets out of `ps`.** The user's own model API key is passed as sandbox
+  `env` when the sandbox is created, and the GitHub token is written to a file
+  (see above), never per `exec`, which keeps them out of `ps` inside the VM.
+  The runner also scrubs both values from stored run output.
 - **Checkpoints for speed.** The standard image already has git and Node. Once
   the agent CLI and common toolchains are installed, capture a checkpoint
   (`sandbox.checkpoint("agent-base")`) and set `SANDBOX_CHECKPOINT` so every run
@@ -168,10 +217,12 @@ Decisions:
 
 ## The harness and the run lifecycle
 
-A **run** is one task against one repository in one sandbox.
+A **run** is one conversation against one repository in one sandbox. Each
+time the runner picks it up is a **turn**: the first does the task, and each
+later one answers the messages the user sent since.
 
 ```
-queued ──▶ running ──▶ succeeded | failed
+queued ──▶ running ──▶ succeeded | failed ──(user sends a message)──▶ queued
    │           │
    └─▶ cancelled ◀── cancelling
 ```
@@ -190,13 +241,20 @@ queued ──▶ running ──▶ succeeded | failed
    ask-the-user tool and inbox hook); any CLI that edits files in the working
    tree works, and plain text output is shown as a log.
 5. It commits whatever the agent left uncommitted, pushes the branch if it
-   moved, opens a pull request, and destroys the sandbox.
+   moved, and opens a pull request. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
-   sees `cancelling` and interrupts the run, which kills the agent process and
-   destroys the sandbox. When a runner is stopped (redeploy, scale down), it
-   interrupts its runs the same way and marks them failed so they can be
-   started again. If a runner dies without stopping cleanly, another
-   replica's reaper fails its runs and destroys their sandboxes.
+   sees `cancelling` and interrupts the run, which kills the agent process.
+   When a runner is stopped (redeploy, scale down), it interrupts its runs
+   the same way and marks them failed. If a runner dies without stopping
+   cleanly, another replica's reaper fails its runs. Either way the sandbox
+   is kept, so a message picks the run up again.
+7. A message to a finished run (`POST /api/runs/:id/messages`) queues it
+   again. On that turn the agent continues its Claude Code session
+   (`claude --continue`, signalled by `FACTORY_CONTINUE`) with the new
+   messages as its prompt; in a new sandbox it gets the original task and the
+   messages instead. Commits go to the same branch and pull request; if that
+   pull request was merged or closed, a new one is opened. A run that
+   finishes while a message is still unread goes straight back to the queue.
 
 Run output is stored in `run_events` (batched once a second, capped at 5 MB per
 run) and the run page polls it.
@@ -274,7 +332,8 @@ key under **Settings**, and it is used for their runs only.
   agent CLI) is a new entry there with its env var and key check.
 - The agent can read the key inside its sandbox, which is inherent to running
   an agent with the user's credentials. The sandbox is isolated from the
-  platform's network and destroyed after the run.
+  platform's network, stopped after a few idle minutes and deleted with the
+  run after a week without activity.
 
 ## Data model
 
@@ -285,6 +344,10 @@ key under **Settings**, and it is used for their runs only.
 - `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat).
 - `run_events`: append-only log per run: runner steps, command output, and the agent's messages, tool calls and results, plus messages from the user (`003_run_activity.sql`).
 - `run_diffs`: the latest diff of each run's branch against its base commit.
+- `runs` also tracks its sandbox between turns (`004_sandbox_lifecycle.sql`):
+  `sandbox_state` (none, running, stopping, stopped, deleted), the checkpoint
+  a stopped one boots from, `last_activity_at`, `turns`, and the last user
+  message handed to the agent.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
 
 ## What this foundation does not do yet

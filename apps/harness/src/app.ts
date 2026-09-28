@@ -58,6 +58,8 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   startedAt: r.started_at,
   finishedAt: r.finished_at,
   awaitingInput: r.awaiting_input,
+  sandboxState: r.sandbox_state,
+  lastActivityAt: r.last_activity_at,
 });
 
 const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({
@@ -299,17 +301,24 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/api/runs/:id/messages",
     Effect.gen(function* () {
-      const { run } = yield* ownedRun;
+      const { user, run } = yield* ownedRun;
       const store = yield* Store;
       const text = (yield* HttpServerRequest.schemaBodyJson(Api.SendMessageBody)).text.trim();
       if (!text) return yield* fail(400, "bad_request", "Write a message first.");
       if (text.length > MAX_MESSAGE_CHARS) return yield* fail(400, "bad_request", "That message is too long.");
-      if (run.status !== "queued" && run.status !== "running") {
-        return yield* fail(400, "bad_request", "This run is not running any more, so the agent cannot read messages.");
+      if (run.status === "cancelling") {
+        return yield* fail(400, "bad_request", "The agent is stopping. Send your message once it has stopped.");
       }
-      // The runner picks the message up and hands it to the agent; the answer clears the question.
-      yield* store.appendEvents(run.id, [{ kind: "user_message", message: text }]);
-      if (run.awaiting_input) yield* store.updateRun(run.id, { awaiting_input: false });
+      if (run.status === "queued" || run.status === "running") {
+        // The runner hands the message to the agent; an answer clears the open question.
+        yield* store.addUserMessage(run.id, text);
+      } else {
+        // A finished run: the message starts the next turn, in the same sandbox when it is still there.
+        if ((yield* store.listApiKeys(user.id)).length === 0) {
+          return yield* fail(400, "api_key_required", "Add your model API key in Settings before continuing a run.");
+        }
+        yield* store.continueRun(run.id, text);
+      }
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
       return yield* json(Api.ApiRun)(toApiRun(updated), 201);
     }),

@@ -29,8 +29,14 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
   return { events, updates, diffs, userMessages, layer };
 };
 
-/** `grantedPermissions` mimics the App's settings: asking for anything else gets GitHub's 422. */
-export const fakeGitHub = (calls: unknown[][] = [], grantedPermissions?: string[]) =>
+/**
+ * `grantedPermissions` mimics the App's settings: asking for anything else gets
+ * GitHub's 422. `prOpen` makes GitHub refuse a second PR for the branch.
+ */
+export const fakeGitHub = (
+  calls: unknown[][] = [],
+  { grantedPermissions, prOpen = false }: { grantedPermissions?: string[]; prOpen?: boolean } = {},
+) =>
   Layer.succeed(GitHubAppApi, {
     installationToken: (...args) =>
       Effect.suspend(() => {
@@ -42,9 +48,17 @@ export const fakeGitHub = (calls: unknown[][] = [], grantedPermissions?: string[
         return Effect.succeed(Redacted.make("ghs_repo_token"));
       }),
     createPullRequest: (token, repo, pr) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         calls.push(["createPullRequest", Redacted.value(token), repo, pr]);
-        return { number: 1, html_url: "https://github.com/shixzie/demo/pull/1" };
+        return prOpen
+          ? Effect.fail(
+              new GitHubError({
+                status: 422,
+                message: "Validation Failed",
+                body: { errors: [{ message: `A pull request already exists for shixzie:${pr.head}.` }] },
+              }),
+            )
+          : Effect.succeed({ number: 1, html_url: "https://github.com/shixzie/demo/pull/1" });
       }),
   });
 
@@ -56,7 +70,16 @@ export interface FakeSandbox {
   /** The env each command ran with, in the same order as `commands`. */
   envs: (Record<string, string> | undefined)[];
   files: Record<string, string>;
+  modes: Record<string, number | undefined>;
   createdWith?: Record<string, string>;
+  /** The checkpoint name a sandbox was booted from. */
+  restoredFrom?: string;
+  /** Sandboxes that exist right now, by id. */
+  alive: Set<string>;
+  /** Checkpoints that exist right now: id to name. */
+  checkpoints: Map<string, string>;
+  destroyedIds: string[];
+  deletedCheckpoints: string[];
   destroyed: boolean;
   killed: boolean;
 }
@@ -64,14 +87,40 @@ export interface FakeSandbox {
 /**
  * Sandboxes whose commands succeed unless `results` has an entry for a
  * substring of the command; `hang` names a command that never finishes.
+ * `create` makes sbx_1 (then sbx_2, ...), `restore` makes sbx_restored.
  */
 export const fakeSandboxes = (
   results: Record<string, Partial<ExecResult> | Effect.Effect<Partial<ExecResult>> | Scripted> = {},
-  { hang, failCreate }: { hang?: string; failCreate?: string } = {},
+  {
+    hang,
+    failCreate,
+    failRestore,
+    failCheckpoint,
+    alive = [],
+    checkpoints = {},
+  }: {
+    hang?: string;
+    failCreate?: string;
+    failRestore?: string;
+    failCheckpoint?: string;
+    alive?: string[];
+    checkpoints?: Record<string, string>;
+  } = {},
 ) => {
-  const state: FakeSandbox = { commands: [], envs: [], files: {}, destroyed: false, killed: false };
-  const handle: SandboxHandle = {
-    id: "sbx_1",
+  const state: FakeSandbox = {
+    commands: [],
+    envs: [],
+    files: {},
+    modes: {},
+    alive: new Set(alive),
+    checkpoints: new Map(Object.entries(checkpoints)),
+    destroyedIds: [],
+    deletedCheckpoints: [],
+    destroyed: false,
+    killed: false,
+  };
+  const handle = (id: string): SandboxHandle => ({
+    id,
     exec: (command, options) => {
       state.commands.push(command);
       state.envs.push(options?.env);
@@ -94,17 +143,53 @@ export const fakeSandboxes = (
         }),
       );
     },
-    writeFile: (path, content) => Effect.sync(() => void (state.files[path] = content)),
-  };
+    writeFile: (path, content, mode) =>
+      Effect.sync(() => {
+        state.files[path] = content;
+        state.modes[path] = mode;
+      }),
+  });
+  let created = 0;
+  let checkpointed = 0;
   const layer = Layer.succeed(Sandboxes, {
     create: (env) =>
       failCreate
         ? Effect.fail(new SandboxError({ message: failCreate }))
         : Effect.sync(() => {
             state.createdWith = env;
-            return handle;
+            const id = `sbx_${++created}`;
+            state.alive.add(id);
+            return handle(id);
           }),
-    destroy: () => Effect.sync(() => void (state.destroyed = true)),
+    restore: (name, env) =>
+      failRestore || ![...state.checkpoints.values()].includes(name)
+        ? Effect.fail(new SandboxError({ message: failRestore ?? `No checkpoint ${name}` }))
+        : Effect.sync(() => {
+            state.createdWith = env;
+            state.restoredFrom = name;
+            state.alive.add("sbx_restored");
+            return handle("sbx_restored");
+          }),
+    connect: (id) => Effect.sync(() => (state.alive.has(id) ? Option.some(handle(id)) : Option.none())),
+    checkpoint: (_id, name) =>
+      failCheckpoint
+        ? Effect.fail(new SandboxError({ message: failCheckpoint }))
+        : Effect.sync(() => {
+            const id = `cp_${++checkpointed}`;
+            state.checkpoints.set(id, name);
+            return { id, name };
+          }),
+    destroy: (id) =>
+      Effect.sync(() => {
+        state.alive.delete(id);
+        state.destroyedIds.push(id);
+        state.destroyed = true;
+      }),
+    deleteCheckpoint: (id) =>
+      Effect.sync(() => {
+        state.checkpoints.delete(id);
+        state.deletedCheckpoints.push(id);
+      }),
   });
   return { state, layer };
 };

@@ -214,7 +214,46 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(page.diffUpdatedAt).toBe(detail.diff.updatedAt);
 
     await post(`/api/runs/${created.id}/cancel`, owner.cookie);
-    expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "too late" })).status).toBe(400);
+    expect(detail.run).toMatchObject({ sandboxState: "none" });
+  });
+
+  it("continues a finished run when the user writes to it", async () => {
+    const owner = await signIn("continuer", 4);
+    const created = await run(
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const r = yield* store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "t" });
+        yield* store.updateRun(r.id, { sandbox_id: "sbx_1", sandbox_state: "stopped" });
+        yield* Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'succeeded' where id = ${r.id}`);
+        return r;
+      }),
+    );
+    const noKey = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
+    expect(noKey.status).toBe(400);
+    expect((await json(noKey)).code).toBe("api_key_required");
+
+    await send("PUT", "/api/settings/keys/anthropic", owner.cookie, { key: "sk-ant-" + "c".repeat(30) });
+    const sent = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
+    expect(sent.status).toBe(201);
+    expect(await json(sent)).toMatchObject({ status: "queued", sandboxState: "stopped", lastActivityAt: expect.any(String) });
+    const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+    expect(detail.events.map((e: { kind: string; message: string }) => `${e.kind}:${e.message}`)).toEqual(["user_message:Now add tests"]);
+    await send("DELETE", "/api/settings/keys/anthropic", owner.cookie);
+  });
+
+  it("asks the user to wait while a run is stopping", async () => {
+    const owner = await signIn("waiter", 5);
+    const created = await run(
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const r = yield* store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "t" });
+        yield* Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'cancelling' where id = ${r.id}`);
+        return r;
+      }),
+    );
+    const res = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "wait" });
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toMatch(/stopping/);
   });
 
   describe("bring your own key", () => {

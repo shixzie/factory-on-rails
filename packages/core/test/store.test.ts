@@ -176,6 +176,102 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
+    it.effect("continues a finished run as its next turn, with the user's message", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const run = yield* enqueue(id, "first");
+        yield* store.claimNextRun("w");
+        // Not finished yet: messages go to the live agent instead.
+        expect(Option.isNone(yield* store.continueRun(run.id, "too soon"))).toBe(true);
+        yield* store.finishRun(run.id, "failed", "boom");
+
+        const queued = Option.getOrThrow(yield* store.continueRun(run.id, "try again"));
+        expect(queued.status).toBe("queued");
+        expect((yield* store.listUserMessages(run.id, 0)).map((e) => e.message)).toEqual(["try again"]);
+        const claimed = Option.getOrThrow(yield* store.claimNextRun("w"));
+        expect(claimed).toMatchObject({ id: run.id, turns: 2, error: null, finished_at: null });
+      }),
+    );
+
+    it.effect("queues a run again when it finishes with a message the agent never got", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const run = yield* enqueue(id, "late message");
+        yield* store.claimNextRun("w");
+        yield* store.addUserMessage(run.id, "one more thing");
+        yield* store.finishRun(run.id, "succeeded");
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).status).toBe("queued");
+
+        yield* store.claimNextRun("w");
+        const [message] = yield* store.listUserMessages(run.id, 0);
+        yield* store.updateRun(run.id, { delivered_message_id: message!.id });
+        yield* store.finishRun(run.id, "succeeded");
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).status).toBe("succeeded");
+      }),
+    );
+
+    it.effect("hands out idle sandboxes to stop once, and holds their runs until stopped", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const idle = yield* enqueue(id, "idle");
+        const recent = yield* enqueue(id, "recent");
+        const live = yield* enqueue(id, "live");
+        yield* sql`update runs set status = 'succeeded' where id in (${idle.id}, ${recent.id})`;
+        yield* sql`update runs set status = 'running' where id = ${live.id}`;
+        yield* sql`update runs set sandbox_state = 'running', sandbox_id = 'sbx_' || left(id::text, 4)`;
+        yield* sql`update runs set last_activity_at = now() - interval '10 minutes' where id in (${idle.id}, ${live.id})`;
+
+        const claimed = yield* Effect.all([1, 2].map(() => store.claimIdleSandboxes(300, 900, 10)), { concurrency: "unbounded" });
+        expect(claimed.flat().map((r) => r.id)).toEqual([idle.id]);
+        const row = Option.getOrThrow(yield* store.getRun(idle.id));
+        expect(row.sandbox_state).toBe("stopping");
+        expect(row.sandbox_state_at).toBeInstanceOf(Date);
+
+        // A message while it stops queues the run, but no runner takes it until the sandbox is saved.
+        yield* store.continueRun(idle.id, "more");
+        expect(Option.isNone(yield* store.claimNextRun("w"))).toBe(true);
+        yield* store.updateRun(idle.id, { sandbox_state: "stopped", sandbox_checkpoint_id: "cp", sandbox_checkpoint_name: "run-x" });
+        expect(Option.map(yield* store.claimNextRun("w"), (r) => r.id)).toEqual(Option.some(idle.id));
+
+        // A runner that died mid-stop gives the sandbox back after a while.
+        yield* sql`update runs set sandbox_state = 'stopping', sandbox_state_at = now() - interval '1 hour' where id = ${recent.id}`;
+        expect((yield* store.claimIdleSandboxes(300, 900, 10)).map((r) => r.id)).toEqual([recent.id]);
+      }),
+    );
+
+    it.effect("finds and deletes runs with no activity for the retention period", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const old = yield* enqueue(id, "old");
+        const fresh = yield* enqueue(id, "fresh");
+        const oldButLive = yield* enqueue(id, "old but running");
+        yield* sql`update runs set status = 'succeeded' where id in (${old.id}, ${fresh.id})`;
+        yield* sql`update runs set status = 'running' where id = ${oldButLive.id}`;
+        yield* sql`update runs set last_activity_at = now() - interval '8 days' where id in (${old.id}, ${oldButLive.id})`;
+
+        expect((yield* store.expiredRuns(7, 10)).map((r) => r.id)).toEqual([old.id]);
+        // The user came back in between: kept.
+        yield* store.continueRun(old.id, "still here");
+        expect(yield* store.deleteExpiredRun(old.id, 7)).toBe(false);
+        yield* sql`update runs set status = 'succeeded', last_activity_at = now() - interval '8 days' where id = ${old.id}`;
+        expect(yield* store.deleteExpiredRun(old.id, 7)).toBe(true);
+        expect(Option.isNone(yield* store.getRun(old.id))).toBe(true);
+        expect(yield* store.listEvents(old.id)).toEqual([]);
+      }),
+    );
+
     it.effect("stores API keys per user and provider without exposing them in listings", () =>
       Effect.gen(function* () {
         const store = yield* Store;

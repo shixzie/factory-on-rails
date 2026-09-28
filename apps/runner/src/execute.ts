@@ -1,14 +1,17 @@
-import { GitHubAppApi, Store, type RunRow } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type RunRow } from "@factory/core";
 import { Data, Duration, Effect, Option, Redacted, Schedule } from "effect";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
 import type { AgentSettings } from "./config.js";
 import {
+  AGENT_RAN_FILE,
   branchName,
   capPatch,
   cloneScript,
   diffScript,
   COMMIT_MSG_FILE,
+  followUpPrompt,
+  HAS_SESSION_MARKER,
   networkCheckScript,
   RECOVERY_CONSOLE_BANNER,
   WORKFLOWS_PERMISSION_REFUSAL,
@@ -17,12 +20,18 @@ import {
   publishScript,
   pullRequestBody,
   REPO_DIR,
+  resumeScript,
   summarizeTask,
   TASK_FILE,
+  TOKEN_FILE,
+  UP_TO_DATE_MARKER,
   withHome,
 } from "./plan.js";
 import type { RunLog } from "./run-log.js";
 import { Sandboxes, type ExecOptions, type SandboxHandle } from "./sandbox.js";
+
+/** Where this turn's sandbox came from. */
+type SandboxOrigin = "kept" | "restored" | "new";
 
 export class StepFailed extends Data.TaggedError("StepFailed")<{ message: string }> {}
 class Cancelled extends Data.TaggedError("Cancelled") {}
@@ -45,13 +54,75 @@ export interface ExecuteOptions {
   readonly diffEvery?: Duration.DurationInput;
 }
 
-/** Everything a run does, inside a scope that owns its sandbox. */
+/**
+ * The sandbox for this turn: the one the last turn left running, a new one
+ * booted from the checkpoint of a stopped one, or a fresh one.
+ */
+const acquireSandbox = (run: RunRow, env: Record<string, string>, log: RunLog) =>
+  Effect.gen(function* () {
+    const sandboxes = yield* Sandboxes;
+    if (run.sandbox_state === "running" && run.sandbox_id) {
+      const id = run.sandbox_id;
+      const kept = yield* sandboxes.connect(id).pipe(
+        Effect.catchAll((err) =>
+          // It may still exist; don't pay for two.
+          Effect.zipRight(Effect.ignore(sandboxes.destroy(id)), Effect.as(log.info(err.message), Option.none<SandboxHandle>())),
+        ),
+      );
+      if (Option.isSome(kept)) {
+        yield* log.info(`Continuing in sandbox ${id}`);
+        return { sandbox: kept.value, origin: "kept" as SandboxOrigin };
+      }
+      yield* log.info("The sandbox from the last turn is gone, so this turn starts a new one");
+    }
+    if (run.sandbox_state === "stopped" && run.sandbox_checkpoint_name) {
+      yield* log.info("Resuming the stopped sandbox");
+      const restored = yield* sandboxes.restore(run.sandbox_checkpoint_name, env).pipe(Effect.either);
+      if (restored._tag === "Right") return { sandbox: restored.right, origin: "restored" as SandboxOrigin };
+      yield* log.info(`${restored.left.message}. Starting a new sandbox from the branch instead`);
+    }
+    yield* log.info("Creating Railway sandbox");
+    return { sandbox: yield* sandboxes.create(env), origin: "new" as SandboxOrigin };
+  });
+
+/** Opens the run's pull request, or finds it already open from an earlier turn. */
+const openPullRequest = (run: RunRow, token: Redacted.Redacted<string>, branch: string, harnessUrl: Option.Option<string>) =>
+  Effect.flatMap(GitHubAppApi, (github) =>
+    github.createPullRequest(token, run.repo_full_name, {
+      title: summarizeTask(run.task),
+      body: pullRequestBody({
+        task: run.task,
+        runId: run.id,
+        runUrl: Option.getOrUndefined(Option.map(harnessUrl, (url) => `${url}/runs/${run.id}`)),
+      }),
+      head: branch,
+      base: run.base_branch,
+    }),
+  ).pipe(
+    Effect.map((pr) => ({ url: pr.html_url, opened: true })),
+    // GitHub refuses a second PR for the branch while the first is open. A
+    // merged or closed one doesn't count, so new work gets a new PR.
+    Effect.catchIf(
+      (err: GitHubError) => err.status === 422 && run.pull_request_url !== null && /already exists/i.test(JSON.stringify(err.body ?? err.message)),
+      () => Effect.succeed({ url: run.pull_request_url!, opened: false }),
+    ),
+  );
+
+/**
+ * One turn of a run, inside a scope that owns its sandbox. The first turn
+ * does the task; each later one answers the messages the user sent since.
+ * The sandbox is left running for the next turn once it holds the checkout;
+ * the runner stops it when it sits idle (see worker.ts).
+ */
 const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions) =>
   Effect.gen(function* () {
     const sandboxes = yield* Sandboxes;
     const github = yield* GitHubAppApi;
     const store = yield* Store;
     const branch = branchName(run.id);
+    const followUp = run.turns > 1;
+    // What the user said since the agent last heard from them: this turn's task.
+    const pending = followUp ? yield* store.listUserMessages(run.id, Number(run.delivered_message_id)) : [];
 
     const permissions = { contents: "write", pull_requests: "write", metadata: "read" } as const;
     const tokenFor = (extra: Record<string, "write"> = {}) =>
@@ -72,17 +143,31 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
     );
     log.addSecret(Redacted.value(token));
 
-    yield* log.info("Creating Railway sandbox");
-    const sandbox: SandboxHandle = yield* Effect.acquireRelease(
-      sandboxes.create({ ...agent.env, GH_TOKEN: Redacted.value(token), IS_SANDBOX: "1" }),
-      (sbx) =>
-        sandboxes.destroy(sbx.id).pipe(
-          Effect.zipRight(log.info("Sandbox destroyed")),
-          Effect.catchAll((err) => log.error(err.message)),
-        ),
+    // Kept for the next turn once it holds the checkout; destroyed if it never gets that far.
+    let keep = false;
+    const { sandbox, origin } = yield* Effect.acquireRelease(acquireSandbox(run, { ...agent.env, IS_SANDBOX: "1" }, log), ({ sandbox }) =>
+      keep
+        ? Effect.void
+        : sandboxes.destroy(sandbox.id).pipe(
+            Effect.zipRight(store.updateRun(run.id, { sandbox_state: "deleted" })),
+            Effect.zipRight(log.info("Sandbox destroyed")),
+            Effect.catchAll((err) => log.error(err.message)),
+          ),
     );
-    yield* store.updateRun(run.id, { sandbox_id: sandbox.id, branch });
-    yield* log.info(`Sandbox ${sandbox.id} is running`);
+    yield* store.updateRun(run.id, {
+      sandbox_id: sandbox.id,
+      branch,
+      sandbox_state: "running",
+      sandbox_checkpoint_id: null,
+      sandbox_checkpoint_name: null,
+    });
+    if (origin !== "kept") yield* log.info(`Sandbox ${sandbox.id} is running`);
+    if (run.sandbox_checkpoint_id) {
+      // Booted from it (or gave up on it); either way it has served its purpose.
+      yield* sandboxes.deleteCheckpoint(run.sandbox_checkpoint_id).pipe(
+        Effect.catchAll((err) => Effect.logWarning(err.message)),
+      );
+    }
 
     const step = (label: string, command: string, opts: ExecOptions = {}) =>
       Effect.gen(function* () {
@@ -113,13 +198,26 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
         return result;
       });
 
+    yield* sandbox.writeFile(TOKEN_FILE, Redacted.value(token), 0o600);
     yield* step("Checking the sandbox can reach GitHub", networkCheckScript({ repo: run.repo_full_name }));
-    yield* step(
-      `Cloning ${run.repo_full_name}@${run.base_branch}`,
-      cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...git }),
-    );
-    yield* sandbox.writeFile(TASK_FILE, run.task);
-    yield* sandbox.writeFile(COMMIT_MSG_FILE, commitMessage(run.task, run.id));
+    let continuing = false;
+    if (origin === "new") {
+      yield* step(
+        followUp ? `Cloning ${run.repo_full_name}@${branch}` : `Cloning ${run.repo_full_name}@${run.base_branch}`,
+        cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...git }),
+      );
+    } else {
+      const resumed = yield* step("Picking up where the last turn left off", resumeScript({ repo: run.repo_full_name }));
+      continuing = resumed.stdout.includes(HAS_SESSION_MARKER);
+    }
+    keep = true;
+
+    const messages = pending.map((m) => m.message);
+    const prompt = followUp
+      ? followUpPrompt({ task: run.task, messages: messages.length > 0 ? messages : ["Carry on."], continuing })
+      : run.task;
+    yield* sandbox.writeFile(TASK_FILE, prompt);
+    yield* sandbox.writeFile(COMMIT_MSG_FILE, commitMessage(messages[0] ?? run.task, run.id));
     for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
 
     yield* step("Preparing the agent", agent.setupCommand);
@@ -142,7 +240,7 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
 
     // Hands the user's messages to the agent (see agent-tools.ts) and keeps
     // `awaiting_input` in step with the agent's open questions.
-    let delivered = 0;
+    let delivered = Number(pending.at(-1)?.id ?? run.delivered_message_id);
     let awaiting = false;
     const syncInbox = Effect.gen(function* () {
       for (const message of yield* store.listUserMessages(run.id, delivered)) {
@@ -152,6 +250,7 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
         });
         if (result.exitCode !== 0) return;
         delivered = Number(message.id);
+        yield* store.updateRun(run.id, { delivered_message_id: String(delivered) });
       }
       if (asking.size > 0 !== awaiting) {
         awaiting = asking.size > 0;
@@ -184,12 +283,22 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
       }
     });
 
+    // From here the agent has this turn's messages; later ones go through the inbox.
+    if (pending.length > 0) yield* store.updateRun(run.id, { delivered_message_id: String(delivered) });
+    yield* sandbox.writeFile(AGENT_RAN_FILE, run.id);
+
     yield* Effect.gen(function* () {
       yield* Effect.forkScoped(inboxLoop);
       yield* Effect.forkScoped(diffLoop);
-      yield* step("Running the agent", agent.command, {
+      yield* step(continuing ? "Continuing the agent's session" : "Running the agent", agent.command, {
         cwd: REPO_DIR,
-        env: { ...agentToolEnv(), FACTORY_TASK_FILE: TASK_FILE, FACTORY_RUN_ID: run.id },
+        env: {
+          ...agentToolEnv(),
+          FACTORY_TASK_FILE: TASK_FILE,
+          FACTORY_RUN_ID: run.id,
+          // The default AGENT_COMMAND passes --continue when this is set.
+          ...(continuing ? { FACTORY_CONTINUE: "1" } : {}),
+        },
         timeoutSec: agent.timeoutSec,
         onOutput: stream.write,
       }).pipe(Effect.ensuring(Effect.sync(stream.end)));
@@ -201,25 +310,21 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
     );
 
     const published = yield* step("Committing and pushing", publishScript({ baseBranch: run.base_branch, branch }));
+    const existing = run.pull_request_url ?? undefined;
     if (published.stdout.includes(NO_CHANGES_MARKER)) {
       yield* log.info("The agent made no changes, so there is nothing to open a PR for");
-      return { status: "succeeded" } as const;
+      return { status: "succeeded", pullRequestUrl: existing } as const;
+    }
+    if (published.stdout.includes(UP_TO_DATE_MARKER)) {
+      yield* log.info("No new changes this turn");
+      return { status: "succeeded", pullRequestUrl: existing } as const;
     }
 
-    yield* log.info("Opening pull request");
-    const pr = yield* github.createPullRequest(token, run.repo_full_name, {
-      title: summarizeTask(run.task),
-      body: pullRequestBody({
-        task: run.task,
-        runId: run.id,
-        runUrl: Option.getOrUndefined(Option.map(harnessUrl, (url) => `${url}/runs/${run.id}`)),
-      }),
-      head: branch,
-      base: run.base_branch,
-    });
-    yield* store.updateRun(run.id, { pull_request_url: pr.html_url });
-    yield* log.info(`Opened ${pr.html_url}`);
-    return { status: "succeeded", pullRequestUrl: pr.html_url } as const;
+    if (!existing) yield* log.info("Opening pull request");
+    const pr = yield* openPullRequest(run, token, branch, harnessUrl);
+    if (pr.url !== existing) yield* store.updateRun(run.id, { pull_request_url: pr.url });
+    yield* log.info(pr.opened ? `Opened ${pr.url}` : `Pushed the changes to ${pr.url}`);
+    return { status: "succeeded", pullRequestUrl: pr.url } as const;
   }).pipe(
     // Logged before the scope closes, so the log reads "error" then "Sandbox destroyed".
     Effect.tapError((err) => log.error(err.message)),
@@ -227,10 +332,10 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
   );
 
 /**
- * Drives one run end to end: sandbox up, clone, agent, push, PR, sandbox down.
- * Never fails; every error becomes a `failed` outcome. A heartbeat runs
- * alongside the work, and when it sees the run was cancelled the work is
- * interrupted, which kills the command in the sandbox and destroys it.
+ * Drives one turn of a run end to end: sandbox up (or back), clone, agent,
+ * push, PR. Never fails; every error becomes a `failed` outcome. A heartbeat
+ * runs alongside the work, and when it sees the run was cancelled the work is
+ * interrupted, which kills the command in the sandbox.
  */
 export const executeRun = (
   run: RunRow,

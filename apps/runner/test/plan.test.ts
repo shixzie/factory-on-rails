@@ -6,6 +6,10 @@ import { describe, expect, it } from "vitest";
 import {
   branchName,
   cloneScript,
+  CREDENTIAL_HELPER,
+  followUpPrompt,
+  TOKEN_FILE,
+  UP_TO_DATE_MARKER,
   networkCheckScript,
   publishScript,
   shellQuote,
@@ -36,16 +40,47 @@ describe("plan helpers", () => {
     expect(summarizeTask("x".repeat(100))).toHaveLength(72);
   });
 
-  it("keeps the token out of the clone script text", () => {
+  it("clones without the token in the URL, and picks up a branch an earlier turn pushed", () => {
     const script = cloneScript({ repo: "o/r", baseBranch: "main", branch: "factory/run-1", authorName: "A", authorEmail: "a@x" });
-    expect(script).toContain('x-access-token:$GH_TOKEN@github.com/o/r.git');
+    expect(script).toContain("git clone --depth 50 --branch 'main' https://github.com/o/r.git /workspace/repo");
+    expect(script).not.toContain("GH_TOKEN");
+    expect(script).toContain(`credential.helper ${shellQuote(CREDENTIAL_HELPER)}`);
+    expect(script).toContain("git fetch -q --depth 50 origin 'refs/heads/factory/run-1:refs/remotes/origin/factory/run-1'");
     expect(script).toContain("git checkout -b 'factory/run-1'");
+  });
+
+  it("gives git the token from the token file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cred-"));
+    const helper = CREDENTIAL_HELPER.replace(TOKEN_FILE, join(dir, "token")).slice(1);
+    writeFileSync(join(dir, "token"), "ghs_fresh");
+    // How git runs a "!" helper: the operation comes after the command.
+    const call = (op: string) => execFileSync("sh", ["-c", `${helper} "$@"`, "sh", op]).toString();
+    expect(call("get")).toBe("username=x-access-token\npassword=ghs_fresh\n");
+    expect(call("store")).toBe("");
+  });
+
+  it("exports the current token to every command", () => {
+    const dir = mkdtempSync(join(tmpdir(), "token-"));
+    const command = withHome('printf %s "${GH_TOKEN:-none}"').replaceAll(TOKEN_FILE, join(dir, "token"));
+    const run = () => execFileSync("sh", ["-c", command], { env: { PATH: "/usr/bin:/bin" } }).toString();
+    expect(run()).toBe("none");
+    writeFileSync(join(dir, "token"), "ghs_fresh");
+    expect(run()).toBe("ghs_fresh");
+  });
+
+  it("asks the agent only for what's new when it can continue its session", () => {
+    expect(followUpPrompt({ task: "Add a README", messages: ["And a license", "MIT"], continuing: true })).toBe("And a license\n\nMIT");
+    const fresh = followUpPrompt({ task: "Add a README", messages: ["And a license"], continuing: false });
+    expect(fresh).toContain("## The original task\n\nAdd a README");
+    expect(fresh).toContain("## What the user asks now\n\nAnd a license");
   });
 
   it("pushes only when the branch moved", () => {
     const script = publishScript({ baseBranch: "main", branch: "factory/run-1" });
     expect(script).toContain("rev-list --count 'origin/main'..HEAD");
     expect(script).toContain("git push -q origin 'HEAD:refs/heads/factory/run-1'");
+    // A later turn with nothing new doesn't push again.
+    expect(script).toContain(`rev-parse -q --verify 'refs/remotes/origin/factory/run-1' || true)" ]; then echo ${UP_TO_DATE_MARKER}`);
   });
 
   it("sets HOME only when the shell has none", () => {

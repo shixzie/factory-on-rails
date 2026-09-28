@@ -1,3 +1,4 @@
+import { Api } from "@factory/core";
 import { Config, Context, Duration, Effect, Layer, Option } from "effect";
 import { hostname } from "node:os";
 
@@ -5,11 +6,12 @@ export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm ins
 /**
  * Claude Code in headless mode, streaming JSON so the run page can show each
  * message and tool call, with the factory's ask-the-user tool and inbox hook
- * (see agent-tools.ts). Any CLI that edits the working tree works as
- * AGENT_COMMAND; plain text output is shown as a log.
+ * (see agent-tools.ts). On a later turn in the same sandbox FACTORY_CONTINUE
+ * is set, and it continues its earlier session. Any CLI that edits the working
+ * tree works as AGENT_COMMAND; plain text output is shown as a log.
  */
 export const DEFAULT_AGENT_COMMAND = [
-  'claude -p "$(cat "$FACTORY_TASK_FILE")"',
+  'claude ${FACTORY_CONTINUE:+--continue} -p "$(cat "$FACTORY_TASK_FILE")"',
   "--dangerously-skip-permissions",
   "--output-format stream-json --verbose",
   '--mcp-config "$FACTORY_MCP_CONFIG"',
@@ -38,6 +40,12 @@ export interface RunnerSettings {
   readonly staleRunSeconds: number;
   /** How often a run records liveness and checks for cancellation. */
   readonly heartbeatInterval: Duration.Duration;
+  /** A finished run's sandbox is stopped after this long without activity. */
+  readonly sandboxIdleStop: Duration.Duration;
+  /** A run with no activity for this many days is deleted, with its sandbox. */
+  readonly runRetentionDays: number;
+  /** How often idle sandboxes and expired runs are looked for. */
+  readonly lifecycleInterval: Duration.Duration;
   readonly agent: AgentSettings;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
 }
@@ -71,6 +79,9 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
         pollInterval: int("POLL_INTERVAL_MS", 5000).pipe(Config.map(Duration.millis)),
         staleRunSeconds: int("STALE_RUN_SECONDS", 180),
         heartbeatInterval: int("HEARTBEAT_INTERVAL_MS", 10_000).pipe(Config.map(Duration.millis)),
+        sandboxIdleStop: int("SANDBOX_IDLE_STOP_MINUTES", Api.SANDBOX_IDLE_STOP_MINUTES).pipe(Config.map(Duration.minutes)),
+        runRetentionDays: int("RUN_RETENTION_DAYS", Api.RUN_RETENTION_DAYS),
+        lifecycleInterval: int("LIFECYCLE_INTERVAL_MS", 30_000).pipe(Config.map(Duration.millis)),
         agent: Config.all({
           setupCommand: str("AGENT_SETUP_COMMAND", DEFAULT_AGENT_SETUP),
           command: str("AGENT_COMMAND", DEFAULT_AGENT_COMMAND),

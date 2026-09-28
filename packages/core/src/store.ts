@@ -4,6 +4,15 @@ import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 export type RunStatus = "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
 export const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "cancelled"];
 
+/**
+ * Where a run's sandbox is. `running` stays up between turns for follow-up
+ * messages; `stopping` means a runner is checkpointing and destroying it;
+ * `stopped` means only its checkpoint is left (it boots again on the next
+ * message); `deleted` means it is gone and the next turn starts a new one
+ * from the run's branch.
+ */
+export type SandboxState = "none" | "running" | "stopping" | "stopped" | "deleted";
+
 export interface UserRow {
   id: string;
   github_id: string;
@@ -39,7 +48,18 @@ export interface RunRow {
   started_at: Date | null;
   finished_at: Date | null;
   awaiting_input: boolean;
+  sandbox_state: SandboxState;
+  sandbox_state_at: Date | null;
+  sandbox_checkpoint_id: string | null;
+  sandbox_checkpoint_name: string | null;
+  last_activity_at: Date;
+  turns: number;
+  /** A bigint id, as a string. */
+  delivered_message_id: string;
 }
+
+/** What the runner needs to stop or delete a run's sandbox. */
+export type RunSandbox = Pick<RunRow, "id" | "sandbox_id" | "sandbox_state" | "sandbox_checkpoint_id">;
 
 /**
  * What a run's log records. `info`/`error` are the runner's own steps and
@@ -86,6 +106,20 @@ export interface ApiKeySummary {
 
 type Q<A> = Effect.Effect<A, SqlError.SqlError>;
 
+export type RunPatch = Partial<
+  Pick<
+    RunRow,
+    | "branch"
+    | "sandbox_id"
+    | "pull_request_url"
+    | "awaiting_input"
+    | "sandbox_state"
+    | "sandbox_checkpoint_id"
+    | "sandbox_checkpoint_name"
+    | "delivered_message_id"
+  >
+>;
+
 export interface StoreService {
   // users & sessions
   readonly upsertUser: (u: Omit<UserRow, "id" | "github_id"> & { github_id: number }) => Q<UserRow>;
@@ -106,15 +140,33 @@ export interface StoreService {
   readonly claimNextRun: (workerId: string) => Q<Option.Option<RunRow>>;
   /** Records liveness and returns the run's current status (how the runner notices cancellation). */
   readonly heartbeat: (runId: string) => Q<Option.Option<RunStatus>>;
-  readonly updateRun: (
-    runId: string,
-    patch: Partial<Pick<RunRow, "branch" | "sandbox_id" | "pull_request_url" | "awaiting_input">>,
-  ) => Q<void>;
+  readonly updateRun: (runId: string, patch: RunPatch) => Q<void>;
+  /**
+   * Ends a turn. A run that succeeded while the user sent a message the agent
+   * never got goes straight back to the queue, so that message is answered.
+   */
   readonly finishRun: (runId: string, status: Extract<RunStatus, "succeeded" | "failed" | "cancelled">, error?: string) => Q<void>;
   /** Marks a queued run cancelled, or asks the runner to stop a running one. */
   readonly requestCancel: (runId: string, userId: string) => Q<boolean>;
   /** Fails runs whose runner stopped heartbeating (crash, redeploy) so they don't hang forever. */
   readonly reapStaleRuns: (staleAfterSeconds: number) => Q<ReadonlyArray<Pick<RunRow, "id" | "sandbox_id">>>;
+  /** A user message to a queued or running run: stored for the runner to hand to the agent. */
+  readonly addUserMessage: (runId: string, text: string) => Q<void>;
+  /**
+   * A user message to a finished run: stored, and the run is queued again so
+   * the agent picks the conversation up. None if the run is not finished.
+   */
+  readonly continueRun: (runId: string, text: string) => Q<Option.Option<RunRow>>;
+  /**
+   * Claims runs whose sandbox has been idle (no turn in progress, no activity)
+   * for `idleSeconds`, marking them `stopping`. Also takes back `stopping`
+   * runs whose runner gave up for `staleSeconds`.
+   */
+  readonly claimIdleSandboxes: (idleSeconds: number, staleSeconds: number, limit: number) => Q<ReadonlyArray<RunSandbox>>;
+  /** Finished runs with no activity for `days`, oldest first. */
+  readonly expiredRuns: (days: number, limit: number) => Q<ReadonlyArray<RunSandbox>>;
+  /** Deletes a run (and its events and diff) if it is still finished and expired. */
+  readonly deleteExpiredRun: (runId: string, days: number) => Q<boolean>;
   // events
   readonly appendEvents: (runId: string, events: ReadonlyArray<RunEvent>) => Q<void>;
   readonly listEvents: (runId: string, afterId?: number, limit?: number) => Q<ReadonlyArray<RunEventRow>>;
@@ -136,6 +188,8 @@ export interface StoreService {
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  /** Wakes the runners (see worker.ts); polling is their fallback. */
+  const notifyQueued = (runId: string) => sql`select pg_notify('runs_queued', ${runId})`.pipe(Effect.asVoid);
 
   const service: StoreService = {
     upsertUser: (u) =>
@@ -170,7 +224,7 @@ const make = Effect.gen(function* () {
     enqueueRun: (r) =>
       Effect.gen(function* () {
         const [row] = yield* sql<RunRow>`insert into runs ${sql.insert(r)} returning *`;
-        yield* sql`select pg_notify('runs_queued', ${row!.id})`;
+        yield* notifyQueued(row!.id);
         return row!;
       }),
 
@@ -181,9 +235,12 @@ const make = Effect.gen(function* () {
 
     claimNextRun: (workerId) =>
       sql<RunRow>`
-        update runs set status = 'running', claimed_by = ${workerId}, started_at = now(), heartbeat_at = now()
+        update runs set
+          status = 'running', claimed_by = ${workerId}, started_at = now(), heartbeat_at = now(),
+          finished_at = null, error = null, turns = turns + 1, last_activity_at = now()
         where id = (
-          select id from runs where status = 'queued'
+          -- A sandbox being checkpointed is picked up once it has stopped.
+          select id from runs where status = 'queued' and sandbox_state <> 'stopping'
           order by created_at
           for update skip locked
           limit 1
@@ -191,19 +248,35 @@ const make = Effect.gen(function* () {
         returning *`.pipe(Effect.map(Arr.head)),
 
     heartbeat: (runId) =>
-      sql<{ status: RunStatus }>`update runs set heartbeat_at = now() where id = ${runId} returning status`.pipe(
+      sql<{ status: RunStatus }>`
+        update runs set heartbeat_at = now(), last_activity_at = now() where id = ${runId} returning status`.pipe(
         Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.status)),
       ),
 
     updateRun: (runId, patch) =>
       Object.keys(patch).length === 0
         ? Effect.void
-        : sql`update runs set ${sql.update(patch)} where id = ${runId}`.pipe(Effect.asVoid),
+        : sql`
+            update runs set ${sql.update(patch)}
+              ${patch.sandbox_state ? sql`, sandbox_state_at = now()` : sql``}
+            where id = ${runId}`.pipe(Effect.asVoid),
 
     finishRun: (runId, status, error) =>
-      sql`
-        update runs set status = ${status}, error = ${error ?? null}, finished_at = now(), awaiting_input = false
-        where id = ${runId} and status in ('running', 'cancelling')`.pipe(Effect.asVoid),
+      Effect.gen(function* () {
+        const rows = yield* sql<{ status: RunStatus }>`
+          update runs set
+            status = case
+              when ${status} = 'succeeded' and exists (
+                select 1 from run_events e
+                where e.run_id = runs.id and e.kind = 'user_message' and e.id > runs.delivered_message_id
+              ) then 'queued'::run_status
+              else ${status}::run_status
+            end,
+            error = ${error ?? null}, finished_at = now(), awaiting_input = false, last_activity_at = now()
+          where id = ${runId} and status in ('running', 'cancelling')
+          returning status`;
+        if (rows[0]?.status === "queued") yield* notifyQueued(runId);
+      }),
 
     requestCancel: (runId, userId) =>
       sql`
@@ -219,6 +292,58 @@ const make = Effect.gen(function* () {
         where status in ('running', 'cancelling')
           and heartbeat_at < now() - make_interval(secs => ${staleAfterSeconds})
         returning id, sandbox_id`,
+
+    addUserMessage: (runId, text) =>
+      sql.withTransaction(
+        Effect.zipRight(
+          sql`insert into run_events (run_id, kind, message) values (${runId}, 'user_message', ${text})`,
+          sql`update runs set last_activity_at = now(), awaiting_input = false where id = ${runId}`,
+        ),
+      ).pipe(Effect.asVoid),
+
+    continueRun: (runId, text) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<RunRow>`
+              update runs set status = 'queued', last_activity_at = now(), awaiting_input = false
+              where id = ${runId} and status in ${sql.in(TERMINAL_STATUSES)}
+              returning *`;
+            if (rows.length === 0) return Option.none<RunRow>();
+            yield* sql`insert into run_events (run_id, kind, message) values (${runId}, 'user_message', ${text})`;
+            return Option.some(rows[0]!);
+          }),
+        )
+        .pipe(Effect.tap((row) => (Option.isSome(row) ? notifyQueued(runId) : Effect.void))),
+
+    claimIdleSandboxes: (idleSeconds, staleSeconds, limit) =>
+      sql<RunSandbox>`
+        update runs set sandbox_state = 'stopping', sandbox_state_at = now()
+        where id in (
+          select id from runs
+          where (sandbox_state = 'running' and status in ${sql.in(TERMINAL_STATUSES)}
+                 and last_activity_at < now() - make_interval(secs => ${idleSeconds}))
+             or (sandbox_state = 'stopping' and sandbox_state_at < now() - make_interval(secs => ${staleSeconds}))
+          order by last_activity_at
+          for update skip locked
+          limit ${limit}
+        )
+        returning id, sandbox_id, sandbox_state, sandbox_checkpoint_id`,
+
+    expiredRuns: (days, limit) =>
+      sql<RunSandbox>`
+        select id, sandbox_id, sandbox_state, sandbox_checkpoint_id from runs
+        where status in ${sql.in(TERMINAL_STATUSES)} and sandbox_state <> 'stopping'
+          and last_activity_at < now() - make_interval(days => ${days})
+        order by last_activity_at
+        limit ${limit}`,
+
+    deleteExpiredRun: (runId, days) =>
+      sql`
+        delete from runs
+        where id = ${runId} and status in ${sql.in(TERMINAL_STATUSES)} and sandbox_state <> 'stopping'
+          and last_activity_at < now() - make_interval(days => ${days})
+        returning id`.pipe(Effect.map((rows) => rows.length > 0)),
 
     appendEvents: (runId, events) =>
       events.length === 0

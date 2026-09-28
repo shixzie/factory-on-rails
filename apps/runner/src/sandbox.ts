@@ -1,5 +1,5 @@
 import { Config, Context, Data, Duration, Effect, Layer, Option, Redacted, Schedule } from "effect";
-import { ExecInterruptedError, Sandbox } from "railway";
+import { ExecInterruptedError, Sandbox, SandboxNotFoundError } from "railway";
 
 export class SandboxError extends Data.TaggedError("SandboxError")<{ message: string; cause?: unknown }> {}
 
@@ -21,15 +21,33 @@ export interface ExecOptions {
 export interface SandboxHandle {
   readonly id: string;
   readonly exec: (command: string, options?: ExecOptions) => Effect.Effect<ExecResult, SandboxError>;
-  readonly writeFile: (path: string, content: string) => Effect.Effect<void, SandboxError>;
+  /** `mode` defaults to 0644; secrets go in with 0600. */
+  readonly writeFile: (path: string, content: string, mode?: number) => Effect.Effect<void, SandboxError>;
 }
 
-/** Railway sandboxes, one per run. */
+/** A saved copy of a sandbox's disk, which a new sandbox can boot from. */
+export interface Checkpoint {
+  readonly id: string;
+  readonly name: string;
+}
+
+/**
+ * Railway sandboxes, one per run. Railway has no stop and start for a sandbox,
+ * so "stopping" one is `checkpoint` then `destroy`, and resuming it is
+ * `restore` from that checkpoint: files survive, running processes do not.
+ */
 export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
   Sandboxes,
   {
     readonly create: (env: Record<string, string>) => Effect.Effect<SandboxHandle, SandboxError>;
+    /** Boots a new sandbox from a checkpoint taken with `checkpoint`. */
+    readonly restore: (checkpointName: string, env: Record<string, string>) => Effect.Effect<SandboxHandle, SandboxError>;
+    /** The sandbox, if it still exists and is running. */
+    readonly connect: (id: string) => Effect.Effect<Option.Option<SandboxHandle>, SandboxError>;
+    readonly checkpoint: (id: string, name: string) => Effect.Effect<Checkpoint, SandboxError>;
+    /** A sandbox that is already gone counts as destroyed. */
     readonly destroy: (id: string) => Effect.Effect<void, SandboxError>;
+    readonly deleteCheckpoint: (id: string) => Effect.Effect<void, SandboxError>;
   }
 >() {
   static readonly Live = Layer.effect(
@@ -44,28 +62,63 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
         environmentId: config.environmentId,
       };
       const destroy = (id: string) =>
-        attempt(`Could not destroy sandbox ${id}`, async () => (await Sandbox.connect(id, auth)).destroy());
+        attempt(`Could not destroy sandbox ${id}`, async () => {
+          try {
+            await (await Sandbox.connect(id, auth)).destroy();
+          } catch (cause) {
+            if (!(cause instanceof SandboxNotFoundError)) throw cause;
+          }
+        });
+      const options = (env: Record<string, string>) => ({
+        ...auth,
+        env,
+        region: Option.getOrUndefined(config.region),
+        // Railway's own backstop: it destroys a sandbox left idle this long (the runner stops them sooner).
+        idleTimeoutMinutes: config.idleTimeoutMinutes,
+        // Agents get internet egress but no route to the factory's own services or database.
+        networkIsolation: "ISOLATED" as const,
+      });
+      const boot = (context: string, create: () => Promise<Sandbox>) =>
+        attempt(context, create).pipe(
+          // Don't leak a sandbox that never starts taking commands.
+          Effect.tap((sandbox) => waitUntilReady(sandbox).pipe(Effect.tapError(() => Effect.ignore(destroy(sandbox.id))))),
+          Effect.map(wrapSandbox),
+        );
       return {
         create: (env) =>
-          attempt("Could not create a sandbox", () => {
-            const options = {
-              ...auth,
-              env,
-              region: Option.getOrUndefined(config.region),
-              idleTimeoutMinutes: config.idleTimeoutMinutes,
-              // Agents get internet egress but no route to the factory's own services or database.
-              networkIsolation: "ISOLATED" as const,
-            };
-            return Option.match(config.checkpoint, {
-              onNone: () => Sandbox.create(options),
-              onSome: (checkpoint) => Sandbox.create(checkpoint, options),
-            });
-          }).pipe(
-            // Don't leak a sandbox that never starts taking commands.
-            Effect.tap((sandbox) => waitUntilReady(sandbox).pipe(Effect.tapError(() => Effect.ignore(destroy(sandbox.id))))),
-            Effect.map(wrapSandbox),
+          boot("Could not create a sandbox", () =>
+            Option.match(config.checkpoint, {
+              onNone: () => Sandbox.create(options(env)),
+              onSome: (checkpoint) => Sandbox.create(checkpoint, options(env)),
+            }),
           ),
+        restore: (checkpointName, env) =>
+          boot(`Could not start the sandbox from checkpoint ${checkpointName}`, () => Sandbox.create(checkpointName, options(env))),
+        connect: (id) =>
+          attempt(`Could not reach sandbox ${id}`, async () => {
+            try {
+              const sandbox = await Sandbox.connect(id, auth);
+              return sandbox.status === "RUNNING" ? Option.some(wrapSandbox(sandbox)) : Option.none();
+            } catch (cause) {
+              if (cause instanceof SandboxNotFoundError) return Option.none();
+              throw cause;
+            }
+          }),
+        checkpoint: (id, name) =>
+          attempt(`Could not checkpoint sandbox ${id}`, async () => {
+            const { id: checkpointId, key } = await (await Sandbox.connect(id, auth)).checkpoint(name);
+            return { id: checkpointId, name: key };
+          }),
         destroy,
+        deleteCheckpoint: (id) =>
+          attempt(`Could not delete checkpoint ${id}`, async () => {
+            try {
+              await Sandbox.deleteCheckpoint(id, auth);
+            } catch (cause) {
+              // One that is already gone counts as deleted.
+              if ((await Sandbox.checkpoints(auth)).some((c) => c.id === id)) throw cause;
+            }
+          }),
       };
     }),
   );
@@ -77,6 +130,7 @@ export const SandboxConfig = Config.all({
   region: Config.option(Config.nonEmptyString("SANDBOX_REGION")),
   /** Boot from a named checkpoint (e.g. one with the agent CLI preinstalled) instead of a blank sandbox. */
   checkpoint: Config.option(Config.nonEmptyString("SANDBOX_CHECKPOINT")),
+  /** Railway's idle timeout: a backstop in case no runner is around to stop an idle sandbox. */
   idleTimeoutMinutes: Config.integer("SANDBOX_IDLE_TIMEOUT_MINUTES").pipe(Config.withDefault(15)),
 });
 
@@ -114,7 +168,7 @@ export interface SandboxLike {
     command: string,
     options: ExecOptions & { onStdout?: (chunk: string) => void; onStderr?: (chunk: string) => void },
   ): PromiseLike<ExecResult> & { kill(signal?: "TERM" | "KILL"): Promise<unknown> };
-  readonly files: { write(path: string, content: string): Promise<unknown> };
+  readonly files: { write(path: string, content: string, options?: { mode?: number }): Promise<unknown> };
 }
 
 export const wrapSandbox = (sandbox: SandboxLike): SandboxHandle => ({
@@ -134,5 +188,8 @@ export const wrapSandbox = (sandbox: SandboxLike): SandboxHandle => ({
       // Interruption (a cancelled run, a stopping runner) kills the process group.
       return Effect.promise(() => handle.kill("TERM").catch(() => undefined));
     }),
-  writeFile: (path, content) => attempt(`Could not write ${path}`, () => sandbox.files.write(path, content)).pipe(Effect.asVoid),
+  writeFile: (path, content, mode) =>
+    attempt(`Could not write ${path}`, () => sandbox.files.write(path, content, mode === undefined ? undefined : { mode })).pipe(
+      Effect.asVoid,
+    ),
 });
