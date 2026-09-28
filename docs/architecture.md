@@ -282,6 +282,20 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    pull request was merged or closed, a new one is opened. A run that
    finishes while a message is still unread goes straight back to the queue.
 
+### Run titles
+
+Right after inserting a run, the harness names it in the background
+(`apps/harness/src/titles.ts`): a small, fast model turns the task into a
+title of a few words, which the sidebar and run header show. It uses the
+user's own key, preferring the run's agent's provider: Claude Haiku 4.5
+(`claude-haiku-4-5`) with an Anthropic API key, or GPT-6 Luna (`gpt-6-luna`)
+with an OpenAI key. A Claude subscription token is not used, since it is for
+Claude Code rather than direct API calls, so a user with only a token or a
+snapshot gets no generated title and lists show the task's first line
+instead. Generation has a 20 second limit and every failure is logged and
+dropped, so it can never fail or slow the run. `PATCH /api/runs/:id` renames a
+run; a name the user gave (`runs.title_by_user`) is never replaced.
+
 Run output is stored in `run_events` (batched once a second, capped at 5 MB per
 run) and the run page polls it.
 
@@ -455,6 +469,8 @@ key under **Settings**, and it is used for their runs only.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
 - `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):
   the agent a run uses, and the snapshot a user's runs start from.
+- `runs.title` and `runs.title_by_user` (`007_run_titles.sql`): the run's
+  generated or user-given name.
 - `instance_settings`: what the setup page created, one JSON value per key
   (`github_app`, `sandboxes`, and the runner's `runner` report), secrets
   encrypted (`006_instance_settings.sql`).

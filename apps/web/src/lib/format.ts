@@ -16,10 +16,23 @@ export function duration(from: Date, to: Date): string {
   return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-/** The first line of a task, which is what lists show as its title. */
-export function taskTitle(task: string, max = 80): string {
-  const line = task.trim().split("\n")[0] ?? "";
-  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+
+/** Openings that say nothing about the task: "please", "can you", "we need to". */
+const LEAD_IN =
+  /^(?:(?:please|pls|hey|hi|ok(?:ay)?)\b[,!\s]*|(?:can|could|would) you\s+|i (?:want|need|would like)(?: you)? to\s+|we (?:need|want|have) to\s+|let'?s\s+)+/i;
+
+/**
+ * What lists and the run header call a run: its title (written by a small
+ * model from the task, or by the user), or until it has one, the task's first
+ * line without its lead-in.
+ */
+export function runTitle(run: { title: string | null; task: string }, max = 80): string {
+  if (run.title) return clip(run.title, max);
+  const line = run.task.trim().split("\n")[0]?.trim() ?? "";
+  const bare = line.replace(LEAD_IN, "");
+  const text = bare ? bare[0]!.toUpperCase() + bare.slice(1) : line;
+  return clip(text, max);
 }
 
 /** "just now", "4m ago", "3h ago". */
