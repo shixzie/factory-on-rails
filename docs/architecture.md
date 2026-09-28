@@ -316,8 +316,10 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    ask-the-user tool and inbox hook (see "Agents" below). Any CLI that edits
    files in the working tree works as a command, and plain text output is
    shown as a log.
-5. It commits whatever the agent left uncommitted, pushes the branch if it
-   moved, and opens a pull request. The sandbox stays up for the next turn.
+5. It commits whatever the agent left uncommitted and pushes the branch if it
+   moved. The same agent then writes the pull request (see "Pull request
+   text" below), and the runner opens it. The sandbox stays up for the next
+   turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
    sees `cancelling` and interrupts the run, which kills the agent process.
    When a runner is stopped (redeploy, scale down), it interrupts its runs
@@ -328,9 +330,29 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    again. On that turn the agent continues its Claude Code session
    (`claude --continue`, signalled by `FACTORY_CONTINUE`) with the new
    messages as its prompt; in a new sandbox it gets the original task and the
-   messages instead. Commits go to the same branch and pull request; if that
-   pull request was merged or closed, a new one is opened. A run that
+   messages instead. Commits go to the same branch and pull request, whose
+   title and description the agent writes again to cover the whole branch;
+   if that pull request was merged or closed, a new one is opened. A run that
    finishes while a message is still unread goes straight back to the queue.
+
+### Pull request text
+
+After a turn that pushed new commits, the runner asks the run's agent, with
+the run's own credentials and model, for the pull request's title and
+description (`AGENT_DESCRIBE_COMMAND` / `CODEX_DESCRIBE_COMMAND`). It
+continues the agent's session, so it knows why each change was made, reads
+the branch's diff against the base, and replies with the title on the first
+line and the description after it: a summary, Changes, How to verify, and
+Notes when something is open, or the repository's own pull request template
+when it has one (the prompt is `describePrompt` in `apps/runner/src/plan.ts`).
+The exchange isn't saved to the session (`claude --no-session-persistence`,
+`codex exec resume --ephemeral`), so the next turn continues the work, and
+Claude Code gets only read tools for it. The runner appends a footer linking
+the run, with the task folded away. On a later turn the open pull request's
+title and description are replaced rather than appended to. When the agent
+can't answer (an error, an empty reply, a custom command that can't
+continue a session), the pull request is titled after the task as before.
+Set either command to an empty string to turn this off.
 
 ### Run titles
 

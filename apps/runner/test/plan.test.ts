@@ -7,7 +7,11 @@ import {
   branchName,
   cloneScript,
   CREDENTIAL_HELPER,
+  describePrompt,
   followUpPrompt,
+  MAX_DESCRIPTION,
+  parsePullRequest,
+  pullRequestBody,
   TOKEN_FILE,
   UP_TO_DATE_MARKER,
   networkCheckScript,
@@ -97,5 +101,48 @@ describe("plan helpers", () => {
     const offline = spawnSync("sh", ["-c", script], { env: { PATH: fakeGitPath(128) } });
     expect(offline.status).toBe(1);
     expect(offline.stderr.toString()).toContain("Cannot reach github.com/o/r from the sandbox");
+  });
+});
+
+describe("the pull request the agent writes", () => {
+  it("reads the first line as the title and the rest as the description", () => {
+    expect(parsePullRequest("Retry exec while the sandbox starts\n\nWhy it matters.\n\n## Changes\n- sandbox.ts\n")).toEqual({
+      title: "Retry exec while the sandbox starts",
+      description: "Why it matters.\n\n## Changes\n- sandbox.ts",
+    });
+  });
+
+  it("tidies up titles written as a heading, a label or a quote, and unwraps a fenced reply", () => {
+    expect(parsePullRequest("\n# Add a README\n\nBody")?.title).toBe("Add a README");
+    expect(parsePullRequest("Title: Add a README")).toEqual({ title: "Add a README", description: "" });
+    expect(parsePullRequest('**"Add a README"**')?.title).toBe("Add a README");
+    expect(parsePullRequest("```markdown\nAdd a README\n\nBody\n```")).toEqual({ title: "Add a README", description: "Body" });
+    expect(parsePullRequest("Add a README\r\n\r\nBody")).toEqual({ title: "Add a README", description: "Body" });
+  });
+
+  it("has nothing to offer without a title, and caps what it keeps", () => {
+    expect(parsePullRequest("")).toBeUndefined();
+    expect(parsePullRequest("  \n#\n")).toBeUndefined();
+    expect(parsePullRequest("x".repeat(300))!.title).toHaveLength(256);
+    const long = parsePullRequest(`Title\n\n${"word ".repeat(5000)}`)!;
+    expect(long.description.length).toBeLessThanOrEqual(MAX_DESCRIPTION + 3);
+    expect(long.description.endsWith("…")).toBe(true);
+  });
+
+  it("asks for the whole branch against its base, and says when the PR already exists", () => {
+    const first = describePrompt({ baseBranch: "main", existing: false });
+    expect(first).toContain("git diff 'origin/main'...HEAD");
+    expect(first).toContain("## How to verify");
+    expect(first).toContain(".github/pull_request_template.md");
+    expect(first).not.toContain("already has a pull request");
+    expect(describePrompt({ baseBranch: "main", existing: true })).toContain("already has a pull request");
+  });
+
+  it("puts the agent's description first, with the run and the folded task after it", () => {
+    const body = pullRequestBody({ task: "Add a README", runId: "r1", runUrl: "https://f.dev/runs/r1", description: "Adds one.\n" });
+    expect(body).toBe(
+      "Adds one.\n\n---\n\nOpened by Factory on Rails, run [r1](https://f.dev/runs/r1).\n\n<details><summary>Task</summary>\n\nAdd a README\n\n</details>\n",
+    );
+    expect(pullRequestBody({ task: "Add a README", runId: "r1" })).toBe("Opened by Factory on Rails, run r1.\n\n### Task\n\nAdd a README\n");
   });
 });

@@ -60,6 +60,11 @@ export const fakeGitHub = (
             )
           : Effect.succeed({ number: 1, html_url: "https://github.com/shixzie/demo/pull/1" });
       }),
+    updatePullRequest: (token, repo, number, pr) =>
+      Effect.suspend(() => {
+        calls.push(["updatePullRequest", Redacted.value(token), repo, number, pr]);
+        return Effect.succeed({ number, html_url: `https://github.com/shixzie/demo/pull/${number}` });
+      }),
   });
 
 /** A command that streams output as it goes, e.g. an agent. */

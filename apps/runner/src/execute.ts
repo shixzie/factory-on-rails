@@ -11,6 +11,8 @@ import {
   cloneScript,
   diffScript,
   COMMIT_MSG_FILE,
+  DESCRIBE_FILE,
+  describePrompt,
   followUpPrompt,
   HAS_SESSION_MARKER,
   networkCheckScript,
@@ -18,6 +20,8 @@ import {
   WORKFLOWS_PERMISSION_REFUSAL,
   commitMessage,
   NO_CHANGES_MARKER,
+  parsePullRequest,
+  PR_FILE,
   PREVIEW_AGENT_FILE,
   PREVIEW_TOKEN_FILE,
   previewAgentScript,
@@ -96,28 +100,53 @@ const acquireSandbox = (run: RunRow, env: Record<string, string>, snapshot: stri
     return { sandbox: yield* sandboxes.create(env, snapshot), origin: "new" as SandboxOrigin };
   });
 
-/** Opens the run's pull request, or finds it already open from an earlier turn. */
-const openPullRequest = (run: RunRow, token: Redacted.Redacted<string>, branch: string, harnessUrl: Option.Option<string>) =>
-  Effect.flatMap(GitHubAppApi, (github) =>
-    github.createPullRequest(token, run.repo_full_name, {
-      title: summarizeTask(run.task),
-      body: pullRequestBody({
-        task: run.task,
-        runId: run.id,
-        runUrl: Option.getOrUndefined(Option.map(harnessUrl, (url) => `${url}/runs/${run.id}`)),
-      }),
-      head: branch,
-      base: run.base_branch,
-    }),
-  ).pipe(
-    Effect.map((pr) => ({ url: pr.html_url, opened: true })),
-    // GitHub refuses a second PR for the branch while the first is open. A
-    // merged or closed one doesn't count, so new work gets a new PR.
-    Effect.catchIf(
-      (err: GitHubError) => err.status === 422 && run.pull_request_url !== null && /already exists/i.test(JSON.stringify(err.body ?? err.message)),
-      () => Effect.succeed({ url: run.pull_request_url!, opened: false }),
-    ),
-  );
+/** The title and description the agent wrote for the run's pull request. */
+type Written = { readonly title: string; readonly description: string };
+
+const pullRequestNumber = (url: string | null) => Number(/\/pull\/(\d+)/.exec(url ?? "")?.[1] ?? NaN);
+
+/**
+ * Opens the run's pull request, or finds it already open from an earlier
+ * turn. With a title and description from the agent, an open PR gets them
+ * in place of its old ones.
+ */
+const openPullRequest = (
+  run: RunRow,
+  token: Redacted.Redacted<string>,
+  branch: string,
+  harnessUrl: Option.Option<string>,
+  written: Written | undefined,
+  log: RunLog,
+) =>
+  Effect.gen(function* () {
+    const github = yield* GitHubAppApi;
+    const title = written?.title ?? summarizeTask(run.task);
+    const body = pullRequestBody({
+      task: run.task,
+      runId: run.id,
+      runUrl: Option.getOrUndefined(Option.map(harnessUrl, (url) => `${url}/runs/${run.id}`)),
+      description: written?.description,
+    });
+    const opened = yield* github.createPullRequest(token, run.repo_full_name, { title, body, head: branch, base: run.base_branch }).pipe(
+      Effect.map((pr) => Option.some(pr.html_url)),
+      // GitHub refuses a second PR for the branch while the first is open. A
+      // merged or closed one doesn't count, so new work gets a new PR.
+      Effect.catchIf(
+        (err: GitHubError) => err.status === 422 && run.pull_request_url !== null && /already exists/i.test(JSON.stringify(err.body ?? err.message)),
+        () => Effect.succeed(Option.none<string>()),
+      ),
+    );
+    if (Option.isSome(opened)) return { url: opened.value, opened: true, updated: false };
+    const url = run.pull_request_url!;
+    const number = pullRequestNumber(url);
+    if (!written || Number.isNaN(number)) return { url, opened: false, updated: false };
+    // The description is a nicety: the work is pushed either way.
+    const updated = yield* github.updatePullRequest(token, run.repo_full_name, number, { title, body }).pipe(
+      Effect.as(true),
+      Effect.catchAll((err) => log.info(`Could not update the pull request's description: ${err.message}`).pipe(Effect.as(false))),
+    );
+    return { url, opened: false, updated };
+  });
 
 /**
  * One turn of a run, inside a scope that owns its sandbox. The first turn
@@ -351,10 +380,35 @@ const work = (
       return { status: "succeeded", pullRequestUrl: existing } as const;
     }
 
+    // The agent writes the PR from its own session and the final diff; if it
+    // can't, the PR is titled after the task as before.
+    const written = agent.describeCommand
+      ? yield* Effect.gen(function* () {
+          yield* sandbox.writeFile(DESCRIBE_FILE, describePrompt({ baseBranch: run.base_branch, existing: existing !== undefined }));
+          yield* step("Writing the pull request description", `rm -f ${PR_FILE}\n${agent.describeCommand}`, {
+            cwd: REPO_DIR,
+            env: { FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
+            timeoutSec: 600,
+            // Its reply is the PR text, not activity for the run page.
+            onOutput: () => {},
+          });
+          const reply = yield* sandbox.exec(withHome(`cat ${PR_FILE}`), { timeoutSec: 30 });
+          const pr = reply.exitCode === 0 ? parsePullRequest(log.redact(reply.stdout)) : undefined;
+          if (!pr) return yield* new StepFailed({ message: "the agent's reply had no title" });
+          return pr;
+        }).pipe(
+          Effect.catchAll((err) =>
+            log.info(`Could not write the pull request description (${err.message}), so the PR is titled after the task`).pipe(Effect.as(undefined)),
+          ),
+        )
+      : undefined;
+
     if (!existing) yield* log.info("Opening pull request");
-    const pr = yield* openPullRequest(run, token, branch, harnessUrl);
+    const pr = yield* openPullRequest(run, token, branch, harnessUrl, written, log);
     if (pr.url !== existing) yield* store.updateRun(run.id, { pull_request_url: pr.url });
-    yield* log.info(pr.opened ? `Opened ${pr.url}` : `Pushed the changes to ${pr.url}`);
+    yield* log.info(
+      pr.opened ? `Opened ${pr.url}` : pr.updated ? `Pushed the changes to ${pr.url} and updated its description` : `Pushed the changes to ${pr.url}`,
+    );
     return { status: "succeeded", pullRequestUrl: pr.url } as const;
   }).pipe(
     // Logged before the scope closes, so the log reads "error" then "Sandbox destroyed".

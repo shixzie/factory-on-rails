@@ -10,8 +10,10 @@ export class GitHubError extends Data.TaggedError("GitHubError")<{
   readonly body?: unknown;
 }> {}
 
-export const githubRequest = (method: "GET" | "POST", path: string) =>
-  (method === "GET" ? HttpClientRequest.get : HttpClientRequest.post)(
+const METHODS = { GET: HttpClientRequest.get, POST: HttpClientRequest.post, PATCH: HttpClientRequest.patch };
+
+export const githubRequest = (method: keyof typeof METHODS, path: string) =>
+  METHODS[method](
     path.startsWith("http") ? path : `${GITHUB_API}${path}`,
   ).pipe(
     HttpClientRequest.setHeaders({
