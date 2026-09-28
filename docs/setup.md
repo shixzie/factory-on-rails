@@ -46,7 +46,6 @@ Project → `production` → Settings → **Shared Variables**:
 | `GITHUB_APP_CLIENT_SECRET` | Client secret |
 | `GITHUB_APP_PRIVATE_KEY` | Full `.pem` contents |
 | `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Encrypts stored GitHub tokens and users' API keys. Don't rotate it casually: after a rotation users sign in again and re-save their API keys. |
-| `ALLOWED_GITHUB_LOGINS` | `shixzie` (comma-separated for more people) |
 | `RAILWAY_SANDBOX_TOKEN` | Token from step 2 |
 | `SANDBOX_ENVIRONMENT_ID` | Environment id from step 2 |
 
@@ -80,10 +79,18 @@ railway config plan
 
 ## 5. Give the harness a domain
 
-In the `harness` service → Settings → Networking, **Generate Domain** (or add a
-custom one). Then put `https://<that domain>/auth/callback` in the GitHub App's
-Callback URL. The harness derives its public URL from `RAILWAY_PUBLIC_DOMAIN`;
-set `PUBLIC_URL` on the service only if you use a custom domain.
+Production serves the harness on `factory.shixzie.com`, declared in
+`.railway/railway.ts` (with `PUBLIC_URL`, and `PORT=3000` so the domain's
+target port matches). Its DNS is on Cloudflare: keep the record proxied only
+with SSL/TLS mode **Full (strict)**. "Flexible" makes Cloudflare call Railway
+over HTTP, Railway redirects to HTTPS, and every request loops on a 301.
+
+Put `https://factory.shixzie.com/auth/callback` in the GitHub App's Callback URL.
+For another environment, generate a Railway domain for the harness instead; it
+then derives its URL from `RAILWAY_PUBLIC_DOMAIN`.
+
+Sign-in is open to any GitHub account (`ALLOWED_GITHUB_LOGINS: "*"` in the
+IaC). To restrict it, change that value to a comma-separated list of logins.
 
 There is no platform-wide model API key. The factory is bring-your-own-key:
 each user saves their own key under **Settings** in the harness, and only their

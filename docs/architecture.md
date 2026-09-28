@@ -174,10 +174,12 @@ gives both identities the platform needs:
   Only these ever enter a sandbox, so an agent can touch the repository it was
   given and nothing else.
 
-Access control is closed by default: only GitHub logins in
-`ALLOWED_GITHUB_LOGINS` can sign in. Sessions are random 256-bit tokens in an
-HttpOnly, SameSite=Lax cookie, stored server-side as SHA-256 hashes, and every
-state-changing request must carry our own `Origin`.
+Access control is set by `ALLOWED_GITHUB_LOGINS`: production uses `*`, so any
+GitHub account can sign in (each user brings their own model key); a
+comma-separated list restricts it, and an empty value lets nobody in.
+Sessions are random 256-bit tokens in an HttpOnly, SameSite=Lax cookie, stored
+server-side as SHA-256 hashes, and every state-changing request must carry our
+own `Origin`.
 
 ## Bring your own key
 

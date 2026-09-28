@@ -6,7 +6,10 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
   {
     /** Public origin, e.g. https://harness-production.up.railway.app. Used for OAuth redirects and origin checks. */
     readonly publicUrl: string;
-    /** GitHub logins allowed to sign in. Empty means nobody: the harness is closed by default. */
+    /**
+     * GitHub logins allowed to sign in. `["*"]` lets any GitHub account in;
+     * empty means nobody, so the harness is closed unless configured.
+     */
     readonly allowedLogins: ReadonlyArray<string>;
     readonly sessionTtlSeconds: number;
   }
@@ -25,6 +28,8 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
       const allowedLogins = yield* listConfig("ALLOWED_GITHUB_LOGINS");
       if (allowedLogins.length === 0) {
         yield* Effect.logWarning("ALLOWED_GITHUB_LOGINS is empty: nobody will be able to sign in.");
+      } else if (allowedLogins.includes("*")) {
+        yield* Effect.logInfo("ALLOWED_GITHUB_LOGINS is *: any GitHub account can sign in.");
       }
       return {
         publicUrl: publicUrl.replace(/\/$/, ""),
