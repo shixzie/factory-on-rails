@@ -65,6 +65,9 @@ export const api = {
     call(json("PUT", `/api/settings/keys/${encodeURIComponent(provider)}`, { key }), Schema.Array(Api.ApiKeySlot)),
   deleteKey: (provider: string) =>
     call(HttpClientRequest.del(`/api/settings/keys/${encodeURIComponent(provider)}`), Schema.Array(Api.ApiKeySlot)),
+  setup: call(HttpClientRequest.get("/api/setup"), Api.SetupStatus),
+  createGitHubApp: (body: Api.CreateGitHubAppBody) => call(json("POST", "/api/setup/github-app", body), Api.GitHubAppForm),
+  setupSandboxes: (token: string) => call(json("POST", "/api/setup/sandboxes", { token }), Api.SetupStatus),
 };
 
 /** An HttpClient that sends every request to `baseUrl`, with extra headers and no caching. */
