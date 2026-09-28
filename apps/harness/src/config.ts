@@ -25,6 +25,12 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
           Option.match(railwayDomain, { onNone: () => `http://localhost:${port}`, onSome: (d) => `https://${d}` }),
         ),
       );
+      const onRailway = Option.isSome(yield* Config.option(Config.string("RAILWAY_ENVIRONMENT_NAME")));
+      if (onRailway && publicUrl.startsWith("http://localhost")) {
+        yield* Effect.logWarning(
+          "PUBLIC_URL is not set and the service has no Railway domain: GitHub sign-in will redirect to localhost.",
+        );
+      }
       const allowedLogins = yield* listConfig("ALLOWED_GITHUB_LOGINS");
       if (allowedLogins.length === 0) {
         yield* Effect.logWarning("ALLOWED_GITHUB_LOGINS is empty: nobody will be able to sign in.");
