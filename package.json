@@ -14,9 +14,11 @@
     "dev:harness": "pnpm build && node --env-file=.env apps/harness/dist/index.js",
     "dev:runner": "pnpm build && node --env-file=.env apps/runner/dist/index.js"
   },
+  "dependencies": {
+    "railway": "^3.11.0"
+  },
   "devDependencies": {
     "@types/node": "^22.15.0",
-    "railway": "^3.11.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   }

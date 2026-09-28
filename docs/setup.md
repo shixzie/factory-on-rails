@@ -57,15 +57,24 @@ Project → `production` → Settings → **Shared Variables**:
 - GitHub repo → Settings → Secrets and variables → Actions: add it as `RAILWAY_TOKEN`.
 - Make sure the Railway GitHub App can see this repository (Railway builds the services from it).
 
-From then on, any PR that changes `.railway/` gets a plan comment and merging applies it.
-For the very first apply you can also run it locally:
+All infrastructure changes go through Railway's GitHub Action
+(`railwayapp/config`, wired up in `.github/workflows/railway-config.yml`):
+every PR that changes `.railway/` gets a plan comment, and merging applies
+exactly that plan. Don't apply from your machine: an out-of-band change moves
+the environment's config etag and makes the pending PR's apply fail until it
+is re-planned.
+
+For the first apply, add the secret before merging the PR that introduces
+`.railway/railway.ts`, then push to it (or close and reopen it) so the plan job
+runs with the token. Review the plan comment, then merge.
+
+To preview locally without applying:
 
 ```bash
 npm i -g @railway/cli   # needs CLI 5.42.1 or newer
 railway login && railway link   # project factory-on-rails, environment production
 pnpm install
 railway config plan
-railway config apply
 ```
 
 ## 5. Give the harness a domain
