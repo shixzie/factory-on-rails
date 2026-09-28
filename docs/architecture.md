@@ -110,9 +110,9 @@ read on 2026-12-01, so this repo does not use it.
 - All three services build from this repository with Railpack (`pnpm run build`,
   plus `next build` for the web app) and use watch patterns so a change to one
   app doesn't redeploy the others.
-- The custom domain belongs to the web app. The harness has no public domain;
-  it listens on `::` so the web app reaches it at
-  `harness.railway.internal:8080`.
+- The custom domain belongs to the web app (see setup.md step 5 for moving it,
+  since IaC can't register custom domains). The harness listens on `::` so the
+  web app reaches it at `harness.railway.internal:8080`.
 - The harness runs database migrations as its pre-deploy command, so a failed
   migration stops the deploy instead of shipping a broken schema.
 - `.github/workflows/railway-config.yml` uses `railwayapp/config@v1`: every PR

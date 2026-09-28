@@ -79,15 +79,27 @@ railway config plan
 
 ## 5. Give the web app a domain
 
-Production serves the web app (`apps/web`) on `factory.shixzie.com`, declared in
-`.railway/railway.ts` (with `PORT=8080` so the domain's target port matches).
-The harness has no public domain: the web app forwards `/api/*` and `/auth/*`
-to it over the private network, and the harness's `PUBLIC_URL` is the web app's
-URL. The domain's DNS target is per service, so whenever the domain moves to a
-different service, copy the new CNAME (and any verification TXT record) from
-that service's Settings → Networking into Cloudflare. Its DNS is on Cloudflare: keep the record proxied only
-with SSL/TLS mode **Full (strict)**. "Flexible" makes Cloudflare call Railway
-over HTTP, Railway redirects to HTTPS, and every request loops on a 301.
+Production serves the web app (`apps/web`) on `factory.shixzie.com`. The
+harness needs no public domain: the web app forwards `/api/*` and `/auth/*` to
+it over the private network, and the harness's `PUBLIC_URL` is the web app's
+URL. Both listen on `PORT=8080`.
+
+Railway IaC can keep a custom domain in sync but can't register one on a
+service, so a domain is added in the dashboard first and then declared in
+`.railway/railway.ts` (a plan that declares an unregistered domain fails with
+"Custom-domain registration is not supported"). To move `factory.shixzie.com`
+from the harness to the web service:
+
+1. In the dashboard, remove `factory.shixzie.com` from the `harness` service
+   (Settings → Networking), then add it to the `web` service with target
+   port 8080.
+2. Copy the DNS record Railway shows for it on `web` (each service gets its own
+   target) into Cloudflare, keeping SSL/TLS mode **Full (strict)**.
+3. Merge a PR that moves the `domains` entry from `harness` to `web` in
+   `.railway/railway.ts`, opened after step 1 so its plan is fresh.
+
+With Cloudflare in front, "Flexible" SSL makes Cloudflare call Railway over
+HTTP, Railway redirects to HTTPS, and every request loops on a 301.
 
 Put `https://factory.shixzie.com/auth/callback` in the GitHub App's Callback URL.
 For another environment, generate a Railway domain for the web service instead;
@@ -97,7 +109,7 @@ Sign-in is open to any GitHub account (`ALLOWED_GITHUB_LOGINS: "*"` in the
 IaC). To restrict it, change that value to a comma-separated list of logins.
 
 There is no platform-wide model API key. The factory is bring-your-own-key:
-each user saves their own key under **Settings** in the harness, and only their
+each user saves their own key under **Settings** in the web app, and only their
 runs use it.
 
 ## 6. Smoke test
