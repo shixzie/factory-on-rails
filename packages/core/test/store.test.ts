@@ -113,4 +113,16 @@ describe.skipIf(!url)("store (Postgres)", () => {
     const after = await store.listEvents(sql, run.id, Number(all[0]!.id));
     expect(after.map((e) => e.message)).toEqual(["two"]);
   });
+
+  it("stores API keys per user and provider without exposing them in listings", async () => {
+    await store.upsertApiKey(sql, { user_id: userId, provider: "anthropic", key_enc: "enc-1", hint: "1111" });
+    await store.upsertApiKey(sql, { user_id: userId, provider: "anthropic", key_enc: "enc-2", hint: "2222" });
+    const listed = await store.listApiKeys(sql, userId);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ provider: "anthropic", hint: "2222" });
+    expect(listed[0]).not.toHaveProperty("key_enc");
+    expect(await store.encryptedApiKeys(sql, userId)).toEqual([{ provider: "anthropic", key_enc: "enc-2" }]);
+    await store.deleteApiKey(sql, userId, "anthropic");
+    expect(await store.listApiKeys(sql, userId)).toEqual([]);
+  });
 });

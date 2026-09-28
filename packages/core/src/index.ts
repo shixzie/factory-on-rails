@@ -2,6 +2,7 @@ export * from "./crypto.js";
 export * from "./db.js";
 export * from "./env.js";
 export * from "./migrate.js";
+export * from "./providers.js";
 export * from "./store.js";
 export * from "./github/api.js";
 export * from "./github/app.js";

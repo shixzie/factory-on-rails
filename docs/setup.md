@@ -45,11 +45,10 @@ Project → `production` → Settings → **Shared Variables**:
 | `GITHUB_APP_CLIENT_ID` | Client ID |
 | `GITHUB_APP_CLIENT_SECRET` | Client secret |
 | `GITHUB_APP_PRIVATE_KEY` | Full `.pem` contents |
-| `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Don't rotate it casually: stored GitHub tokens become unreadable (users just sign in again). |
+| `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Encrypts stored GitHub tokens and users' API keys. Don't rotate it casually: after a rotation users sign in again and re-save their API keys. |
 | `ALLOWED_GITHUB_LOGINS` | `shixzie` (comma-separated for more people) |
 | `RAILWAY_SANDBOX_TOKEN` | Token from step 2 |
 | `SANDBOX_ENVIRONMENT_ID` | Environment id from step 2 |
-| `ANTHROPIC_API_KEY` | Key for the default agent (Claude Code). Swap for your agent's key if you change `AGENT_COMMAND`. |
 
 ## 4. Let CI apply the infrastructure
 
@@ -84,9 +83,14 @@ custom one). Then put `https://<that domain>/auth/callback` in the GitHub App's
 Callback URL. The harness derives its public URL from `RAILWAY_PUBLIC_DOMAIN`;
 set `PUBLIC_URL` on the service only if you use a custom domain.
 
+There is no platform-wide model API key. The factory is bring-your-own-key:
+each user saves their own key under **Settings** in the harness, and only their
+runs use it.
+
 ## 6. Smoke test
 
-Open the harness, sign in with GitHub, pick a repository, and start a run with
+Open the harness, sign in with GitHub, save your Anthropic API key under
+**Settings**, pick a repository, and start a run with
 a small task ("Add a CONTRIBUTING.md with a short how-to-run section"). You
 should see the sandbox come up in the `agents` environment's Sandboxes tab,
 the log stream on the run page, and a PR on the repository when it finishes.

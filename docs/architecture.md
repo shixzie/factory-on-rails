@@ -88,9 +88,10 @@ Decisions:
   Hobby, 100 on Pro) don't compete with anything else.
 - **`ISOLATED` networking.** Sandboxes get internet egress but no route to the
   factory's private network, so agents cannot reach Postgres.
-- **Secrets at create time.** The GitHub token and model API key are passed as
-  sandbox `env` when the sandbox is created (not per `exec`), which keeps them
-  out of `ps` inside the VM.
+- **Secrets at create time.** The GitHub token and the user's own model API key
+  are passed as sandbox `env` when the sandbox is created (not per `exec`),
+  which keeps them out of `ps` inside the VM. The runner also scrubs both
+  values from stored run output.
 - **Checkpoints for speed.** The standard image already has git and Node. Once
   the agent CLI and common toolchains are installed, capture a checkpoint
   (`sandbox.checkpoint("agent-base")`) and set `SANDBOX_CHECKPOINT` so every run
@@ -148,6 +149,24 @@ Access control is closed by default: only GitHub logins in
 HttpOnly, SameSite=Lax cookie, stored server-side as SHA-256 hashes, and every
 state-changing request must carry our own `Origin`.
 
+## Bring your own key
+
+There is no platform-wide model API key. Each user saves their own provider
+key under **Settings**, and it is used for their runs only.
+
+- Keys are validated for shape, encrypted with AES-256-GCM
+  (`TOKEN_ENCRYPTION_KEY`) and stored in `user_api_keys`, one per user and
+  provider. The UI only ever shows the last four characters.
+- The harness refuses to queue a run for a user with no key and sends them to
+  Settings. The runner decrypts the run owner's keys when it picks the run up
+  and injects each one under its provider's env var (`ANTHROPIC_API_KEY` for
+  Anthropic), so the agent CLI in the sandbox bills that user's account.
+- Providers live in `packages/core/src/providers.ts`. Adding one (for another
+  agent CLI) is a new entry there with its env var and key check.
+- The agent can read the key inside its sandbox, which is inherent to running
+  an agent with the user's credentials. The sandbox is isolated from the
+  platform's network and destroyed after the run.
+
 ## Data model
 
 `packages/core/migrations/001_init.sql`:
@@ -156,6 +175,7 @@ state-changing request must carry our own `Origin`.
 - `sessions`: hashed session tokens with expiry.
 - `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat).
 - `run_events`: append-only log per run.
+- `user_api_keys`: each user's encrypted model API keys (bring your own key).
 
 ## What this foundation does not do yet
 
@@ -168,7 +188,7 @@ These are the natural next steps, roughly in order:
 3. **Pipelines.** Multi-step factories (plan, implement, test, review) with a
    sandbox per step and forks to try approaches in parallel.
 4. **Secrets per repository.** Let a repository declare which extra variables
-   its sandbox needs, stored as Railway shared variables in the `agents` environment.
+   its sandbox needs, encrypted per user alongside their API keys.
 5. **Preview deploys.** Use sandbox public domains (`networkIsolation: "PRIVATE"`
    with `domains`) to expose a running app for review.
 6. **Multi-user.** Organisations, per-repo permissions, and quotas instead of an allowlist.

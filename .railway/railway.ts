@@ -57,9 +57,10 @@ export default defineRailway((ctx) => {
       HARNESS_URL: "https://${{harness.RAILWAY_PUBLIC_DOMAIN}}",
       GITHUB_APP_ID: ctx.shared.GITHUB_APP_ID,
       GITHUB_APP_PRIVATE_KEY: ctx.shared.GITHUB_APP_PRIVATE_KEY,
+      // Decrypts each user's own model API key (bring your own key).
+      TOKEN_ENCRYPTION_KEY: ctx.shared.TOKEN_ENCRYPTION_KEY,
       RAILWAY_SANDBOX_TOKEN: ctx.shared.RAILWAY_SANDBOX_TOKEN,
       SANDBOX_ENVIRONMENT_ID: ctx.shared.SANDBOX_ENVIRONMENT_ID,
-      ANTHROPIC_API_KEY: ctx.shared.ANTHROPIC_API_KEY,
       MAX_CONCURRENT_RUNS: ctx.isEnvironment("production") ? "5" : "1",
     },
   });

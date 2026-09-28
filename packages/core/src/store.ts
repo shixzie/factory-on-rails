@@ -187,3 +187,36 @@ export function listEvents(sql: Sql, runId: string, afterId = 0, limit = 500): P
     select * from run_events where run_id = ${runId} and id > ${afterId}
     order by id limit ${limit}`;
 }
+
+// ---- bring-your-own API keys -----------------------------------------------
+
+export interface ApiKeySummary {
+  provider: string;
+  hint: string;
+  updated_at: Date;
+}
+
+export async function upsertApiKey(
+  sql: Sql,
+  k: { user_id: string; provider: string; key_enc: string; hint: string },
+): Promise<void> {
+  await sql`
+    insert into user_api_keys ${sql(k)}
+    on conflict (user_id, provider) do update set
+      key_enc = excluded.key_enc, hint = excluded.hint, updated_at = now()`;
+}
+
+/** What the UI may show: never the key itself. */
+export function listApiKeys(sql: Sql, userId: string): Promise<ApiKeySummary[]> {
+  return sql<ApiKeySummary[]>`
+    select provider, hint, updated_at from user_api_keys where user_id = ${userId} order by provider`;
+}
+
+export async function deleteApiKey(sql: Sql, userId: string, provider: string): Promise<void> {
+  await sql`delete from user_api_keys where user_id = ${userId} and provider = ${provider}`;
+}
+
+/** Encrypted keys for the runner to decrypt and inject into a run's sandbox. */
+export function encryptedApiKeys(sql: Sql, userId: string): Promise<{ provider: string; key_enc: string }[]> {
+  return sql`select provider, key_enc from user_api_keys where user_id = ${userId}`;
+}

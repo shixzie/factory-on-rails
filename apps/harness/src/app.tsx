@@ -1,5 +1,12 @@
 import {
+  deleteApiKey,
+  encrypt,
   enqueueRun,
+  isModelProvider,
+  keyHint,
+  listApiKeys,
+  upsertApiKey,
+  validateApiKey,
   getRun,
   GitHubError,
   listEvents,
@@ -23,7 +30,7 @@ import {
   type Env,
 } from "./auth.js";
 import type { HarnessConfig } from "./config.js";
-import { Dashboard, LoginPage, MessagePage, NewRepoPage, RunPage, type RepoOption } from "./views.js";
+import { Dashboard, LoginPage, MessagePage, NewRepoPage, RunPage, SettingsPage, type RepoOption } from "./views.js";
 
 /** Renders a full HTML document (Hono JSX does not emit a doctype on its own). */
 const render = (c: Context, node: Child, status: 200 | 400 | 403 | 500 = 200) =>
@@ -85,8 +92,11 @@ export function createApp(sql: Sql, config: HarnessConfig) {
   app.get("/", async (c) => {
     const user = c.get("user");
     if (!user) return render(c, <LoginPage />);
-    const [repos, runs] = await Promise.all([accessibleRepos(user), listRuns(sql, user.id)]);
-    return render(c, <Dashboard user={user} repos={repos} runs={runs} installUrl={installUrl} />);
+    const [repos, runs, keys] = await Promise.all([accessibleRepos(user), listRuns(sql, user.id), listApiKeys(sql, user.id)]);
+    return render(
+      c,
+      <Dashboard user={user} repos={repos} runs={runs} installUrl={installUrl} hasApiKey={keys.length > 0} />,
+    );
   });
 
   app.get("/repos/new", (c) => {
@@ -127,6 +137,40 @@ export function createApp(sql: Sql, config: HarnessConfig) {
     }
   });
 
+  // ---- bring your own key --------------------------------------------------
+
+  app.get("/settings", async (c) => {
+    const user = requireUser(c);
+    if (user instanceof Response) return user;
+    return render(c, <SettingsPage user={user} keys={await listApiKeys(sql, user.id)} />);
+  });
+
+  app.post("/settings/keys/:provider", async (c) => {
+    const user = requireUser(c);
+    if (user instanceof Response) return user;
+    const provider = c.req.param("provider");
+    if (!isModelProvider(provider)) return c.notFound();
+    const key = String((await c.req.parseBody()).key ?? "").trim();
+    const error = validateApiKey(provider, key);
+    if (error) return render(c, <SettingsPage user={user} keys={await listApiKeys(sql, user.id)} error={error} />, 400);
+    await upsertApiKey(sql, {
+      user_id: user.id,
+      provider,
+      key_enc: encrypt(key, config.encryptionKey),
+      hint: keyHint(key),
+    });
+    return render(c, <SettingsPage user={user} keys={await listApiKeys(sql, user.id)} notice="Key saved." />);
+  });
+
+  app.post("/settings/keys/:provider/delete", async (c) => {
+    const user = requireUser(c);
+    if (user instanceof Response) return user;
+    const provider = c.req.param("provider");
+    if (!isModelProvider(provider)) return c.notFound();
+    await deleteApiKey(sql, user.id, provider);
+    return render(c, <SettingsPage user={user} keys={await listApiKeys(sql, user.id)} notice="Key removed." />);
+  });
+
   app.post("/runs", async (c) => {
     const user = requireUser(c);
     if (user instanceof Response) return user;
@@ -134,6 +178,7 @@ export function createApp(sql: Sql, config: HarnessConfig) {
     const [installation, fullName] = String(form.repo ?? "").split(/:(.*)/s);
     const task = String(form.task ?? "").trim();
     if (!installation || !fullName || !task) return c.text("repo and task are required", 400);
+    if ((await listApiKeys(sql, user.id)).length === 0) return c.redirect("/settings");
 
     // Never trust the form: the repo must be one this user can reach through that installation.
     const installationId = Number(installation);

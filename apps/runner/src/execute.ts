@@ -50,6 +50,8 @@ export interface RunDeps {
     info(message: string): void;
     error(message: string): void;
     output(stream: "stdout" | "stderr", chunk: string): void;
+    /** Registers a value that must never appear in stored logs. */
+    secret(value: string): void;
     update(patch: { branch?: string; sandbox_id?: string; pull_request_url?: string }): Promise<void>;
     /** Records liveness and returns the run's current status (used to notice cancellation). */
     heartbeat(): Promise<RunStatus | undefined>;
@@ -107,6 +109,7 @@ export async function executeRun(run: RunRow, deps: RunDeps): Promise<RunOutcome
   try {
     const installationId = Number(run.installation_id);
     const token = await deps.mintRepoToken(installationId, run.repo_full_name);
+    report.secret(token);
 
     report.info("Creating Railway sandbox");
     sandbox = await deps.createSandbox({ ...deps.agent.env, GH_TOKEN: token, IS_SANDBOX: "1" });

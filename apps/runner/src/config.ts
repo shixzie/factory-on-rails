@@ -1,5 +1,5 @@
 import { hostname } from "node:os";
-import { intEnv, optionalEnv, pemFromEnv, requireEnv } from "@factory/core";
+import { intEnv, optionalEnv, parseEncryptionKey, pemFromEnv, requireEnv } from "@factory/core";
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
 export const DEFAULT_AGENT_COMMAND = 'claude -p "$(cat "$FACTORY_TASK_FILE")" --dangerously-skip-permissions';
@@ -14,6 +14,8 @@ export interface RunnerConfig {
   /** A run whose heartbeat is older than this is considered abandoned. */
   staleRunSeconds: number;
   github: { appId: string; privateKeyPem: string };
+  /** Decrypts users' own API keys (bring your own key). Same key the harness encrypts with. */
+  encryptionKey: Buffer;
   sandbox: {
     /**
      * Railway project token for the environment sandboxes live in. Kept
@@ -31,14 +33,17 @@ export interface RunnerConfig {
     setupCommand: string;
     command: string;
     timeoutSec: number;
-    /** Runner env vars copied into each sandbox (e.g. ANTHROPIC_API_KEY). */
+    /**
+     * Extra runner env vars copied into every sandbox. Model API keys do not
+     * belong here: each user brings their own (see packages/core/src/providers.ts).
+     */
     passthroughEnv: Record<string, string>;
   };
   git: { authorName: string; authorEmail: string };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
-  const passthroughNames = optionalEnv("AGENT_ENV_PASSTHROUGH", "ANTHROPIC_API_KEY", env)
+  const passthroughNames = (env.AGENT_ENV_PASSTHROUGH ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -60,6 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       appId: requireEnv("GITHUB_APP_ID", env),
       privateKeyPem: pemFromEnv("GITHUB_APP_PRIVATE_KEY", env),
     },
+    encryptionKey: parseEncryptionKey(requireEnv("TOKEN_ENCRYPTION_KEY", env)),
     sandbox: {
       token: requireEnv("RAILWAY_SANDBOX_TOKEN", env),
       environmentId: requireEnv("SANDBOX_ENVIRONMENT_ID", env),

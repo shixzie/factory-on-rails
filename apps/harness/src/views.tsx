@@ -1,4 +1,4 @@
-import type { GitHubRepo, RunEventRow, RunRow, UserRow } from "@factory/core";
+import { MODEL_PROVIDERS, type ApiKeySummary, type GitHubRepo, type ModelProvider, type RunEventRow, type RunRow, type UserRow } from "@factory/core";
 import type { Child } from "hono/jsx";
 
 export interface RepoOption {
@@ -46,6 +46,7 @@ export function Layout(props: { title: string; user?: UserRow | null; children: 
           {props.user ? (
             <>
               <a href="/repos/new">New repo</a>
+              <a href="/settings">Settings</a>
               <span class="muted">@{props.user.github_login}</span>
               <form method="post" action="/auth/logout" style="margin:0">
                 <button class="secondary" style="margin:0">Sign out</button>
@@ -76,12 +77,22 @@ function Status(props: { status: string }) {
   return <span class={`status ${props.status}`}>{props.status}</span>;
 }
 
-export function Dashboard(props: { user: UserRow; repos: RepoOption[]; runs: RunRow[]; installUrl: string }) {
+export function Dashboard(props: {
+  user: UserRow;
+  repos: RepoOption[];
+  runs: RunRow[];
+  installUrl: string;
+  hasApiKey: boolean;
+}) {
   return (
     <Layout title="Dashboard" user={props.user}>
       <div class="card">
         <h2 style="margin-top:0">New run</h2>
-        {props.repos.length === 0 ? (
+        {!props.hasApiKey ? (
+          <p>
+            Runs use your own model API key. <a href="/settings">Add your key in Settings</a> to start a run.
+          </p>
+        ) : props.repos.length === 0 ? (
           <p>
             The GitHub App can't see any of your repositories yet. <a href={props.installUrl}>Install it</a> on the
             repos the factory should work on, then reload.
@@ -213,6 +224,55 @@ export function MessagePage(props: { title: string; user?: UserRow | null; child
   return (
     <Layout title={props.title} user={props.user}>
       <div class="card">{props.children}</div>
+    </Layout>
+  );
+}
+
+export function SettingsPage(props: { user: UserRow; keys: ApiKeySummary[]; error?: string; notice?: string }) {
+  const byProvider = new Map(props.keys.map((k) => [k.provider, k]));
+  return (
+    <Layout title="Settings" user={props.user}>
+      <div class="card">
+        <h2 style="margin-top:0">API keys</h2>
+        <p class="muted">
+          Bring your own key: your runs use your key, and only your runs. Keys are encrypted at rest, never shown again
+          after you save them, and only handed to the sandboxes that run your tasks.
+        </p>
+        {props.error ? <p style="color:#dc2626">{props.error}</p> : null}
+        {props.notice ? <p style="color:#16a34a">{props.notice}</p> : null}
+        {(Object.keys(MODEL_PROVIDERS) as ModelProvider[]).map((provider) => {
+          const meta = MODEL_PROVIDERS[provider];
+          const saved = byProvider.get(provider);
+          return (
+            <div style="border-top:1px solid var(--line); padding-top:8px; margin-top:12px">
+              <h3 style="margin:4px 0">{meta.label}</h3>
+              <p class="muted" style="margin:0">
+                {saved
+                  ? `Key ending in …${saved.hint}, saved ${saved.updated_at.toISOString().slice(0, 10)}.`
+                  : "No key saved."}{" "}
+                <a href={meta.consoleUrl}>Get a key</a>
+              </p>
+              <form method="post" action={`/settings/keys/${provider}`}>
+                <label for={`key-${provider}`}>{saved ? "Replace key" : "API key"}</label>
+                <input
+                  id={`key-${provider}`}
+                  name="key"
+                  type="password"
+                  autocomplete="off"
+                  placeholder={meta.placeholder}
+                  required
+                />
+                <button type="submit">Save key</button>
+              </form>
+              {saved ? (
+                <form method="post" action={`/settings/keys/${provider}/delete`}>
+                  <button class="secondary">Remove key</button>
+                </form>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
     </Layout>
   );
 }

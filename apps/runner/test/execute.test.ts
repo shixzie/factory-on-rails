@@ -37,6 +37,7 @@ function fakeSandbox(results: Record<string, Partial<ExecResultLike>> = {}) {
 
 function deps(sandbox: SandboxLike, overrides: Partial<RunDeps> = {}) {
   const events: string[] = [];
+  const secrets: string[] = [];
   const d: RunDeps = {
     createSandbox: vi.fn(async () => sandbox),
     mintRepoToken: vi.fn(async () => "ghs_token"),
@@ -45,6 +46,7 @@ function deps(sandbox: SandboxLike, overrides: Partial<RunDeps> = {}) {
       info: (m) => events.push(`info:${m}`),
       error: (m) => events.push(`error:${m}`),
       output: () => {},
+      secret: (v) => secrets.push(v),
       update: vi.fn(async () => {}),
       heartbeat: vi.fn(async (): Promise<RunStatus> => "running"),
     },
@@ -52,15 +54,16 @@ function deps(sandbox: SandboxLike, overrides: Partial<RunDeps> = {}) {
     git: { authorName: "A", authorEmail: "a@x" },
     ...overrides,
   };
-  return { d, events };
+  return { d, events, secrets };
 }
 
 describe("executeRun", () => {
   it("runs the agent, pushes and opens a PR, then destroys the sandbox", async () => {
     const sandbox = fakeSandbox();
-    const { d } = deps(sandbox);
+    const { d, secrets } = deps(sandbox);
     const outcome = await executeRun(run, d);
 
+    expect(secrets).toContain("ghs_token");
     expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: "https://github.com/shixzie/demo/pull/1" });
     expect(d.mintRepoToken).toHaveBeenCalledWith(42, "shixzie/demo");
     expect(d.createSandbox).toHaveBeenCalledWith({ ANTHROPIC_API_KEY: "k", GH_TOKEN: "ghs_token", IS_SANDBOX: "1" });

@@ -2,6 +2,15 @@ import { appendEvents, type RunEventRow, type Sql } from "@factory/core";
 
 type Event = Pick<RunEventRow, "kind" | "message">;
 
+/** Replaces every occurrence of each secret with a marker. */
+export function redact(message: string, secrets: Iterable<string>): string {
+  let out = message;
+  for (const secret of secrets) {
+    if (secret) out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
+
 /**
  * Batches run events so streaming agent output becomes a handful of inserts
  * per second rather than one per chunk. Output beyond `maxOutputBytes` is
@@ -13,6 +22,7 @@ export class LogBuffer {
   private truncated = false;
   private timer: NodeJS.Timeout;
   private flushing: Promise<void> = Promise.resolve();
+  private readonly secrets = new Set<string>();
 
   constructor(
     private readonly sql: Sql,
@@ -23,7 +33,17 @@ export class LogBuffer {
     this.timer = setInterval(() => void this.flush(), flushMs);
   }
 
-  push(kind: Event["kind"], message: string): void {
+  /**
+   * Values (the user's API keys, the repo token) scrubbed from everything
+   * stored. A secret split across two output chunks can slip through, so this
+   * is a safety net, not a guarantee.
+   */
+  addSecret(value: string): void {
+    if (value.length >= 8) this.secrets.add(value);
+  }
+
+  push(kind: Event["kind"], rawMessage: string): void {
+    const message = redact(rawMessage, this.secrets);
     if (kind === "stdout" || kind === "stderr") {
       if (this.truncated) return;
       this.outputBytes += Buffer.byteLength(message);

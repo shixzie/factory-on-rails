@@ -2,6 +2,10 @@ import {
   claimNextRun,
   createDb,
   createInstallationToken,
+  decrypt,
+  encryptedApiKeys,
+  isModelProvider,
+  MODEL_PROVIDERS,
   finishRun,
   heartbeat,
   reapStaleRuns,
@@ -32,9 +36,35 @@ async function createSandbox(env: Record<string, string>): Promise<SandboxLike> 
   return config.sandbox.checkpoint ? Sandbox.create(config.sandbox.checkpoint, options) : Sandbox.create(options);
 }
 
+/** Decrypts the run owner's own API keys into the env vars their agent reads. */
+async function userKeyEnv(userId: string): Promise<Record<string, string>> {
+  const env: Record<string, string> = {};
+  for (const { provider, key_enc } of await encryptedApiKeys(sql, userId)) {
+    if (isModelProvider(provider)) env[MODEL_PROVIDERS[provider].envVar] = decrypt(key_enc, config.encryptionKey);
+  }
+  return env;
+}
+
 async function handleRun(run: RunRow): Promise<void> {
   const log = new LogBuffer(sql, run.id);
   log.push("info", `Claimed by runner ${config.workerId}`);
+
+  let keyEnv: Record<string, string>;
+  try {
+    keyEnv = await userKeyEnv(run.user_id);
+  } catch (err) {
+    console.error(`run ${run.id}: could not decrypt API keys`, err);
+    keyEnv = {};
+  }
+  if (Object.keys(keyEnv).length === 0) {
+    const error = "No usable API key saved. Add or re-save your key in Settings, then start the run again.";
+    log.push("error", error);
+    await log.close();
+    await finishRun(sql, run.id, "failed", error);
+    return;
+  }
+  Object.values(keyEnv).forEach((v) => log.addSecret(v));
+
   const outcome = await executeRun(run, {
     createSandbox,
     mintRepoToken: async (installationId, repoFullName) =>
@@ -50,10 +80,12 @@ async function handleRun(run: RunRow): Promise<void> {
       info: (m) => log.push("info", m),
       error: (m) => log.push("error", m),
       output: (stream, chunk) => log.push(stream, chunk),
+      secret: (value) => log.addSecret(value),
       update: (patch) => updateRun(sql, run.id, patch),
       heartbeat: () => heartbeat(sql, run.id),
     },
-    agent: { ...config.agent, env: config.agent.passthroughEnv },
+    // The user's own keys win over any platform-level passthrough of the same name.
+    agent: { ...config.agent, env: { ...config.agent.passthroughEnv, ...keyEnv } },
     git: config.git,
     harnessUrl: config.harnessUrl,
   });

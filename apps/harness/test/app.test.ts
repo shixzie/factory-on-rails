@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { createDb, encrypt, enqueueRun, migrate, sha256, createSession, type Sql } from "@factory/core";
+import { createDb, decrypt, encrypt, enqueueRun, migrate, sha256, createSession, type Sql } from "@factory/core";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import type { HarnessConfig } from "../src/config.js";
@@ -124,5 +124,60 @@ describe.skipIf(!url)("harness app", () => {
     expect(cancel.status).toBe(302);
     const [row] = await sql`select status from runs where id = ${run.id}`;
     expect(row!.status).toBe("cancelled");
+  });
+
+  describe("bring your own key", () => {
+    const cookie = "factory_session=byok-token";
+    const post = (path: string, body?: Record<string, string>) =>
+      app.request(path, {
+        method: "POST",
+        headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body ?? {}).toString(),
+      });
+
+    beforeAll(async () => {
+      const [u] = await sql<{ id: string }[]>`
+        insert into users (github_id, github_login, access_token_enc)
+        values (3, 'byok', ${encrypt("t", config.encryptionKey)}) returning id`;
+      await createSession(sql, sha256("byok-token"), u!.id, 60);
+    });
+
+    it("sends users without a key to Settings instead of starting a run", async () => {
+      const res = await post("/runs", { repo: "1:o/r", task: "do it" });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/settings");
+    });
+
+    it("rejects malformed keys", async () => {
+      const res = await post("/settings/keys/anthropic", { key: "not-a-key" });
+      expect(res.status).toBe(400);
+      expect(await sql`select 1 from user_api_keys`).toHaveLength(0);
+    });
+
+    it("rejects unknown providers", async () => {
+      expect((await post("/settings/keys/toString", { key: "sk-ant-" + "x".repeat(30) })).status).toBe(404);
+    });
+
+    it("saves the key encrypted and only ever shows its last four characters", async () => {
+      const key = "sk-ant-api03-" + "k".repeat(40) + "WXYZ";
+      const res = await post("/settings/keys/anthropic", { key });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("…WXYZ");
+      expect(html).not.toContain(key);
+
+      const [row] = await sql<{ key_enc: string }[]>`select key_enc from user_api_keys`;
+      expect(row!.key_enc).not.toContain(key);
+      expect(decrypt(row!.key_enc, config.encryptionKey)).toBe(key);
+
+      const page = await (await app.request("/settings", { headers: { cookie } })).text();
+      expect(page).toContain("…WXYZ");
+      expect(page).not.toContain(key);
+    });
+
+    it("removes the key", async () => {
+      await post("/settings/keys/anthropic/delete");
+      expect(await sql`select 1 from user_api_keys`).toHaveLength(0);
+    });
   });
 });
