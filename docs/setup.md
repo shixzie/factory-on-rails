@@ -59,13 +59,15 @@ Project → `production` → Settings → **Shared Variables**:
 All infrastructure changes go through Railway's GitHub Action
 (`railwayapp/config`, wired up in `.github/workflows/railway-config.yml`):
 every PR that changes `.railway/` gets a plan comment, and merging applies
-exactly that plan. Don't apply from your machine: an out-of-band change moves
-the environment's config etag and makes the pending PR's apply fail until it
-is re-planned.
+exactly that plan. Don't apply from your machine: any change to the
+environment after the plan (a local apply, or dashboard edits such as adding
+shared variables) moves its config etag, and the apply on merge then fails with
+"The environment changed since this plan was computed".
 
-For the first apply, add the secret before merging the PR that introduces
-`.railway/railway.ts`, then push to it (or close and reopen it) so the plan job
-runs with the token. Review the plan comment, then merge.
+So finish dashboard changes first, then push to the PR (or close and reopen it)
+so the plan is fresh, review the plan comment, and merge. If an apply on merge
+still fails that way, nothing was changed; open a PR that touches `.railway/`
+(or the workflow) to get a new plan, and merge that.
 
 To preview locally without applying:
 
