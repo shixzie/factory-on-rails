@@ -1,5 +1,6 @@
 /**
- * Railway Infrastructure as Code for Factory on Rails.
+ * Railway Infrastructure as Code for Factory on Rails: the web app (public),
+ * the harness (private API and auth), the runner (worker) and Postgres.
  *
  *   railway config plan    # preview against the linked environment
  *   railway config apply   # apply after review (CI does this on merge)
@@ -20,13 +21,18 @@ export default defineRailway((ctx) => {
 
   const db = postgres("postgres");
 
-  // The harness is served on a custom domain in production (DNS via Cloudflare,
-  // SSL mode Full). Other environments use their generated Railway domain.
+  // The web app (apps/web, Next.js) is the public face, served on a custom
+  // domain in production (DNS via Cloudflare, SSL mode Full strict). Other
+  // environments use its generated Railway domain. It forwards /api/* and
+  // /auth/* to the harness over the private network, so the browser only ever
+  // talks to one origin: PUBLIC_URL below is the web app's URL for both.
   // Change the domain, its port or PUBLIC_URL here rather than in the
   // dashboard: a dashboard edit invalidates any open PR's pinned plan.
   const production = ctx.isEnvironment("production");
-  const harnessUrl = production ? "https://factory.shixzie.com" : "https://${{harness.RAILWAY_PUBLIC_DOMAIN}}";
+  const publicUrl = production ? "https://factory.shixzie.com" : "https://${{web.RAILWAY_PUBLIC_DOMAIN}}";
 
+  // API and auth backend for the web app. No public domain: only reachable
+  // on the private network (listening on :: so the private DNS name resolves).
   const harness = service("harness", {
     source,
     build: {
@@ -38,11 +44,11 @@ export default defineRailway((ctx) => {
     preDeploy: "node packages/core/dist/db.js",
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
-    // Pin the port so the custom domain's target port always matches.
-    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
     env: {
       PORT: "8080",
-      PUBLIC_URL: harnessUrl,
+      HOST: "::",
+      // The origin users see (the web app): OAuth redirects, cookies and the Origin check use it.
+      PUBLIC_URL: publicUrl,
       DATABASE_URL: db.env.DATABASE_URL,
       GITHUB_APP_SLUG: ctx.shared.GITHUB_APP_SLUG,
       GITHUB_APP_CLIENT_ID: ctx.shared.GITHUB_APP_CLIENT_ID,
@@ -51,6 +57,27 @@ export default defineRailway((ctx) => {
       // Any GitHub account can sign in (each user brings their own model key).
       // Set a comma-separated list of logins instead to restrict it.
       ALLOWED_GITHUB_LOGINS: "*",
+    },
+  });
+
+  const web = service("web", {
+    source,
+    build: {
+      builder: "RAILPACK",
+      // Builds packages/core first: the web app imports its API schemas.
+      buildCommand: "pnpm run build && pnpm --filter @factory/web build",
+      watchPatterns: ["apps/web/**", "packages/core/**", "pnpm-lock.yaml"],
+    },
+    start: "cd apps/web && node node_modules/next/dist/bin/next start --hostname 0.0.0.0",
+    healthcheck: "/healthz",
+    healthcheckTimeout: 60,
+    // Pin the port so the custom domain's target port always matches.
+    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
+    env: {
+      PORT: "8080",
+      NEXT_TELEMETRY_DISABLED: "1",
+      // Railway resolves ${{service.VAR}} inside literal values at deploy time.
+      HARNESS_INTERNAL_URL: "http://${{harness.RAILWAY_PRIVATE_DOMAIN}}:8080",
     },
   });
 
@@ -65,7 +92,8 @@ export default defineRailway((ctx) => {
     env: {
       DATABASE_URL: db.env.DATABASE_URL,
       // Railway resolves ${{service.VAR}} inside literal values at deploy time.
-      HARNESS_URL: harnessUrl,
+      // Links PRs back to their run page on the web app.
+      HARNESS_URL: publicUrl,
       GITHUB_APP_ID: ctx.shared.GITHUB_APP_ID,
       GITHUB_APP_PRIVATE_KEY: ctx.shared.GITHUB_APP_PRIVATE_KEY,
       // Decrypts each user's own model API key (bring your own key).
@@ -77,6 +105,6 @@ export default defineRailway((ctx) => {
   });
 
   return project("factory-on-rails", {
-    resources: [group("Factory", [harness, runner]), group("Data", [db])],
+    resources: [group("Factory", [web, harness, runner]), group("Data", [db])],
   });
 });

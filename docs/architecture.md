@@ -10,9 +10,11 @@ repository, how the pieces fit, and what comes next.
 
 ```mermaid
 flowchart LR
-  user([You, in a browser]) -->|GitHub login, tasks| harness
+  user([You, in a browser]) -->|factory.shixzie.com| web
   subgraph production["Railway project: factory-on-rails / environment: production"]
-    harness["harness<br/>(Effect HTTP app)"]
+    web["web<br/>(Next.js UI)"]
+    harness["harness<br/>(Effect JSON API, private)"]
+    web -- "/api/*, /auth/* and server rendering<br/>(private network)" --> harness
     runner["runner<br/>(worker)"]
     db[("postgres")]
     harness -- runs, users, sessions --> db
@@ -30,8 +32,9 @@ flowchart LR
 
 | Piece | Where | What it does |
 |---|---|---|
-| `.railway/railway.ts` | Railway IaC | Declares the `harness` and `runner` services and the `postgres` database for the environment. |
-| `apps/harness` | Railway service, public | GitHub sign-in, repository list and creation, starting and cancelling runs, live run logs. |
+| `.railway/railway.ts` | Railway IaC | Declares the `web`, `harness` and `runner` services and the `postgres` database for the environment. |
+| `apps/web` | Railway service, public | The UI: Next.js (App Router) with shadcn/ui, laid out like t3code. Forwards `/api/*` and `/auth/*` to the harness. |
+| `apps/harness` | Railway service, private | JSON API and GitHub sign-in: repository list and creation, starting and cancelling runs, run logs, API keys. |
 | `apps/runner` | Railway service, private | Claims queued runs, drives one Railway sandbox per run, pushes the branch and opens the PR. |
 | `packages/core` | Library | Postgres schema and data access, GitHub App auth, token encryption. |
 | Railway Sandboxes | `agents` environment | Isolated VMs the agent runs in. Created and destroyed per run by the runner. |
@@ -61,13 +64,37 @@ All application code is written with Effect 3:
   the plain `.sql` files in `packages/core/migrations`.
 - **HTTP.** The harness is an `@effect/platform` `HttpRouter` served by
   `@effect/platform-node`; request bodies, query strings and path params are
-  decoded with `Schema`. Pages are rendered with `hono/jsx`, used only as a
-  templating engine. GitHub calls use `HttpClient` with `Schema`-decoded responses.
+  decoded with `Schema`, and responses are encoded with the schemas in
+  `packages/core/src/api.ts`. GitHub calls use `HttpClient` with
+  `Schema`-decoded responses.
+- **The web app** decodes the same `@factory/core/api` schemas with an
+  `@effect/platform` `HttpClient` (`apps/web/src/lib/api.ts`), both in server
+  components and in the browser. React stays plain React.
 - **Resources and cancellation.** A run's sandbox is a scoped resource
   (`acquireRelease`), so it is destroyed however the run ends. Cancelling a run,
   or stopping the runner, interrupts the fiber, which kills the command in the
   sandbox and releases the sandbox on the way out.
 - **Tests** use `@effect/vitest`.
+
+## The web app
+
+`apps/web` is a Next.js App Router app with [shadcn/ui](https://ui.shadcn.com)
+components (Base UI primitives, Tailwind v4), modelled on
+[t3code](https://github.com/pingdotgg/t3code): a left sidebar of repositories
+with their runs under them, each run shown as a thread (the task as your
+message, the agent's work log under it, the pull request at the end), and a
+composer pinned to the bottom for the next task. Light and dark follow the
+system, with a switch in the user menu.
+
+It is the only public service. The browser talks to one origin; `/api/*` and
+`/auth/*` are route handlers that forward the request as-is (cookies, Origin,
+body) to the harness over Railway's private network (`HARNESS_INTERNAL_URL`)
+and hand back its answer, redirects and `Set-Cookie` included. That keeps the
+session cookie first-party, the GitHub callback at
+`https://factory.shixzie.com/auth/callback`, and the harness's Origin check
+unchanged. Server components call the harness directly with the visitor's
+cookie. The run page polls `/api/runs/:id/events` every two seconds while a run
+is live.
 
 ## Infrastructure as Code
 
@@ -80,8 +107,12 @@ read on 2026-12-01, so this repo does not use it.
   export). Removing a resource from the file deletes it on the next apply.
 - Secrets never appear in the file. Services reference environment shared
   variables with `ctx.shared.NAME`, which compiles to `${{shared.NAME}}`.
-- Both services build from this repository with Railpack (`pnpm run build`)
-  and use watch patterns so a change to one app doesn't redeploy the other.
+- All three services build from this repository with Railpack (`pnpm run build`,
+  plus `next build` for the web app) and use watch patterns so a change to one
+  app doesn't redeploy the others.
+- The custom domain belongs to the web app. The harness has no public domain;
+  it listens on `::` so the web app reaches it at
+  `harness.railway.internal:8080`.
 - The harness runs database migrations as its pre-deploy command, so a failed
   migration stops the deploy instead of shipping a broken schema.
 - `.github/workflows/railway-config.yml` uses `railwayapp/config@v1`: every PR

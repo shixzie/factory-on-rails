@@ -47,12 +47,14 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
   let handler: (req: Request) => Promise<Response>;
   const run = <A, E>(effect: Effect.Effect<A, E, Layer.Layer.Success<typeof TestLayer>>) => runtime.runPromise(effect);
   const request = (path: string, init?: RequestInit) => handler(new Request(`${ORIGIN}${path}`, init));
-  const post = (path: string, cookie: string, body: Record<string, string> = {}) =>
+  const send = (method: string, path: string, cookie: string, body?: unknown) =>
     request(path, {
-      method: "POST",
-      headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(body).toString(),
+      method,
+      headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
+  const post = (path: string, cookie: string, body?: unknown) => send("POST", path, cookie, body);
+  const json = (res: Response | Promise<Response>): Promise<any> => Promise.resolve(res).then((r) => r.json());
 
   const signIn = (login: string, githubId: number) =>
     run(
@@ -83,10 +85,10 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect((await request("/healthz")).status).toBe(200);
   });
 
-  it("shows the sign-in page to anonymous visitors", async () => {
-    const html = await (await request("/")).text();
-    expect(html.startsWith("<!doctype html>")).toBe(true);
-    expect(html).toContain("Sign in with GitHub");
+  it("answers anonymous API calls with 401 JSON", async () => {
+    const res = await request("/api/me");
+    expect(res.status).toBe(401);
+    expect(await json(res)).toEqual({ code: "unauthorized", error: "Sign in to continue." });
   });
 
   it("starts GitHub login with an HttpOnly state cookie", async () => {
@@ -101,14 +103,16 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
 
   it("rejects a callback whose state does not match", async () => {
     const res = await request("/auth/callback?code=good&state=evil", { headers: { cookie: "factory_oauth_state=fine" } });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toMatch(/^\/login\?error=Sign-in%20failed/);
   });
 
   it("refuses GitHub users outside the allowlist", async () => {
     github.login = "mallory";
     const res = await request("/auth/callback?code=good&state=s", { headers: { cookie: "factory_oauth_state=s" } });
     github.login = "shixzie";
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(302);
+    expect(decodeURIComponent(res.headers.get("location")!)).toContain("mallory is not allowed");
     const rows = await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`select 1 from users where github_login = 'mallory'`));
     expect(rows).toHaveLength(0);
   });
@@ -127,12 +131,23 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(decrypt(user!.access_token_enc, key)).toBe("ghu_x");
   });
 
-  it("rejects cross-origin form posts", async () => {
-    const res = await request("/runs", { method: "POST", headers: { origin: "https://evil.example" } });
+  it("returns the signed-in user", async () => {
+    const { cookie } = await signIn("me", 7);
+    const res = await request("/api/me", { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await json(res)).toEqual({
+      user: { login: "me", name: null, avatarUrl: null },
+      hasApiKey: false,
+      installUrl: "https://github.com/apps/factory-on-rails/installations/new",
+    });
+  });
+
+  it("rejects cross-origin writes", async () => {
+    const res = await request("/api/runs", { method: "POST", headers: { origin: "https://evil.example" } });
     expect(res.status).toBe(403);
   });
 
-  it("shows a run only to its owner, escaped", async () => {
+  it("shows a run only to its owner", async () => {
     const owner = await signIn("owner", 1);
     const other = await signIn("other", 2);
     const created = await run(
@@ -147,29 +162,37 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       ),
     );
 
-    const mine = await request(`/runs/${created.id}`, { headers: { cookie: owner.cookie } });
+    const mine = await request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } });
     expect(mine.status).toBe(200);
-    expect(await mine.text()).toContain("Do &lt;b&gt;things&lt;/b&gt;");
-    expect((await request(`/runs/${created.id}`, { headers: { cookie: other.cookie } })).status).toBe(404);
-    expect((await request(`/runs/not-a-uuid`, { headers: { cookie: owner.cookie } })).status).toBe(400);
+    const detail = await json(mine);
+    expect(detail.run).toMatchObject({ id: created.id, repo: "o/r", task: "Do <b>things</b>", status: "queued" });
+    expect(detail.events).toEqual([]);
+    expect((await request(`/api/runs/${created.id}`, { headers: { cookie: other.cookie } })).status).toBe(404);
+    expect((await request(`/api/runs/${created.id}/events`, { headers: { cookie: other.cookie } })).status).toBe(404);
+    expect((await request(`/api/runs/not-a-uuid`, { headers: { cookie: owner.cookie } })).status).toBe(400);
+    const listed = await json(request("/api/runs", { headers: { cookie: owner.cookie } }));
+    expect(listed.map((r: { id: string }) => r.id)).toContain(created.id);
+    expect(await json(request("/api/runs", { headers: { cookie: other.cookie } }))).toEqual([]);
 
-    expect((await post(`/runs/${created.id}/cancel`, owner.cookie)).status).toBe(302);
+    const cancelled = await post(`/api/runs/${created.id}/cancel`, owner.cookie);
+    expect(cancelled.status).toBe(200);
+    expect((await json(cancelled)).status).toBe("cancelled");
     const status = await run(Effect.flatMap(Store, (s) => s.getRun(created.id)));
     expect(status._tag === "Some" && status.value.status).toBe("cancelled");
   });
 
   describe("bring your own key", () => {
-    it("sends users without a key to Settings instead of starting a run", async () => {
+    it("refuses to start a run for users without a key", async () => {
       const { cookie } = await signIn("byok", 3);
-      const res = await post("/runs", cookie, { repo: "1:o/r", task: "do it" });
-      expect(res.status).toBe(302);
-      expect(res.headers.get("location")).toBe("/settings");
+      const res = await post("/api/runs", cookie, { installationId: 1, repo: "o/r", task: "do it" });
+      expect(res.status).toBe(400);
+      expect((await json(res)).code).toBe("api_key_required");
     });
 
     it("rejects malformed keys and unknown providers", async () => {
       const { cookie } = await signIn("byok", 3);
-      expect((await post("/settings/keys/anthropic", cookie, { key: "not-a-key" })).status).toBe(400);
-      expect((await post("/settings/keys/toString", cookie, { key: "sk-ant-" + "x".repeat(30) })).status).toBe(404);
+      expect((await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "not-a-key" })).status).toBe(400);
+      expect((await send("PUT", "/api/settings/keys/toString", cookie, { key: "sk-ant-" + "x".repeat(30) })).status).toBe(404);
       const rows = await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`select 1 from user_api_keys`));
       expect(rows).toHaveLength(0);
     });
@@ -177,18 +200,19 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     it("saves the key encrypted and only ever shows its last four characters", async () => {
       const { cookie } = await signIn("byok", 3);
       const apiKey = "sk-ant-api03-" + "k".repeat(40) + "WXYZ";
-      const res = await post("/settings/keys/anthropic", cookie, { key: apiKey });
+      const res = await send("PUT", "/api/settings/keys/anthropic", cookie, { key: apiKey });
       expect(res.status).toBe(200);
-      const html = await res.text();
-      expect(html).toContain("…WXYZ");
-      expect(html).not.toContain(apiKey);
+      const body = await res.text();
+      expect(JSON.parse(body)[0]).toMatchObject({ provider: "anthropic", saved: { hint: "WXYZ" } });
+      expect(body).not.toContain(apiKey);
 
       const [row] = await run(
         Effect.flatMap(SqlClient.SqlClient, (sql) => sql<{ key_enc: string }>`select key_enc from user_api_keys`),
       );
       expect(row!.key_enc).not.toContain(apiKey);
       expect(decrypt(row!.key_enc, key)).toBe(apiKey);
-      expect(await (await request("/settings", { headers: { cookie } })).text()).not.toContain(apiKey);
+      expect(await (await request("/api/settings/keys", { headers: { cookie } })).text()).not.toContain(apiKey);
+      expect((await json(request("/api/me", { headers: { cookie } }))).hasApiKey).toBe(true);
     });
 
     it("only queues runs for repos the app can reach, then removes the key", async () => {
@@ -196,10 +220,15 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       github.repos = [
         { id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "trunk", html_url: "h" },
       ];
-      expect((await post("/runs", cookie, { repo: "1:someone/else", task: "x" })).status).toBe(403);
-      const ok = await post("/runs", cookie, { repo: "1:shixzie/demo", task: "Add a README" });
-      expect(ok.status).toBe(302);
-      expect(ok.headers.get("location")).toMatch(/^\/runs\/[0-9a-f-]{36}$/);
+      const repos = await json(request("/api/repos", { headers: { cookie } }));
+      expect(repos).toEqual([
+        { installationId: 1, fullName: "shixzie/demo", defaultBranch: "trunk", private: true, htmlUrl: "h" },
+      ]);
+      expect((await post("/api/runs", cookie, { installationId: 1, repo: "someone/else", task: "x" })).status).toBe(403);
+      expect((await post("/api/runs", cookie, { installationId: 2, repo: "shixzie/demo", task: "x" })).status).toBe(403);
+      const ok = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "Add a README" });
+      expect(ok.status).toBe(201);
+      expect((await json(ok)).id).toMatch(/^[0-9a-f-]{36}$/);
       const [queued] = await run(
         Effect.flatMap(
           SqlClient.SqlClient,
@@ -208,7 +237,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       );
       expect(queued).toEqual({ base_branch: "trunk", status: "queued" });
 
-      await post("/settings/keys/anthropic/delete", cookie);
+      expect((await send("DELETE", "/api/settings/keys/anthropic", cookie)).status).toBe(200);
       const rows = await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`select 1 from user_api_keys`));
       expect(rows).toHaveLength(0);
     });
@@ -216,8 +245,9 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
 
   it("shows GitHub's reason when repo creation is refused", async () => {
     const { cookie } = await signIn("owner", 1);
-    const res = await post("/repos", cookie, { name: "taken", private: "1" });
+    expect((await post("/api/repos", cookie, { name: "bad name", private: true })).status).toBe(400);
+    const res = await post("/api/repos", cookie, { name: "taken", private: true });
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain("name already exists");
+    expect(await json(res)).toEqual({ code: "github", error: "name already exists" });
   });
 });

@@ -10,8 +10,8 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 
 | Setting | Value |
 |---|---|
-| Homepage URL | Your harness URL (step 3), or the repo URL for now |
-| Callback URL | `https://<harness domain>/auth/callback` |
+| Homepage URL | Your site URL (step 5), or the repo URL for now |
+| Callback URL | `https://<site domain>/auth/callback` (the web app's domain, step 5) |
 | Expire user authorization tokens | On (default) |
 | Request user authorization (OAuth) during installation | Optional |
 | Webhook | Off for now |
@@ -77,17 +77,21 @@ pnpm install
 railway config plan
 ```
 
-## 5. Give the harness a domain
+## 5. Give the web app a domain
 
-Production serves the harness on `factory.shixzie.com`, declared in
-`.railway/railway.ts` (with `PUBLIC_URL`, and `PORT=8080` so the domain's
-target port matches). Its DNS is on Cloudflare: keep the record proxied only
+Production serves the web app (`apps/web`) on `factory.shixzie.com`, declared in
+`.railway/railway.ts` (with `PORT=8080` so the domain's target port matches).
+The harness has no public domain: the web app forwards `/api/*` and `/auth/*`
+to it over the private network, and the harness's `PUBLIC_URL` is the web app's
+URL. The domain's DNS target is per service, so whenever the domain moves to a
+different service, copy the new CNAME (and any verification TXT record) from
+that service's Settings → Networking into Cloudflare. Its DNS is on Cloudflare: keep the record proxied only
 with SSL/TLS mode **Full (strict)**. "Flexible" makes Cloudflare call Railway
 over HTTP, Railway redirects to HTTPS, and every request loops on a 301.
 
 Put `https://factory.shixzie.com/auth/callback` in the GitHub App's Callback URL.
-For another environment, generate a Railway domain for the harness instead; it
-then derives its URL from `RAILWAY_PUBLIC_DOMAIN`.
+For another environment, generate a Railway domain for the web service instead;
+the IaC points the harness's `PUBLIC_URL` at it.
 
 Sign-in is open to any GitHub account (`ALLOWED_GITHUB_LOGINS: "*"` in the
 IaC). To restrict it, change that value to a comma-separated list of logins.
@@ -98,7 +102,7 @@ runs use it.
 
 ## 6. Smoke test
 
-Open the harness, sign in with GitHub, save your Anthropic API key under
+Open the site, sign in with GitHub, save your Anthropic API key under
 **Settings**, pick a repository, and start a run with
 a small task ("Add a CONTRIBUTING.md with a short how-to-run section"). You
 should see the sandbox come up in the `agents` environment's Sandboxes tab,
@@ -110,7 +114,8 @@ the log stream on the run page, and a PR on the repository when it finishes.
 cp .env.example .env    # fill in; a GitHub App with callback http://localhost:3000/auth/callback
 pnpm install
 pnpm migrate
-pnpm dev:harness
+pnpm dev:harness        # API on :3001 (PORT in .env)
+pnpm dev:web            # UI on http://localhost:3000, forwards /api and /auth to :3001
 pnpm dev:runner         # talks to real Railway sandboxes via RAILWAY_SANDBOX_TOKEN
 ```
 
