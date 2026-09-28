@@ -1,0 +1,67 @@
+# Railway Infrastructure as Code, driven by Railway's official action
+# (https://github.com/railwayapp/config):
+#   - every PR that touches .railway/ gets `railway config plan`, a pinned plan
+#     artifact, and a plan comment (posted as the Railway bot via id-token);
+#   - merging the PR applies exactly that pinned plan. Nothing re-plans on merge.
+# The action installs Node 24 and the Railway CLI itself, and runs `npm install`
+# in plan mode so `railway/iac` resolves (it is a root dependency for that reason).
+#
+# RAILWAY_TOKEN is a Railway project token for the production environment
+# (docs/setup.md). Until it is added, both jobs skip with a notice.
+name: Railway config
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - ".railway/**"
+      # The railway/iac version that evaluates .railway/railway.ts
+      - "package.json"
+      - ".github/workflows/railway-config.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  id-token: write
+
+jobs:
+  plan:
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - id: token
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -n "$RAILWAY_TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else
+            echo "::notice::RAILWAY_TOKEN secret is not set, so the Railway plan was skipped. See docs/setup.md."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+      - uses: railwayapp/config@v1
+        if: steps.token.outputs.present == 'true'
+        with:
+          command: plan
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}
+
+  apply:
+    if: github.event.action == 'closed' && github.event.pull_request.merged && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - id: token
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -n "$RAILWAY_TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else
+            echo "::notice::RAILWAY_TOKEN secret is not set, so the Railway apply was skipped. See docs/setup.md."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - uses: railwayapp/config@v1
+        if: steps.token.outputs.present == 'true'
+        with:
+          command: apply
+          railway-token: ${{ secrets.RAILWAY_TOKEN }}

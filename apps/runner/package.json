@@ -1,0 +1,20 @@
+{
+  "name": "@factory/runner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@effect/platform": "0.97.2",
+    "@effect/platform-node": "0.108.2",
+    "@effect/sql": "0.52.1",
+    "@effect/sql-pg": "0.53.0",
+    "@factory/core": "workspace:*",
+    "effect": "3.22.2",
+    "railway": "^3.11.0"
+  }
+}
