@@ -1,8 +1,7 @@
 "use client";
 
-import { ChevronRightIcon, FileCodeIcon, XIcon } from "lucide-react";
+import { ChevronRightIcon, FileCodeIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { Button } from "@/components/ui/button";
 import type { Api } from "@/lib/api";
 import { diffTotals, parseDiff, type DiffFile, type DiffLine } from "@/lib/diff";
 import { ago } from "@/lib/format";
@@ -105,21 +104,19 @@ export function useDiffFiles(diff: Api.ApiRunDiff | null) {
 }
 
 /**
- * The run's changes, file by file, beside the thread (over it on small
- * screens), like t3code's diff panel. `focus` scrolls to a file.
+ * The run's changes, file by file, like t3code's diff panel (the Diff tab of
+ * the run's side panel). `focus` scrolls to a file.
  */
-export function DiffPanel({
+export function DiffPane({
   diff,
   files,
   live,
   focus,
-  onClose,
 }: {
   diff: Api.ApiRunDiff | null;
   files: DiffFile[];
   live: boolean;
   focus?: { path: string; n: number };
-  onClose: () => void;
 }) {
   const [closed, setClosed] = useState<Set<string>>(new Set());
   const totals = diffTotals(files);
@@ -135,8 +132,8 @@ export function DiffPanel({
   }, [focus]);
 
   return (
-    <aside className="fixed inset-x-0 top-12 bottom-0 z-20 flex flex-col border-l bg-background lg:sticky lg:inset-auto lg:top-12 lg:z-auto lg:min-w-0 lg:self-start lg:h-[calc(100svh-3rem)] lg:w-[min(46rem,48%)] lg:shrink-0">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b px-3 text-xs">
+    <>
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3 text-xs">
         <FileCodeIcon className="size-3.5 text-muted-foreground" />
         <span className="font-medium">
           {files.length} {files.length === 1 ? "file" : "files"} changed
@@ -147,9 +144,6 @@ export function DiffPanel({
             · {live ? "updated" : "as of"} {ago(diff.updatedAt)}
           </span>
         ) : null}
-        <Button variant="ghost" size="icon-sm" className="ml-auto" onClick={onClose} aria-label="Close diff">
-          <XIcon />
-        </Button>
       </div>
       <div className="flex-1 overflow-y-auto p-3">
         {diff?.truncated ? (
@@ -181,7 +175,7 @@ export function DiffPanel({
           </div>
         )}
       </div>
-    </aside>
+    </>
   );
 }
 

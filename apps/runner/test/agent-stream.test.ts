@@ -50,6 +50,21 @@ describe("parseAgentLine", () => {
     expect(event!.data).toMatchObject({ id: "toolu_2", parentToolUseId: "toolu_task" });
   });
 
+  it("keeps what a finished subagent reported about itself", () => {
+    const [event] = parseAgentLine(
+      line({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "toolu_task", content: [{ type: "text", text: "Found it." }] }] },
+        tool_use_result: { status: "completed", totalDurationMs: 41200, totalTokens: 18034, totalToolUseCount: 7, content: [] },
+      }),
+    )!;
+    expect(event).toEqual({
+      kind: "tool_result",
+      message: "Found it.",
+      data: { toolUseId: "toolu_task", isError: false, stats: { durationMs: 41200, tokens: 18034, toolUses: 7 } },
+    });
+  });
+
   it("reads tool results given as a string or as blocks, and caps long ones", () => {
     const events = parseAgentLine(
       line({

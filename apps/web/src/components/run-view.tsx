@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  ArrowDownIcon,
   ArrowUpIcon,
   CircleAlertIcon,
   CircleDotIcon,
@@ -10,18 +11,22 @@ import {
   GitBranchIcon,
   GitPullRequestIcon,
   SquareIcon,
+  WorkflowIcon,
+  XIcon,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
-import { ChangedFiles, DiffPanel, DiffStat, useDiffFiles } from "@/components/diff-view";
+import { ChangedFiles, DiffPane, DiffStat, useDiffFiles } from "@/components/diff-view";
 import { PageHeader } from "@/components/page-header";
 import { RunActivity } from "@/components/run-activity";
+import { RunFlow } from "@/components/run-flow";
 import { isActive, SandboxLabel, sandboxHint, StatusLabel } from "@/components/run-status";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
+import { useFollow } from "@/hooks/use-follow";
 import { openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
@@ -134,7 +139,7 @@ function Outcome({ run }: { run: Api.ApiRun }) {
           <div className="text-sm font-medium">Pull request opened</div>
           <div className="truncate text-xs text-muted-foreground">{run.pullRequestUrl.replace("https://github.com/", "")}</div>
         </div>
-        <Button variant="outline" size="sm" render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
+        <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
           Review <ExternalLinkIcon />
         </Button>
       </div>
@@ -164,6 +169,54 @@ function Outcome({ run }: { run: Api.ApiRun }) {
   return null;
 }
 
+type PanelTab = "flow" | "diff";
+
+/** Beside the thread on wide screens, over it on small ones: the flow map or the diff. */
+function SidePanel({
+  tab,
+  onTab,
+  onClose,
+  fileCount,
+  children,
+}: {
+  tab: PanelTab;
+  onTab: (tab: PanelTab) => void;
+  onClose: () => void;
+  fileCount: number;
+  children: React.ReactNode;
+}) {
+  const tabs: { id: PanelTab; label: string; icon: React.ReactNode }[] = [
+    { id: "flow", label: "Flow", icon: <WorkflowIcon /> },
+    { id: "diff", label: fileCount ? `Diff · ${fileCount}` : "Diff", icon: <FileDiffIcon /> },
+  ];
+  return (
+    <aside className="fixed inset-x-0 top-12 bottom-0 z-20 flex flex-col border-l bg-background lg:sticky lg:inset-auto lg:top-12 lg:z-auto lg:h-[calc(100svh-3rem)] lg:w-[min(46rem,48%)] lg:min-w-0 lg:shrink-0 lg:self-start">
+      <div className="flex h-11 shrink-0 items-center gap-1 border-b px-2" role="tablist" aria-label="Side panel">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => onTab(t.id)}
+            className={cn(
+              "relative inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs transition-colors [&_svg]:size-3.5",
+              tab === t.id ? "bg-accent font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t.icon}
+            {t.label}
+          </button>
+        ))}
+        <Button variant="ghost" size="icon-sm" className="ml-auto" onClick={onClose} aria-label="Close the side panel">
+          <XIcon />
+        </Button>
+      </div>
+      {children}
+    </aside>
+  );
+}
+
 /**
  * One run as a thread: the task as the user's message, then what the agent
  * said and did (polled while the run is live), questions it asked, and the
@@ -174,7 +227,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const [run, setRun] = useState(initial.run);
   const [events, setEvents] = useState(initial.events);
   const [diff, setDiff] = useState(initial.diff);
-  const [diffOpen, setDiffOpen] = useState(false);
+  const [panel, setPanel] = useState<PanelTab | null>(null);
+  const [focusAgent, setFocusAgent] = useState<{ id: string; n: number }>();
   const [focus, setFocus] = useState<{ path: string; n: number }>();
   const [cancelling, startCancel] = useTransition();
   const [sending, setSending] = useState(false);
@@ -182,7 +236,6 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   // A finished run's sandbox is stopped after a few idle minutes; keep the label honest.
   const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
   const now = useNow(active);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const pollNow = useRef<() => void>(() => {});
 
   // Poll for new activity while the run is live (and page through a long
@@ -244,13 +297,13 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     else router.refresh();
   }, [awaiting]);
 
-  // Follow new activity when the reader is already at the bottom.
+  // Follow the run as it works; scrolling up pauses that until you come back down.
+  const follow = useFollow(events.length, active);
+
+  // A live run opens with its flow map beside it, where there is room.
   useEffect(() => {
-    const el = bottomRef.current;
-    if (!el) return;
-    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;
-    if (nearBottom) el.scrollIntoView({ block: "end" });
-  }, [events.length, run.status]);
+    if (active && window.matchMedia("(min-width: 1024px)").matches) setPanel((p) => p ?? "flow");
+  }, []);
 
   const blocks = useMemo(() => toBlocks(events), [events]);
   const files = useDiffFiles(diff);
@@ -258,8 +311,16 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const question = active ? openQuestion(blocks) : undefined;
 
   const openDiff = (path?: string) => {
-    setDiffOpen(true);
+    setPanel("diff");
     if (path) setFocus((f) => ({ path, n: (f?.n ?? 0) + 1 }));
+  };
+
+  const togglePanel = (tab: PanelTab) => setPanel((p) => (p === tab ? null : tab));
+
+  // Picking a subagent on the map opens its card in the thread (closing the map where it covers the thread).
+  const selectAgent = (id: string) => {
+    setFocusAgent((f) => ({ id, n: (f?.n ?? 0) + 1 }));
+    if (!window.matchMedia("(min-width: 1024px)").matches) setPanel(null);
   };
 
   const cancel = () =>
@@ -302,12 +363,24 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
       <PageHeader
         actions={
           <>
+            {events.length > 0 || active ? (
+              <Button
+                variant={panel === "flow" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => togglePanel("flow")}
+                aria-pressed={panel === "flow"}
+                aria-label="Toggle the flow map"
+              >
+                <WorkflowIcon />
+                <span className="hidden sm:inline">Flow</span>
+              </Button>
+            ) : null}
             {files.length > 0 || active ? (
               <Button
-                variant={diffOpen ? "secondary" : "ghost"}
+                variant={panel === "diff" ? "secondary" : "ghost"}
                 size="sm"
-                onClick={() => setDiffOpen((o) => !o)}
-                aria-pressed={diffOpen}
+                onClick={() => togglePanel("diff")}
+                aria-pressed={panel === "diff"}
                 aria-label="Toggle the diff"
               >
                 <FileDiffIcon />
@@ -316,7 +389,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
               </Button>
             ) : null}
             {run.pullRequestUrl ? (
-              <Button variant="outline" size="sm" render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
+              <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
                 <GitPullRequestIcon /> <span className="hidden sm:inline">Pull request</span>
               </Button>
             ) : null}
@@ -354,7 +427,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 </div>
               </div>
 
-              <RunActivity blocks={blocks} live={active} onAnswer={send} sending={sending} />
+              <RunActivity blocks={blocks} live={active} onAnswer={send} sending={sending} focusAgent={focusAgent} />
 
               {active ? (
                 <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
@@ -370,11 +443,29 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
 
               <ChangedFiles files={files} onOpen={openDiff} />
               <Outcome run={run} />
-              <div ref={bottomRef} />
             </div>
           </div>
 
           <div className="sticky bottom-0 bg-gradient-to-t from-background via-background to-transparent px-4 pt-6 pb-4">
+            {active && !follow.following ? (
+              <div className="pointer-events-none absolute inset-x-0 -top-6 flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={follow.jump}
+                  className="pointer-events-auto animate-in rounded-full bg-background/95 shadow-md backdrop-blur fade-in slide-in-from-bottom-2 dark:bg-card/95"
+                >
+                  {follow.unseen ? (
+                    <span className="relative flex size-2">
+                      <span className="absolute inset-0 animate-ping rounded-full bg-primary opacity-60" />
+                      <span className="relative size-2 rounded-full bg-primary" />
+                    </span>
+                  ) : null}
+                  {follow.unseen ? "New activity" : "Jump to latest"}
+                  <ArrowDownIcon />
+                </Button>
+              </div>
+            ) : null}
             <MessageComposer
               question={!!question}
               live={active}
@@ -391,8 +482,23 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           </div>
         </div>
 
-        {diffOpen ? (
-          <DiffPanel diff={diff} files={files} live={active} focus={focus} onClose={() => setDiffOpen(false)} />
+        {panel ? (
+          <SidePanel tab={panel} onTab={setPanel} onClose={() => setPanel(null)} fileCount={files.length}>
+            {panel === "flow" ? (
+              <div className="flex-1 overflow-y-auto p-4">
+                <RunFlow
+                  events={events}
+                  live={active}
+                  awaiting={!!question}
+                  pullRequestUrl={run.pullRequestUrl}
+                  filesChanged={files.length}
+                  onSelectAgent={selectAgent}
+                />
+              </div>
+            ) : (
+              <DiffPane diff={diff} files={files} live={active} focus={focus} />
+            )}
+          </SidePanel>
         ) : null}
       </div>
     </>

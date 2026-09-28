@@ -9,6 +9,16 @@ import type { ApiRunEvent } from "@factory/core/api";
 /** The tool the agent calls to ask the user something (the factory's MCP server in the sandbox). */
 export const ASK_USER_TOOL = "mcp__factory__ask_user";
 
+/** Claude Code's tool for starting a subagent ("Task" in older versions, "Agent" in newer ones). */
+export const isSubagentTool = (name: string) => name === "Task" || name === "Agent";
+
+/** What a subagent reported about itself when it finished, when the agent CLI says. */
+export interface SubagentStats {
+  durationMs?: number;
+  tokens?: number;
+  toolUses?: number;
+}
+
 export interface ToolCall {
   type: "tool";
   id: string;
@@ -18,6 +28,12 @@ export interface ToolCall {
   result?: { text: string; isError: boolean };
   /** The subagent (Task) call this one ran under, if any. */
   parentId?: string;
+  /** For a subagent call: everything the subagent did, in order. */
+  children?: WorkItem[];
+  stats?: SubagentStats;
+  /** When the call was made and when its result came back. */
+  at: Date;
+  doneAt?: Date;
 }
 
 export type WorkItem =
@@ -40,6 +56,12 @@ const num = (v: unknown) => (typeof v === "number" ? v : undefined);
 export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
   const blocks: Block[] = [];
   const calls = new Map<string, ToolCall>();
+  // A subagent's own steps go inside the call that started it, not the main log.
+  const home = (id: string, parentId: string | undefined): WorkItem[] => {
+    const parent = parentId ? calls.get(parentId) : undefined;
+    if (parent) return (parent.children ??= []);
+    return work(id);
+  };
   const work = (id: string) => {
     const last = blocks.at(-1);
     if (last?.type === "work") return last.items;
@@ -65,24 +87,31 @@ export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
         break;
       }
       case "thinking":
-        work(e.id).push({ type: "thinking", id: e.id, text: e.message, parentId });
+        home(e.id, parentId).push({ type: "thinking", id: e.id, text: e.message, parentId });
         break;
       case "message":
-        // A subagent's prose stays inside the work log; the main agent's is the conversation.
-        if (parentId) work(e.id).push({ type: "note", id: e.id, text: e.message, parentId });
+        // A subagent's prose stays with its work; the main agent's is the conversation.
+        if (parentId) home(e.id, parentId).push({ type: "note", id: e.id, text: e.message, parentId });
         else blocks.push({ type: "message", id: e.id, text: e.message });
         break;
       case "tool_call": {
         const input = typeof data.input === "object" && data.input !== null ? (data.input as Record<string, unknown>) : {};
-        const call: ToolCall = { type: "tool", id: str(data.id) || e.id, name: str(data.name) ?? e.message, input, parentId };
+        const name = str(data.name) ?? e.message;
+        const call: ToolCall = { type: "tool", id: str(data.id) || e.id, name, input, parentId, at: e.at };
+        if (isSubagentTool(name)) call.children = [];
         calls.set(call.id, call);
         if (call.name === ASK_USER_TOOL && !parentId) blocks.push({ type: "question", id: e.id, call });
-        else work(e.id).push(call);
+        else home(e.id, parentId).push(call);
         break;
       }
       case "tool_result": {
         const call = calls.get(str(data.toolUseId) ?? "");
-        if (call) call.result = { text: e.message, isError: data.isError === true };
+        if (call) {
+          call.result = { text: e.message, isError: data.isError === true };
+          call.doneAt = e.at;
+          const stats = typeof data.stats === "object" && data.stats !== null ? (data.stats as Record<string, unknown>) : undefined;
+          if (stats) call.stats = { durationMs: num(stats.durationMs), tokens: num(stats.tokens), toolUses: num(stats.toolUses) };
+        }
         break;
       }
       case "user_message":

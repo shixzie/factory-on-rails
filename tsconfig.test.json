@@ -11,5 +11,9 @@
   "include": [
     "packages/*/test/**/*.ts",
     "apps/*/test/**/*.ts"
+  ],
+  // The web app's tests are checked with its own (bundler) settings: pnpm --filter @factory/web typecheck.
+  "exclude": [
+    "apps/web/test/**"
   ]
 }
