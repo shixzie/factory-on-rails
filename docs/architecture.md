@@ -37,6 +37,7 @@ flowchart LR
 | `apps/web` | Railway service, public | The UI: Next.js (App Router) with shadcn/ui, laid out like t3code. Forwards `/api/*` and `/auth/*` to the harness. |
 | `apps/harness` | Railway service, private | JSON API and GitHub sign-in: repository list and creation, starting and cancelling runs, run logs, API keys. |
 | `apps/runner` | Railway service, private | Claims queued runs, drives one Railway sandbox per run, pushes the branch and opens the PR. |
+| `apps/preview` | Railway service, public | The preview gateway: sandboxes tunnel out to it, and it serves their ports to the run's owner (see Previews). |
 | `packages/core` | Library | Postgres schema and data access, GitHub App auth, token encryption. |
 | Railway Sandboxes | `agents` environment | Isolated VMs the agent runs in. One per run, kept between its turns, stopped when idle and deleted with the run. |
 
@@ -238,6 +239,55 @@ Decisions:
   common coding agents. A checkpoint with toolchains installed can be set as
   `SANDBOX_CHECKPOINT` so every run without a snapshot of its own boots from
   it; it is shared by everyone, so it holds no one's sign-in.
+
+## Previews
+
+Anything the agent runs in a sandbox (a dev server, an API, Storybook) can be
+opened from the run page's **Preview** tab, privately: only the person who
+started the run can reach it.
+
+Railway sandboxes can publish HTTP ports on public `*.up.railway.app` domains,
+but only in `PRIVATE` networking (which puts every user's sandbox on one
+private network with the others), only for ports chosen when the sandbox is
+created, and with no access control. So the factory keeps sandboxes
+`ISOLATED` and brings the traffic out itself:
+
+```mermaid
+flowchart LR
+  browser([Run owner's browser]) -- "p5173-&lt;run&gt;.preview.shixzie.com<br/>(preview cookie)" --> gateway
+  web["web"] -- "one-time link<br/>(harness checks ownership)" --> browser
+  subgraph sandbox["run's sandbox (ISOLATED)"]
+    agent["preview agent"] -- "localhost:5173" --> app["dev server"]
+  end
+  agent -- "outbound WebSocket to<br/>tunnel.preview.shixzie.com" --> gateway["preview gateway<br/>(apps/preview)"]
+  gateway -- "ports, activity" --> db[("postgres")]
+```
+
+- **The preview agent** (`packages/core/src/preview-agent.ts`) is a
+  dependency-free Node script the runner starts in the background every turn.
+  It dials out to the gateway (sandboxes have internet egress), authenticates
+  with a signed `tunnel` grant for its run, reports which ports are listening
+  (from `/proc/net/tcp`, with the process behind each), and opens a
+  connection to `localhost:<port>` for each stream the gateway asks for.
+- **The gateway** (`apps/preview`) serves every run and port on its own
+  origin, `p<port>-<run>.preview.shixzie.com`, so apps work at `/`, can't read
+  each other's cookies or storage, and never share an origin with the factory.
+  Requests, streamed responses and WebSockets (hot reload) pass through; the
+  app sees `Host: localhost:<port>` and never the preview cookie.
+- **Access.** The Preview tab asks the harness (`POST /api/runs/:id/previews`)
+  for a link, which checks the run is the user's and signs a one-minute,
+  one-use `open` grant. The gateway swaps it for an HttpOnly, Partitioned
+  cookie scoped to that one origin. Grants are HMAC-signed with
+  `PREVIEW_SIGNING_KEY`. Because previews share the `shixzie.com` site with the
+  factory, the harness's own cookies carry the `__Host-` prefix, so a preview
+  page can't plant a session on the factory; the Origin check already refuses
+  its writes.
+- **Lifecycle.** Preview traffic counts as run activity, so the runner won't
+  stop a sandbox someone is using, and the runner runs a no-op in it every few
+  minutes so Railway's own idle timeout doesn't either. A stopped sandbox has
+  no processes; the tab says so, and the agent starts the server again on the
+  next turn. The agent's system prompt tells it to start servers with
+  `setsid nohup … &` so they outlive its turn.
 
 ## The harness and the run lifecycle
 
@@ -496,6 +546,9 @@ key under **Settings**, and it is used for their runs only.
 - `instance_settings`: what the setup page created, one JSON value per key
   (`github_app`, `sandboxes`, and the runner's `runner` report), secrets
   encrypted (`006_instance_settings.sql`).
+- `runs.preview_ports` and `runs.preview_seen_at` (`008_previews.sql`): the
+  ports listening in the sandbox while its preview agent is connected, and
+  when someone last used a preview.
 
 ## What this foundation does not do yet
 
@@ -510,9 +563,7 @@ These are the natural next steps, roughly in order:
    sandbox per step and forks to try approaches in parallel.
 4. **Secrets per repository.** Let a repository declare which extra variables
    its sandbox needs, encrypted per user alongside their API keys.
-5. **Preview deploys.** Use sandbox public domains (`networkIsolation: "PRIVATE"`
-   with `domains`) to expose a running app for review.
-6. **Multi-user.** Organisations, per-repo permissions, and quotas instead of an allowlist.
+5. **Multi-user.** Organisations, per-repo permissions, and quotas instead of an allowlist.
 
 ## References
 

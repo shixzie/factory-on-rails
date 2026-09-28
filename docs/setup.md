@@ -62,6 +62,7 @@ Project → `production` → Settings → **Shared Variables**:
 | `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Encrypts stored GitHub tokens and users' API keys. Don't rotate it casually: after a rotation users sign in again and re-save their API keys. |
 | `RAILWAY_SANDBOX_TOKEN` | Token from step 2 |
 | `SANDBOX_ENVIRONMENT_ID` | Environment id from step 2 |
+| `PREVIEW_SIGNING_KEY` | Output of `openssl rand -base64 48`. Signs preview links and sandbox tunnel grants (step 8). Without it previews are off and the `preview` service won't start. |
 
 ## 4. Let CI apply the infrastructure
 
@@ -209,6 +210,29 @@ Good to know:
   when its user hasn't picked a snapshot. It is for everyone, so it must not
   hold anyone's sign-in.
 
+## 8. Give the preview gateway its wildcard domain
+
+Previews of servers running in a sandbox are served by the `preview` service
+on `*.preview.shixzie.com`: one origin per run and port
+(`p5173-<run>.preview.shixzie.com`), and `tunnel.preview.shixzie.com` for
+sandboxes to connect to. As with the web domain, the domain is added in the
+dashboard first:
+
+1. Make sure `PREVIEW_SIGNING_KEY` is set (step 3), then let the IaC create
+   the `preview` service.
+2. In the dashboard, add the custom domain `*.preview.shixzie.com` to the
+   `preview` service (Settings → Networking) with target port 8080.
+3. In Cloudflare, add the records Railway shows: the `*.preview` CNAME, the
+   `_acme-challenge.preview` CNAME and the TXT record. Set both CNAMEs to
+   **DNS only** (grey cloud): Cloudflare's free certificate doesn't cover a
+   second-level wildcard, so Railway issues and serves the certificate itself.
+4. Merge a PR that declares the domain on `preview` in `.railway/railway.ts`
+   (`domains: [{ domain: "*.preview.shixzie.com", port: 8080 }]`).
+
+Keep the `preview` service at one replica: sandboxes' tunnels live in its
+memory. It is a small always-on Node process; preview traffic is billed as
+egress.
+
 ## Local development
 
 ```bash
@@ -219,6 +243,13 @@ pnpm dev:harness        # API on :3001 (PORT in .env)
 pnpm dev:web            # UI on http://localhost:3000, forwards /api and /auth to :3001
 pnpm dev:runner         # talks to real Railway sandboxes via RAILWAY_SANDBOX_TOKEN
 ```
+
+Previews work locally too: set `PREVIEW_DOMAIN=preview.localhost:8090` and a
+`PREVIEW_SIGNING_KEY` for the harness, and run the gateway with
+`PORT=8090 PUBLIC_URL=http://localhost:3000 node apps/preview/dist/index.js`.
+Browsers resolve `*.localhost` to your machine, and `*.localhost` is served
+over plain http. Real sandboxes can't reach your machine, so point a preview
+agent at it by hand (see apps/preview/test/gateway.test.ts for how).
 
 Tests: `pnpm test`. Set `TEST_DATABASE_URL` to a disposable Postgres database
 to include the database and HTTP suites (they drop and recreate its `public` schema).

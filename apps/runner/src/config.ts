@@ -1,5 +1,5 @@
-import { Api, snapshotsConfig, type AgentId, type SandboxSnapshot } from "@factory/core";
-import { Config, Context, Duration, Effect, Layer, Option } from "effect";
+import { Api, previewSigningKeyConfig, snapshotsConfig, type AgentId, type SandboxSnapshot } from "@factory/core";
+import { Config, Context, Duration, Effect, Layer, Option, type Redacted } from "effect";
 import { hostname } from "node:os";
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
@@ -108,6 +108,14 @@ export interface RunnerSettings {
   /** Sandbox snapshots users may pick, and who may use each (SANDBOX_SNAPSHOTS). */
   readonly snapshots: ReadonlyArray<SandboxSnapshot>;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
+  /** Where sandboxes' preview agents connect, and the key their grants are signed with; none turns previews off. */
+  readonly preview: Option.Option<PreviewSettings>;
+}
+
+export interface PreviewSettings {
+  /** e.g. wss://tunnel.preview.example.com/connect */
+  readonly tunnelUrl: string;
+  readonly signingKey: Redacted.Redacted<string>;
 }
 
 const int = (name: string, fallback: number) => Config.integer(name).pipe(Config.withDefault(fallback));
@@ -164,7 +172,9 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
       });
       const { snapshots, errors } = yield* snapshotsConfig;
       for (const error of errors) yield* Effect.logWarning(`SANDBOX_SNAPSHOTS: ${error}`);
-      return { ...settings, snapshots, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
+      const tunnelUrl = Option.filter(yield* Config.option(Config.string("PREVIEW_TUNNEL_URL")), (u) => u.trim() !== "");
+      const preview = Option.all({ tunnelUrl: Option.map(tunnelUrl, (u) => u.trim()), signingKey: yield* previewSigningKeyConfig });
+      return { ...settings, snapshots, preview, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
     }),
   );
 }

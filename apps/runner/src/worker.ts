@@ -91,6 +91,7 @@ export const handleRun = (run: RunRow) =>
       snapshot,
       git: config.git,
       harnessUrl: config.harnessUrl,
+      preview: config.preview,
       heartbeatEvery: config.heartbeatInterval,
     });
     yield* log.flush;
@@ -205,6 +206,30 @@ export const deleteExpiredRuns = Effect.gen(function* () {
   yield* Effect.forEach(expired, (run) => deleteRun(run, config.runRetentionDays), { concurrency: 3, discard: true });
 });
 
+/** How often a sandbox someone is previewing gets a no-op command. */
+const PREVIEW_KEEPALIVE_MS = 5 * 60_000;
+/** Preview traffic this recent counts as someone previewing. */
+const PREVIEW_RECENT_SECONDS = 120;
+
+/**
+ * Preview traffic bumps a run's activity, so the runner doesn't stop the
+ * sandbox under the person using it. Railway's own idle timeout only counts
+ * commands, though, so those sandboxes also get a no-op now and then.
+ * `last` remembers when each one last got it.
+ */
+export const keepPreviewedSandboxesAlive = (last: Map<string, number>, now = Date.now()) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const sandboxes = yield* Sandboxes;
+    for (const [id, at] of last) if (now - at > 2 * PREVIEW_KEEPALIVE_MS) last.delete(id);
+    for (const run of yield* store.previewedSandboxes(PREVIEW_RECENT_SECONDS)) {
+      if (!run.sandbox_id || now - (last.get(run.id) ?? 0) < PREVIEW_KEEPALIVE_MS) continue;
+      last.set(run.id, now);
+      const handle = yield* sandboxes.connect(run.sandbox_id);
+      if (Option.isSome(handle)) yield* handle.value.exec("true", { timeoutSec: 30 }).pipe(Effect.ignore);
+    }
+  });
+
 /** Claims and runs queued runs until interrupted; interrupting it stops every run in flight. */
 export const runner = Effect.gen(function* () {
   const config = yield* RunnerConfig;
@@ -230,6 +255,13 @@ export const runner = Effect.gen(function* () {
   );
   yield* Effect.zipRight(stopIdleSandboxes, deleteExpiredRuns).pipe(
     Effect.catchAllCause((cause) => Effect.logError("Sandbox cleanup failed", cause)),
+    Effect.repeat(Schedule.spaced(config.lifecycleInterval)),
+    Effect.forkScoped,
+  );
+
+  const keptAlive = new Map<string, number>();
+  yield* Effect.suspend(() => keepPreviewedSandboxesAlive(keptAlive)).pipe(
+    Effect.catchAllCause((cause) => Effect.logWarning("Could not keep previewed sandboxes alive", cause)),
     Effect.repeat(Schedule.spaced(config.lifecycleInterval)),
     Effect.forkScoped,
   );

@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  AppWindowIcon,
   ArrowDownIcon,
   ArrowUpIcon,
   CircleAlertIcon,
@@ -19,6 +20,7 @@ import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
 import { ChangedFiles, DiffPane, DiffStat, useDiffFiles } from "@/components/diff-view";
 import { PageHeader } from "@/components/page-header";
+import { PreviewPane } from "@/components/preview-pane";
 import { RunActivity } from "@/components/run-activity";
 import { RunFlow } from "@/components/run-flow";
 import { RunTitle } from "@/components/run-title";
@@ -38,6 +40,8 @@ import { cn } from "@/lib/utils";
 const POLL_MS = 2000;
 /** While a finished run's sandbox is up, check now and then whether it has been stopped. */
 const SANDBOX_POLL_MS = 15_000;
+/** Sooner while the Preview tab is open, so servers the sandbox starts show up. */
+const PREVIEW_POLL_MS = 4000;
 
 /** Re-renders every second while `on`, for live durations. */
 function useNow(on: boolean) {
@@ -198,25 +202,29 @@ function Outcome({ run }: { run: Api.ApiRun }) {
   return null;
 }
 
-type PanelTab = "flow" | "diff";
+type PanelTab = "flow" | "diff" | "preview";
 
-/** Beside the thread on wide screens, over it on small ones: the flow map or the diff. */
+/** Beside the thread on wide screens, over it on small ones: the flow map, the diff, or a preview. */
 function SidePanel({
   tab,
   onTab,
   onClose,
   fileCount,
+  previews,
   children,
 }: {
   tab: PanelTab;
   onTab: (tab: PanelTab) => void;
   onClose: () => void;
   fileCount: number;
+  /** Show the Preview tab. */
+  previews: boolean;
   children: React.ReactNode;
 }) {
   const tabs: { id: PanelTab; label: string; icon: React.ReactNode }[] = [
     { id: "flow", label: "Flow", icon: <WorkflowIcon /> },
     { id: "diff", label: fileCount ? `Diff · ${fileCount}` : "Diff", icon: <FileDiffIcon /> },
+    ...(previews ? [{ id: "preview" as const, label: "Preview", icon: <AppWindowIcon /> }] : []),
   ];
   return (
     <aside className="fixed inset-x-0 top-12 bottom-0 z-20 flex flex-col border-l bg-background lg:sticky lg:inset-auto lg:top-12 lg:z-auto lg:h-[calc(100svh-3rem)] lg:w-[min(46rem,48%)] lg:min-w-0 lg:shrink-0 lg:self-start">
@@ -266,6 +274,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
   const now = useNow(active);
   const pollNow = useRef<() => void>(() => {});
+  const previewing = useRef(false);
+  previewing.current = panel === "preview";
 
   // Poll for new activity while the run is live (and page through a long
   // finished run); refresh the sidebar when the run settles.
@@ -305,7 +315,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         else if (!isActive(page.run.status)) {
           if (isActive(run.status)) router.refresh();
           if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return;
-          delay = SANDBOX_POLL_MS;
+          delay = previewing.current ? PREVIEW_POLL_MS : SANDBOX_POLL_MS;
         }
       }
       timer = setTimeout(tick, delay);
@@ -350,7 +360,14 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     if (path) setFocus((f) => ({ path, n: (f?.n ?? 0) + 1 }));
   };
 
-  const togglePanel = (tab: PanelTab) => setPanel((p) => (p === tab ? null : tab));
+  const togglePanel = (tab: PanelTab) => {
+    setPanel((p) => (p === tab ? null : tab));
+    // Opening the preview wants fresh ports rather than the next slow poll.
+    if (tab === "preview") pollNow.current();
+  };
+
+  const previewPorts = run.previewPorts?.length ?? 0;
+  const showPreview = initial.previewsEnabled && (active || sandboxUp || previewPorts > 0 || panel === "preview");
 
   // Picking a subagent on the map opens its card in the thread (closing the map where it covers the thread).
   const selectAgent = (id: string) => {
@@ -421,6 +438,21 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 <FileDiffIcon />
                 <span className="hidden sm:inline">Diff</span>
                 {files.length > 0 ? <DiffStat additions={totals.additions} deletions={totals.deletions} /> : null}
+              </Button>
+            ) : null}
+            {showPreview ? (
+              <Button
+                variant={panel === "preview" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => togglePanel("preview")}
+                aria-pressed={panel === "preview"}
+                aria-label="Toggle the preview"
+              >
+                <AppWindowIcon />
+                <span className="hidden sm:inline">Preview</span>
+                {previewPorts > 0 ? (
+                  <span className="rounded bg-success/15 px-1 font-mono text-[10px] text-success">{previewPorts}</span>
+                ) : null}
               </Button>
             ) : null}
             {run.pullRequestUrl ? (
@@ -528,8 +560,16 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         </div>
 
         {panel ? (
-          <SidePanel tab={panel} onTab={setPanel} onClose={() => setPanel(null)} fileCount={files.length}>
-            {panel === "flow" ? (
+          <SidePanel
+            tab={panel}
+            onTab={setPanel}
+            onClose={() => setPanel(null)}
+            fileCount={files.length}
+            previews={initial.previewsEnabled}
+          >
+            {panel === "preview" ? (
+              <PreviewPane run={run} enabled={initial.previewsEnabled} />
+            ) : panel === "flow" ? (
               <div className="flex-1 overflow-y-auto p-4">
                 <RunFlow
                   events={events}

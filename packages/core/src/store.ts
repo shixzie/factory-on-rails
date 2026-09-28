@@ -64,6 +64,16 @@ export interface RunRow {
   turns: number;
   /** A bigint id, as a string. */
   delivered_message_id: string;
+  /** Ports listening in the sandbox while its preview agent is connected; null when it is not. */
+  preview_ports: ReadonlyArray<PreviewPort> | null;
+  /** When someone last used one of the run's previews. */
+  preview_seen_at: Date | null;
+}
+
+/** A port listening in a run's sandbox, and the process behind it when the agent could tell. */
+export interface PreviewPort {
+  port: number;
+  process?: string;
 }
 
 /** What the runner needs to stop or delete a run's sandbox. */
@@ -202,6 +212,16 @@ export interface StoreService {
   readonly getSetting: (key: string) => Q<Option.Option<unknown>>;
   /** Saves a setting. With `onlyIfAbsent` an existing value is kept, and the result says whether this one was saved. */
   readonly putSetting: (key: string, value: unknown, options?: { readonly onlyIfAbsent?: boolean }) => Q<boolean>;
+
+  // previews (see preview.ts)
+  /** What the sandbox's preview agent reports; null when it disconnects. */
+  readonly setPreviewPorts: (runId: string, ports: ReadonlyArray<PreviewPort> | null) => Q<void>;
+  /** Forgets every run's ports (the gateway starting up holds no tunnels). */
+  readonly clearPreviewPorts: Q<void>;
+  /** Someone is using a preview: counts as activity, so the sandbox isn't stopped under them. */
+  readonly touchPreview: (runId: string) => Q<void>;
+  /** Finished runs whose running sandbox had preview traffic in the last `seconds`. */
+  readonly previewedSandboxes: (seconds: number) => Q<ReadonlyArray<Pick<RunRow, "id" | "sandbox_id">>>;
 }
 
 const make = Effect.gen(function* () {
@@ -446,6 +466,24 @@ const make = Effect.gen(function* () {
             returning key`;
       return Effect.map(saved, (rows) => rows.length > 0);
     },
+
+    setPreviewPorts: (runId, ports) =>
+      sql`
+        update runs set preview_ports = ${ports === null ? null : JSON.stringify(ports)}::jsonb
+        where id = ${runId}`.pipe(Effect.asVoid),
+
+    clearPreviewPorts: sql`update runs set preview_ports = null where preview_ports is not null`.pipe(Effect.asVoid),
+
+    touchPreview: (runId) =>
+      sql`
+        update runs set last_activity_at = now(), preview_seen_at = now()
+        where id = ${runId} and sandbox_state = 'running'`.pipe(Effect.asVoid),
+
+    previewedSandboxes: (seconds) =>
+      sql<Pick<RunRow, "id" | "sandbox_id">>`
+        select id, sandbox_id from runs
+        where sandbox_state = 'running' and sandbox_id is not null and status in ${sql.in(TERMINAL_STATUSES)}
+          and preview_seen_at > now() - make_interval(secs => ${seconds})`,
   };
   return service;
 });

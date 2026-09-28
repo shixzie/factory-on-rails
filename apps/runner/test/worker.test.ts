@@ -1,12 +1,12 @@
 import { SqlClient } from "@effect/sql";
 import { encrypt, Store, TokenCipher, type RunRow } from "@factory/core";
 import { describe, expect, layer } from "@effect/vitest";
-import { Duration, Effect, Fiber, Layer, Option, Schedule } from "effect";
+import { Duration, Effect, Fiber, Layer, Option, Redacted, Schedule } from "effect";
 import { randomBytes } from "node:crypto";
 import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { RunnerConfig } from "../src/config.js";
 import { HAS_SESSION_MARKER } from "../src/plan.js";
-import { deleteExpiredRuns, runner } from "../src/worker.js";
+import { deleteExpiredRuns, keepPreviewedSandboxesAlive, runner } from "../src/worker.js";
 import { fakeGitHub, fakeSandboxes } from "./stubs.js";
 
 const key = randomBytes(32);
@@ -32,6 +32,7 @@ const settings = {
   },
   snapshots: [{ name: "shixzie-agents", logins: ["shixzie"] }],
   git: { authorName: "A", authorEmail: "a@x" },
+  preview: Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make("s".repeat(40)) }),
 };
 const config = Layer.succeed(RunnerConfig, settings);
 
@@ -244,6 +245,30 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         expect(sandboxes.state.envs.findLast((e) => e?.FACTORY_RUN_ID)?.FACTORY_CONTINUE).toBe("1");
         expect(resumed.delivered_message_id).not.toBe("0");
         expect(resumed.pull_request_url).toBe("https://github.com/shixzie/demo/pull/1");
+      }),
+    );
+
+    it.effect("keeps a sandbox someone is previewing awake, without asking Railway every tick", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_previewed", "sbx_quiet"] });
+        const previewed = yield* queueRun;
+        const quiet = yield* queueRun;
+        yield* sql`
+          update runs set status = 'succeeded', sandbox_state = 'running', sandbox_id = 'sbx_previewed', preview_seen_at = now()
+          where id = ${previewed.id}`;
+        yield* sql`
+          update runs set status = 'succeeded', sandbox_state = 'running', sandbox_id = 'sbx_quiet',
+            preview_seen_at = now() - interval '1 hour'
+          where id = ${quiet.id}`;
+
+        const last = new Map<string, number>();
+        yield* keepPreviewedSandboxesAlive(last, 1_000_000).pipe(Effect.provide(sandboxes.layer));
+        yield* keepPreviewedSandboxesAlive(last, 1_000_000 + 60_000).pipe(Effect.provide(sandboxes.layer));
+        expect(sandboxes.state.commands).toEqual(["true"]);
+        yield* keepPreviewedSandboxesAlive(last, 1_000_000 + 6 * 60_000).pipe(Effect.provide(sandboxes.layer));
+        expect(sandboxes.state.commands).toEqual(["true", "true"]);
+        yield* sql`update runs set sandbox_state = 'deleted' where id in (${previewed.id}, ${quiet.id})`;
       }),
     );
 

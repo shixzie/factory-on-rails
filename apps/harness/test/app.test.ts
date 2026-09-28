@@ -5,13 +5,14 @@ import {
   GitHubError,
   GitHubUserApi,
   InstanceSettings,
+  PREVIEW_COOKIE,
   sha256,
   Store,
   TokenCipher,
   type GitHubRepo,
 } from "@factory/core";
 import { afterAll, beforeAll, describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, ManagedRuntime, Option } from "effect";
+import { Effect, Layer, ManagedRuntime, Option, Redacted } from "effect";
 import { randomBytes } from "node:crypto";
 import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { app, originCheck } from "../src/app.js";
@@ -21,6 +22,7 @@ import { TitleError, TitleModel, type TitleProvider } from "../src/titles.js";
 
 const ORIGIN = "https://factory.example";
 const key = randomBytes(32);
+const PREVIEW_KEY = "p".repeat(40);
 
 /**
  * A scriptable GitHub: tests set the viewer login and the repos the app can see.
@@ -93,6 +95,7 @@ const TestLayer = Layer.mergeAll(
     publicUrl: ORIGIN,
     allowedLogins: ["shixzie"],
     sessionTtlSeconds: 3600,
+    preview: Option.some({ domain: "preview.example", signingKey: Redacted.make(PREVIEW_KEY) }),
     railwayProjectId: Option.some("project-1"),
     snapshots: [
       { name: "snap-agents", logins: ["snapper"] },
@@ -135,7 +138,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
         });
         const token = randomBytes(16).toString("hex");
         yield* store.createSession(sha256(token), user.id, 60);
-        return { user, cookie: `factory_session=${token}` };
+        return { user, cookie: `__Host-factory_session=${token}` };
       }),
     );
 
@@ -167,14 +170,14 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
   });
 
   it("rejects a callback whose state does not match", async () => {
-    const res = await request("/auth/callback?code=good&state=evil", { headers: { cookie: "factory_oauth_state=fine" } });
+    const res = await request("/auth/callback?code=good&state=evil", { headers: { cookie: "__Host-factory_oauth_state=fine" } });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toMatch(/^\/login\?error=Sign-in%20failed/);
   });
 
   it("refuses GitHub users outside the allowlist", async () => {
     github.login = "mallory";
-    const res = await request("/auth/callback?code=good&state=s", { headers: { cookie: "factory_oauth_state=s" } });
+    const res = await request("/auth/callback?code=good&state=s", { headers: { cookie: "__Host-factory_oauth_state=s" } });
     github.login = "shixzie";
     expect(res.status).toBe(302);
     expect(decodeURIComponent(res.headers.get("location")!)).toContain("mallory is not allowed");
@@ -183,9 +186,9 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
   });
 
   it("signs in allowed users and stores their token encrypted", async () => {
-    const res = await request("/auth/callback?code=good&state=s", { headers: { cookie: "factory_oauth_state=s" } });
+    const res = await request("/auth/callback?code=good&state=s", { headers: { cookie: "__Host-factory_oauth_state=s" } });
     expect(res.status).toBe(302);
-    expect(res.headers.get("set-cookie")).toContain("factory_session=");
+    expect(res.headers.get("set-cookie")).toContain("__Host-factory_session=");
     const [user] = await run(
       Effect.flatMap(
         SqlClient.SqlClient,
@@ -249,6 +252,44 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect((await json(cancelled)).status).toBe("cancelled");
     const status = await run(Effect.flatMap(Store, (s) => s.getRun(created.id)));
     expect(status._tag === "Some" && status.value.status).toBe("cancelled");
+  });
+
+  it("hands a run's owner a one-time link to a port's preview, and nobody else", async () => {
+    const owner = await signIn("previewer", 11);
+    const other = await signIn("snoop", 12);
+    const created = await run(
+      Effect.flatMap(Store, (store) =>
+        store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "t" }),
+      ),
+    );
+    await run(Effect.flatMap(Store, (store) => store.setPreviewPorts(created.id, [{ port: 5173, process: "vite" }])));
+
+    const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+    expect(detail.previewsEnabled).toBe(true);
+    expect(detail.run.previewPorts).toEqual([{ port: 5173, process: "vite" }]);
+
+    const res = await post(`/api/runs/${created.id}/previews`, owner.cookie, { port: 5173, path: "/docs" });
+    expect(res.status).toBe(200);
+    const link = await json(res);
+    const host = `p5173-${created.id.replace(/-/g, "")}.preview.example`;
+    expect(link.origin).toBe(`https://${host}`);
+    const url = new URL(link.url);
+    expect(url.host).toBe(host);
+    expect(url.pathname).toBe("/__factory/open");
+    expect(url.searchParams.get("path")).toBe("/docs");
+    const { verifyPreviewGrant } = await import("@factory/core");
+    const grant = verifyPreviewGrant(PREVIEW_KEY, url.searchParams.get("token")!, "open");
+    expect(grant).toMatchObject({ run: created.id, port: 5173, user: owner.user.id });
+    expect(link.url).not.toContain(PREVIEW_COOKIE);
+
+    expect((await post(`/api/runs/${created.id}/previews`, other.cookie, { port: 5173 })).status).toBe(404);
+    expect((await post(`/api/runs/${created.id}/previews`, owner.cookie, { port: 70000 })).status).toBe(400);
+    const crossSite = await request(`/api/runs/${created.id}/previews`, {
+      method: "POST",
+      headers: { cookie: owner.cookie, origin: `https://${host}`, "content-type": "application/json" },
+      body: JSON.stringify({ port: 5173 }),
+    });
+    expect(crossSite.status).toBe(403);
   });
 
   it("takes messages for a live run, shows its activity and its diff", async () => {
@@ -527,7 +568,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
         body: JSON.stringify(organization ? { organization } : {}),
       });
     const callback = (code: string, state: string, cookieState = state) =>
-      request(`/auth/setup/github-app?code=${code}&state=${state}`, { headers: { cookie: `factory_setup_state=${cookieState}` } });
+      request(`/auth/setup/github-app?code=${code}&state=${state}`, { headers: { cookie: `__Host-factory_setup_state=${cookieState}` } });
     const errorOf = (res: Response) => new URL(res.headers.get("location")!, ORIGIN).searchParams.get("error");
 
     beforeAll(async () => {
@@ -566,7 +607,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       const action = new URL(form.action);
       expect(action.origin + action.pathname).toBe("https://github.com/settings/apps/new");
       const state = action.searchParams.get("state")!;
-      expect(res.headers.get("set-cookie")).toContain(`factory_setup_state=${state}`);
+      expect(res.headers.get("set-cookie")).toContain(`__Host-factory_setup_state=${state}`);
       const manifest = JSON.parse(form.manifest);
       expect(manifest).toMatchObject({
         url: ORIGIN,

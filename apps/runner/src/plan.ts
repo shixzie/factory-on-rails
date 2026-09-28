@@ -19,6 +19,11 @@ export const BASE_SHA_FILE = `${FACTORY_DIR}/base-sha`;
  * helper, so it is never baked into the sandbox env or `.git/config`.
  */
 export const TOKEN_FILE = `${FACTORY_DIR}/gh-token`;
+/** The preview agent and its `tunnel` grant (see packages/core/src/preview.ts), rewritten every turn. */
+export const PREVIEW_AGENT_FILE = `${FACTORY_DIR}/preview-agent.mjs`;
+export const PREVIEW_TOKEN_FILE = `${FACTORY_DIR}/preview-token`;
+const PREVIEW_PID_FILE = `${FACTORY_DIR}/preview-agent.pid`;
+const PREVIEW_LOG_FILE = `${FACTORY_DIR}/preview-agent.log`;
 /** Written when the agent starts, so a later turn knows there is a session to continue. */
 export const AGENT_RAN_FILE = `${FACTORY_DIR}/agent-ran`;
 /** What the agent is asked when it writes the pull request (see describePrompt). */
@@ -126,7 +131,24 @@ export function resumeScript(p: { repo: string }): string {
 }
 
 /** Run before a sandbox is checkpointed, so the saved disk holds no token. */
-export const SCRUB_SCRIPT = `rm -f ${TOKEN_FILE}`;
+export const SCRUB_SCRIPT = `rm -f ${TOKEN_FILE} ${PREVIEW_TOKEN_FILE}`;
+
+/**
+ * Starts the preview agent in the background, detached from the exec session
+ * so it keeps running between turns (it replaces one left by an earlier turn).
+ * A background process doesn't count as sandbox activity, so it never keeps
+ * an idle sandbox up.
+ */
+export function previewAgentScript(tunnelUrl: string): string {
+  return [
+    "set -eu",
+    `export FACTORY_PREVIEW_URL=${shellQuote(tunnelUrl)}`,
+    `export FACTORY_PREVIEW_TOKEN_FILE=${PREVIEW_TOKEN_FILE}`,
+    `export FACTORY_PREVIEW_PID_FILE=${PREVIEW_PID_FILE}`,
+    "detach=; if command -v setsid >/dev/null 2>&1; then detach=setsid; fi",
+    `$detach nohup node ${PREVIEW_AGENT_FILE} > ${PREVIEW_LOG_FILE} 2>&1 < /dev/null &`,
+  ].join("\n");
+}
 
 /**
  * Prints everything the run changed since the base commit (commits and

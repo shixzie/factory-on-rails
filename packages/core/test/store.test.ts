@@ -272,6 +272,33 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
+    it.effect("records a sandbox's preview ports, and preview traffic as activity on a running sandbox", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const previewed = yield* enqueue(id, "previewed");
+        const stopped = yield* enqueue(id, "stopped");
+        yield* sql`update runs set status = 'succeeded', sandbox_id = 'sbx', last_activity_at = now() - interval '10 minutes'`;
+        yield* sql`update runs set sandbox_state = 'running' where id = ${previewed.id}`;
+        yield* sql`update runs set sandbox_state = 'stopped' where id = ${stopped.id}`;
+
+        yield* store.setPreviewPorts(previewed.id, [{ port: 5173, process: "vite" }]);
+        expect(Option.getOrThrow(yield* store.getRun(previewed.id)).preview_ports).toEqual([{ port: 5173, process: "vite" }]);
+
+        yield* store.touchPreview(previewed.id);
+        yield* store.touchPreview(stopped.id);
+        // Someone is using it, so it is not idle.
+        expect(yield* store.claimIdleSandboxes(300, 900, 10)).toEqual([]);
+        expect((yield* store.previewedSandboxes(60)).map((r) => r.id)).toEqual([previewed.id]);
+        expect(Option.getOrThrow(yield* store.getRun(stopped.id)).preview_seen_at).toBeNull();
+
+        yield* store.clearPreviewPorts;
+        expect(Option.getOrThrow(yield* store.getRun(previewed.id)).preview_ports).toBeNull();
+      }),
+    );
+
     it.effect("stores API keys per user and provider without exposing them in listings", () =>
       Effect.gen(function* () {
         const store = yield* Store;

@@ -161,6 +161,8 @@ The person who started this run is following along and can talk to you:
 - If you need a decision only they can make, call the ask_user tool (from the "factory" MCP server) with one clear question and, when it helps, a few short options. It waits for their answer. Decide everything you reasonably can on your own; don't ask for permission or confirmation.
 - They may also send you messages while you work. Those arrive as additional context after a tool call. Follow them.
 
+They can also open any server you run in this sandbox from the run's Preview tab (a web app, an API, Storybook): the factory proxies it to them privately. When a running server would help them check your work, start it in the background so it keeps running after you finish, e.g. \`setsid nohup npm run dev > /tmp/dev.log 2>&1 &\`, listening on any interface or localhost, and tell them the port. They reach it on its own https origin, not on localhost, so don't hard-code localhost URLs into what the page loads.
+
 End with a short summary of what you changed and anything they should check.`;
 
 /** TOML for a string; a JSON string is also a valid TOML basic string. */

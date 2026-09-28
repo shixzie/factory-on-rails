@@ -62,6 +62,13 @@ export const ApiRepo = Schema.Struct({
 });
 export type ApiRepo = typeof ApiRepo.Type;
 
+/** A port listening in a run's sandbox, and the process behind it when known. */
+export const PreviewPort = Schema.Struct({
+  port: Schema.Number,
+  process: Schema.optional(Schema.String),
+});
+export type PreviewPort = typeof PreviewPort.Type;
+
 export const ApiRun = Schema.Struct({
   id: Schema.String,
   repo: Schema.String,
@@ -84,6 +91,11 @@ export const ApiRun = Schema.Struct({
   sandboxState: Schema.optionalWith(SandboxState, { default: () => "none" as const }),
   /** The last agent activity or user message; the run is deleted `RUN_RETENTION_DAYS` after it. */
   lastActivityAt: Schema.optionalWith(Schema.NullOr(Schema.Date), { default: () => null }),
+  /**
+   * Ports listening in the sandbox, as its preview agent last reported them;
+   * null while the agent is not connected (no sandbox, stopped, or starting).
+   */
+  previewPorts: Schema.optionalWith(Schema.NullOr(Schema.Array(PreviewPort)), { default: () => null }),
 });
 export type ApiRun = typeof ApiRun.Type;
 
@@ -128,6 +140,8 @@ export const RunDetail = Schema.Struct({
   /** More events exist after the last one; page through `/events?after=`. */
   hasMore: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   diff: Schema.optionalWith(Schema.NullOr(ApiRunDiff), { default: () => null }),
+  /** This factory has a preview gateway set up (PREVIEW_DOMAIN and PREVIEW_SIGNING_KEY). */
+  previewsEnabled: Schema.optionalWith(Schema.Boolean, { default: () => false }),
 });
 export type RunDetail = typeof RunDetail.Type;
 
@@ -185,6 +199,21 @@ export const CreateRepoBody = Schema.Struct({
   private: Schema.Boolean,
 });
 export type CreateRepoBody = typeof CreateRepoBody.Type;
+
+/** Open a port of the run's sandbox in the browser; `path` is where to land. */
+export const OpenPreviewBody = Schema.Struct({
+  port: Schema.Int.pipe(Schema.between(1, 65535)),
+  path: Schema.optional(Schema.String),
+});
+export type OpenPreviewBody = typeof OpenPreviewBody.Type;
+
+/** A one-time link (valid for a minute) that signs the browser in to that port's preview origin. */
+export const PreviewLink = Schema.Struct({
+  url: Schema.String,
+  /** The preview's origin, e.g. https://p5173-<run>.preview.example.com. */
+  origin: Schema.String,
+});
+export type PreviewLink = typeof PreviewLink.Type;
 
 export const SaveKeyBody = Schema.Struct({ key: Schema.String });
 export type SaveKeyBody = typeof SaveKeyBody.Type;

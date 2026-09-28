@@ -110,6 +110,12 @@ both and stores them in the database, encrypted with `TOKEN_ENCRYPTION_KEY`.
 Setting `GITHUB_APP_*`, `RAILWAY_SANDBOX_TOKEN` and `SANDBOX_ENVIRONMENT_ID`
 by hand still works and takes precedence ([setup.md](setup.md)).
 
+Previews of servers running in sandboxes are left out of the template: they
+need a wildcard custom domain, which a template can't bring. To add them
+later, create a `preview` service (start command
+`node apps/preview/dist/index.js`, healthcheck `/healthz`) and follow
+[setup.md](setup.md), step 8.
+
 ## Overview text for the marketplace
 
 ```md

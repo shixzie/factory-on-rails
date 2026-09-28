@@ -59,6 +59,8 @@ export const api = {
   runDiff: (id: string) => call(HttpClientRequest.get(`/api/runs/${encodeURIComponent(id)}/diff`), Api.ApiRunDiff),
   sendMessage: (id: string, text: string) =>
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
+  openPreview: (id: string, body: Api.OpenPreviewBody) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/previews`, body), Api.PreviewLink),
   renameRun: (id: string, title: string) =>
     call(json("PATCH", `/api/runs/${encodeURIComponent(id)}`, { title }), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),

@@ -2,7 +2,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platf
 import { Api, appManifest, GitHubUserApi, InstanceSettings, manifestFormUrl, randomToken, type UserRow } from "@factory/core";
 import { Data, Effect, Option, Schema } from "effect";
 import { randomBytes } from "node:crypto";
-import { cookieOptions, currentUser, namedLogins, requireUser } from "./auth.js";
+import { baseCookieOptions, cookieName, cookieOptions, currentUser, namedLogins, requireUser } from "./auth.js";
 import { HarnessConfig } from "./config.js";
 import { fail } from "./errors.js";
 import { RailwayApi } from "./railway.js";
@@ -93,7 +93,7 @@ export const setupRoutes = HttpRouter.empty.pipe(
         manifest: JSON.stringify(appManifest(config.publicUrl, name)),
       };
       return yield* HttpServerResponse.schemaJson(Api.GitHubAppForm)(form).pipe(
-        Effect.flatMap(HttpServerResponse.setCookie(SETUP_STATE_COOKIE, state, cookieOptions(config.publicUrl, 3600))),
+        Effect.flatMap(HttpServerResponse.setCookie(cookieName(config.publicUrl, SETUP_STATE_COOKIE), state, cookieOptions(config.publicUrl, 3600))),
       );
     }),
   ),
@@ -107,7 +107,7 @@ export const setupRoutes = HttpRouter.empty.pipe(
       const { code, state } = yield* HttpServerRequest.schemaSearchParams(
         Schema.Struct({ code: Schema.optional(Schema.String), state: Schema.optional(Schema.String) }),
       );
-      const expected = req.cookies[SETUP_STATE_COOKIE];
+      const expected = req.cookies[cookieName(config.publicUrl, SETUP_STATE_COOKIE)];
       if (!code || !state || !expected || state !== expected) {
         return yield* new SetupRejected({ message: "GitHub App setup failed: the setup state did not match. Start again." });
       }
@@ -127,7 +127,7 @@ export const setupRoutes = HttpRouter.empty.pipe(
       }
       yield* Effect.logInfo(`GitHub App ${app.slug} created by the setup page, owned by ${app.owner}`);
       return yield* HttpServerResponse.redirect("/setup", { status: 302 }).pipe(
-        HttpServerResponse.expireCookie(SETUP_STATE_COOKIE, { path: "/" }),
+        HttpServerResponse.expireCookie(cookieName(config.publicUrl, SETUP_STATE_COOKIE), baseCookieOptions(config.publicUrl)),
       );
     }),
   ),

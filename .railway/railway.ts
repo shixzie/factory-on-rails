@@ -1,6 +1,7 @@
 /**
  * Railway Infrastructure as Code for Factory on Rails: the web app (public),
- * the harness (private API and auth), the runner (worker) and Postgres.
+ * the harness (private API and auth), the runner (worker), the preview
+ * gateway (public, production only) and Postgres.
  *
  *   railway config plan    # preview against the linked environment
  *   railway config apply   # apply after review (CI does this on merge)
@@ -39,6 +40,16 @@ export default defineRailway((ctx) => {
   // the sign-in of whoever prepared it, so list only them unless it holds none.
   const sandboxSnapshots = production ? "shixzie-agents=shixzie" : "";
 
+  // Previews of servers running in sandboxes (packages/core/src/preview.ts):
+  // each run's port gets its own origin, p<port>-<run>.preview.shixzie.com,
+  // served by the preview gateway, which sandboxes dial out to at
+  // tunnel.preview.shixzie.com. Needs the wildcard domain on the gateway and
+  // the PREVIEW_SIGNING_KEY shared variable (docs/setup.md, step 8). Without
+  // them the harness and runner simply leave previews off.
+  const previewDomain = "preview.shixzie.com";
+  const inProduction = <T extends object>(env: T): Partial<T> => (production ? env : {});
+  const previewEnv = inProduction({ PREVIEW_SIGNING_KEY: ctx.shared.PREVIEW_SIGNING_KEY });
+
   // API and auth backend for the web app. No public domain: only reached on
   // the private network (listening on :: so the private DNS name resolves).
   const harness = service("harness", {
@@ -62,6 +73,8 @@ export default defineRailway((ctx) => {
       GITHUB_APP_CLIENT_ID: ctx.shared.GITHUB_APP_CLIENT_ID,
       GITHUB_APP_CLIENT_SECRET: ctx.shared.GITHUB_APP_CLIENT_SECRET,
       TOKEN_ENCRYPTION_KEY: ctx.shared.TOKEN_ENCRYPTION_KEY,
+      ...previewEnv,
+      ...inProduction({ PREVIEW_DOMAIN: previewDomain }),
       // Any GitHub account can sign in (each user brings their own model key).
       // Set a comma-separated list of logins instead to restrict it.
       ALLOWED_GITHUB_LOGINS: "*",
@@ -114,10 +127,37 @@ export default defineRailway((ctx) => {
       // Checked again when a run starts, in case a snapshot was taken away.
       SANDBOX_SNAPSHOTS: sandboxSnapshots,
       MAX_CONCURRENT_RUNS: ctx.isEnvironment("production") ? "5" : "1",
+      ...previewEnv,
+      ...inProduction({ PREVIEW_TUNNEL_URL: `wss://tunnel.${previewDomain}/connect` }),
+    },
+  });
+
+  // The preview gateway (apps/preview). Public: browsers reach previews on
+  // *.preview.shixzie.com and sandboxes (which have internet egress only)
+  // connect to tunnel.preview.shixzie.com. Keep one replica: tunnels live in
+  // its memory. The wildcard domain is added in the dashboard first, then
+  // declared here (IaC can't register a custom domain).
+  const preview = service("preview", {
+    source,
+    build: {
+      builder: "RAILPACK",
+      buildCommand: "pnpm run build",
+      watchPatterns: ["apps/preview/**", "packages/core/**", "pnpm-lock.yaml"],
+    },
+    start: "node apps/preview/dist/index.js",
+    healthcheck: "/healthz",
+    healthcheckTimeout: 60,
+    env: {
+      PORT: "8080",
+      DATABASE_URL: db.env.DATABASE_URL,
+      PREVIEW_DOMAIN: previewDomain,
+      // Links back to runs, and the only page allowed to frame the gateway's own pages.
+      PUBLIC_URL: publicUrl,
+      ...previewEnv,
     },
   });
 
   return project("factory-on-rails", {
-    resources: [group("Factory", [web, harness, runner]), group("Data", [db])],
+    resources: [group("Factory", production ? [web, harness, runner, preview] : [web, harness, runner]), group("Data", [db])],
   });
 });

@@ -1,5 +1,5 @@
-import { listConfig, snapshotsConfig, type SandboxSnapshot } from "@factory/core";
-import { Config, Context, Effect, Layer, Option } from "effect";
+import { listConfig, previewSigningKeyConfig, snapshotsConfig, type SandboxSnapshot } from "@factory/core";
+import { Config, Context, Effect, Layer, Option, Redacted } from "effect";
 
 export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
   HarnessConfig,
@@ -16,6 +16,8 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
     readonly snapshots: ReadonlyArray<SandboxSnapshot>;
     /** The Railway project this runs in (Railway sets it), where the setup page creates the sandbox environment. */
     readonly railwayProjectId: Option.Option<string>;
+    /** Where previews of sandbox ports are served; none when the preview gateway isn't set up. */
+    readonly preview: Option.Option<{ readonly domain: string; readonly signingKey: Redacted.Redacted<string> }>;
   }
 >() {
   static readonly Live = Layer.effect(
@@ -41,10 +43,20 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
       } else if (allowedLogins.includes("*")) {
         yield* Effect.logInfo("ALLOWED_GITHUB_LOGINS is *: any GitHub account can sign in.");
       }
+      const previewDomain = Option.filter(yield* Config.option(Config.string("PREVIEW_DOMAIN")), (d) => d.trim() !== "");
+      const previewKey = yield* previewSigningKeyConfig;
+      const preview = Option.all({
+        domain: Option.map(previewDomain, (d) => d.trim().toLowerCase().replace(/^\.|\.$/g, "")),
+        signingKey: previewKey,
+      });
+      if (Option.isSome(previewDomain) && Option.isNone(previewKey)) {
+        yield* Effect.logWarning("PREVIEW_DOMAIN is set but PREVIEW_SIGNING_KEY is missing or shorter than 32 characters: previews are off.");
+      }
       const { snapshots, errors } = yield* snapshotsConfig;
       for (const error of errors) yield* Effect.logWarning(`SANDBOX_SNAPSHOTS: ${error}`);
       return {
         snapshots,
+        preview,
         publicUrl: publicUrl.replace(/\/$/, ""),
         allowedLogins,
         sessionTtlSeconds: yield* Config.integer("SESSION_TTL_SECONDS").pipe(Config.withDefault(7 * 24 * 3600)),
