@@ -1,9 +1,17 @@
-import type { RunRow } from "@factory/core";
+import { PREVIEW_AGENT_SCRIPT, verifyPreviewGrant, type RunRow } from "@factory/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option } from "effect";
+import { Effect, Layer, Option, Redacted } from "effect";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
-import { HAS_SESSION_MARKER, MAX_DIFF_BYTES, NO_CHANGES_MARKER, TOKEN_FILE, UP_TO_DATE_MARKER } from "../src/plan.js";
+import {
+  HAS_SESSION_MARKER,
+  MAX_DIFF_BYTES,
+  NO_CHANGES_MARKER,
+  PREVIEW_AGENT_FILE,
+  PREVIEW_TOKEN_FILE,
+  TOKEN_FILE,
+  UP_TO_DATE_MARKER,
+} from "../src/plan.js";
 import { makeRunLog } from "../src/run-log.js";
 import { fakeGitHub, fakeSandboxes, recordingStore } from "./stubs.js";
 
@@ -65,7 +73,43 @@ const execute = (
 /** The line each command ran after the shared prelude (HOME and the GitHub token). */
 const firstLines = (commands: string[]) => commands.map((c) => c.split("\n")[2]);
 
+const PREVIEW_KEY = "s".repeat(40);
+const preview = Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make(PREVIEW_KEY) });
+
 describe("executeRun", () => {
+  it.effect("starts the sandbox's preview agent with this run's tunnel grant before the agent works", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes();
+      const store = recordingStore();
+      const { outcome } = yield* execute(sandboxes, store, { preview });
+      expect(outcome.status).toBe("succeeded");
+
+      const { files, modes, commands } = sandboxes.state;
+      expect(files[PREVIEW_AGENT_FILE]).toBe(PREVIEW_AGENT_SCRIPT);
+      expect(modes[PREVIEW_TOKEN_FILE]).toBe(0o600);
+      expect(verifyPreviewGrant(PREVIEW_KEY, files[PREVIEW_TOKEN_FILE], "tunnel")?.run).toBe(run.id);
+      const launch = commands.findIndex((c) => c.includes(`nohup node ${PREVIEW_AGENT_FILE}`));
+      expect(launch).toBeGreaterThan(-1);
+      expect(commands[launch]).toContain("FACTORY_PREVIEW_URL='wss://tunnel.preview.example/connect'");
+      expect(launch).toBeLessThan(commands.findIndex((c) => c.includes("run-agent")));
+    }),
+  );
+
+  it.effect("carries on without previews when the preview agent can't start, and without them when they are off", () =>
+    Effect.gen(function* () {
+      const broken = fakeSandboxes({ "nohup node": { exitCode: 127 } });
+      const store = recordingStore();
+      const { outcome, events } = yield* execute(broken, store, { preview });
+      expect(outcome.status).toBe("succeeded");
+      expect(events).toContain("info:Previews are unavailable this turn: the preview agent exited with 127");
+
+      const off = fakeSandboxes();
+      yield* execute(off);
+      expect(off.state.commands.some((c) => c.includes("preview-agent"))).toBe(false);
+      expect(off.state.files[PREVIEW_TOKEN_FILE]).toBeUndefined();
+    }),
+  );
+
   it.effect("runs the agent, pushes and opens a PR, and keeps the sandbox for the next turn", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();

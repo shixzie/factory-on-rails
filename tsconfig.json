@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/core" },
     { "path": "apps/harness" },
-    { "path": "apps/runner" }
+    { "path": "apps/runner" },
+    { "path": "apps/preview" }
   ]
 }

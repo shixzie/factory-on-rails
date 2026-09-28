@@ -1,5 +1,5 @@
-import { listConfig } from "@factory/core";
-import { Config, Context, Effect, Layer, Option } from "effect";
+import { listConfig, previewSigningKeyConfig } from "@factory/core";
+import { Config, Context, Effect, Layer, Option, Redacted } from "effect";
 
 export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
   HarnessConfig,
@@ -12,6 +12,8 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
      */
     readonly allowedLogins: ReadonlyArray<string>;
     readonly sessionTtlSeconds: number;
+    /** Where previews of sandbox ports are served; none when the preview gateway isn't set up. */
+    readonly preview: Option.Option<{ readonly domain: string; readonly signingKey: Redacted.Redacted<string> }>;
   }
 >() {
   static readonly Live = Layer.effect(
@@ -37,7 +39,17 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
       } else if (allowedLogins.includes("*")) {
         yield* Effect.logInfo("ALLOWED_GITHUB_LOGINS is *: any GitHub account can sign in.");
       }
+      const previewDomain = Option.filter(yield* Config.option(Config.string("PREVIEW_DOMAIN")), (d) => d.trim() !== "");
+      const previewKey = yield* previewSigningKeyConfig;
+      const preview = Option.all({
+        domain: Option.map(previewDomain, (d) => d.trim().toLowerCase().replace(/^\.|\.$/g, "")),
+        signingKey: previewKey,
+      });
+      if (Option.isSome(previewDomain) && Option.isNone(previewKey)) {
+        yield* Effect.logWarning("PREVIEW_DOMAIN is set but PREVIEW_SIGNING_KEY is missing or shorter than 32 characters: previews are off.");
+      }
       return {
+        preview,
         publicUrl: publicUrl.replace(/\/$/, ""),
         allowedLogins,
         sessionTtlSeconds: yield* Config.integer("SESSION_TTL_SECONDS").pipe(Config.withDefault(7 * 24 * 3600)),

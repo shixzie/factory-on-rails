@@ -6,6 +6,10 @@ import {
   isModelProvider,
   keyHint,
   MODEL_PROVIDERS,
+  openGrant,
+  PREVIEW_OPEN_PATH,
+  previewOrigin,
+  signPreviewGrant,
   Store,
   TokenCipher,
   validateApiKey,
@@ -14,7 +18,7 @@ import {
   type RunRow,
   type UserRow,
 } from "@factory/core";
-import { Data, Effect, Option, Schema } from "effect";
+import { Data, Effect, Option, Redacted, Schema } from "effect";
 import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from "./auth.js";
 import { HarnessConfig } from "./config.js";
 
@@ -60,6 +64,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   awaitingInput: r.awaiting_input,
   sandboxState: r.sandbox_state,
   lastActivityAt: r.last_activity_at,
+  previewPorts: r.preview_ports ?? null,
 });
 
 const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({
@@ -279,10 +284,12 @@ export const router = HttpRouter.empty.pipe(
       const { run } = yield* ownedRun;
       const page = yield* eventsPage(run.id);
       const diff = yield* (yield* Store).getDiff(run.id);
+      const { preview } = yield* HarnessConfig;
       return yield* json(Api.RunDetail)({
         run: toApiRun(run),
         ...page,
         diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
+        previewsEnabled: Option.isSome(preview),
       });
     }),
   ),
@@ -332,6 +339,25 @@ export const router = HttpRouter.empty.pipe(
       yield* store.requestCancel(run.id, user.id);
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
       return yield* json(Api.ApiRun)(toApiRun(updated));
+    }),
+  ),
+
+  // A one-time link that signs the owner's browser in to one port's preview
+  // origin (see packages/core/src/preview.ts). The gateway checks the grant;
+  // this is where ownership is checked.
+  HttpRouter.post(
+    "/api/runs/:id/previews",
+    Effect.gen(function* () {
+      const { user, run } = yield* ownedRun;
+      const { preview } = yield* HarnessConfig;
+      if (Option.isNone(preview)) return yield* fail(404, "previews_disabled", "Previews are not set up on this factory.");
+      const { port, path } = yield* HttpServerRequest.schemaBodyJson(Api.OpenPreviewBody);
+      const origin = previewOrigin(preview.value.domain, run.id, port);
+      const token = signPreviewGrant(Redacted.value(preview.value.signingKey), openGrant(run.id, port, user.id));
+      const url = new URL(PREVIEW_OPEN_PATH, origin);
+      url.searchParams.set("token", token);
+      if (path?.startsWith("/")) url.searchParams.set("path", path);
+      return yield* json(Api.PreviewLink)({ url: url.toString(), origin });
     }),
   ),
 

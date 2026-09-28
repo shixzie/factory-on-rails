@@ -1,5 +1,5 @@
-import { Api } from "@factory/core";
-import { Config, Context, Duration, Effect, Layer, Option } from "effect";
+import { Api, previewSigningKeyConfig } from "@factory/core";
+import { Config, Context, Duration, Effect, Layer, Option, type Redacted } from "effect";
 import { hostname } from "node:os";
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
@@ -51,6 +51,14 @@ export interface RunnerSettings {
   readonly lifecycleInterval: Duration.Duration;
   readonly agent: AgentSettings;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
+  /** Where sandboxes' preview agents connect, and the key their grants are signed with; none turns previews off. */
+  readonly preview: Option.Option<PreviewSettings>;
+}
+
+export interface PreviewSettings {
+  /** e.g. wss://tunnel.preview.example.com/connect */
+  readonly tunnelUrl: string;
+  readonly signingKey: Redacted.Redacted<string>;
 }
 
 const int = (name: string, fallback: number) => Config.integer(name).pipe(Config.withDefault(fallback));
@@ -95,7 +103,9 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
           authorEmail: str("GIT_AUTHOR_EMAIL", "factory-on-rails@users.noreply.github.com"),
         }),
       });
-      return { ...settings, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
+      const tunnelUrl = Option.filter(yield* Config.option(Config.string("PREVIEW_TUNNEL_URL")), (u) => u.trim() !== "");
+      const preview = Option.all({ tunnelUrl: Option.map(tunnelUrl, (u) => u.trim()), signingKey: yield* previewSigningKeyConfig });
+      return { ...settings, preview, agent: { ...settings.agent, passthroughEnv: yield* passthroughEnv } };
     }),
   );
 }

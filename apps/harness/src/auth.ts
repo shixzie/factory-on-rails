@@ -14,12 +14,19 @@ import { Data, Duration, Effect, Option, Schema } from "effect";
 import { HarnessConfig } from "./config.js";
 
 export const SESSION_COOKIE = "factory_session";
+export const STATE_COOKIE = "factory_oauth_state";
+
+/**
+ * Over HTTPS the cookies carry the `__Host-` prefix: the browser then only
+ * accepts them host-only, Secure and on `/`, so a page on a sibling subdomain
+ * (a sandbox preview on *.preview.<domain>, say) can't plant its own session
+ * or login state on the factory.
+ */
+export const cookieName = (publicUrl: string, name: string) => (publicUrl.startsWith("https://") ? `__Host-${name}` : name);
 
 /** `*` in the allowlist admits any GitHub account; otherwise logins match case-insensitively. */
 export const isAllowedLogin = (allowed: ReadonlyArray<string>, login: string): boolean =>
   allowed.includes("*") || allowed.includes(login.toLowerCase());
-export const STATE_COOKIE = "factory_oauth_state";
-
 /** No signed-in user: send them to the sign-in page. */
 export class Unauthorized extends Data.TaggedError("Unauthorized") {}
 
@@ -29,11 +36,15 @@ export class ReauthRequired extends Data.TaggedError("ReauthRequired") {}
 /** Sign-in refused, with a message for the sign-in page. */
 export class LoginRejected extends Data.TaggedError("LoginRejected")<{ readonly status: 400 | 403; readonly message: string }> {}
 
-const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
+const baseCookieOptions = (publicUrl: string) => ({
   httpOnly: true,
   secure: publicUrl.startsWith("https://"),
   sameSite: "lax" as const,
   path: "/",
+});
+
+const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
+  ...baseCookieOptions(publicUrl),
   maxAge: Duration.seconds(maxAgeSeconds),
 });
 
@@ -42,7 +53,8 @@ export const redirectUri = (publicUrl: string) => `${publicUrl}/auth/callback`;
 /** The signed-in user, from the session cookie. */
 export const currentUser = Effect.gen(function* () {
   const req = yield* HttpServerRequest.HttpServerRequest;
-  const token = req.cookies[SESSION_COOKIE];
+  const { publicUrl } = yield* HarnessConfig;
+  const token = req.cookies[cookieName(publicUrl, SESSION_COOKIE)];
   if (!token) return Option.none<UserRow>();
   return yield* (yield* Store).userForSession(sha256(token));
 });
@@ -57,7 +69,7 @@ export const beginLogin = Effect.gen(function* () {
   const github = yield* GitHubUserApi;
   const state = randomToken(16);
   return yield* HttpServerResponse.redirect(authorizeUrl(github.clientId, redirectUri(publicUrl), state)).pipe(
-    HttpServerResponse.setCookie(STATE_COOKIE, state, cookieOptions(publicUrl, 600)),
+    HttpServerResponse.setCookie(cookieName(publicUrl, STATE_COOKIE), state, cookieOptions(publicUrl, 600)),
   );
 });
 
@@ -75,7 +87,7 @@ export const completeLogin = Effect.gen(function* () {
   const cipher = yield* TokenCipher;
   const req = yield* HttpServerRequest.HttpServerRequest;
 
-  const expectedState = req.cookies[STATE_COOKIE];
+  const expectedState = req.cookies[cookieName(config.publicUrl, STATE_COOKIE)];
   const { code, state } = yield* HttpServerRequest.schemaSearchParams(
     Schema.Struct({ code: Schema.optional(Schema.String), state: Schema.optional(Schema.String) }),
   );
@@ -99,16 +111,22 @@ export const completeLogin = Effect.gen(function* () {
   const sessionToken = randomToken();
   yield* store.createSession(sha256(sessionToken), user.id, config.sessionTtlSeconds);
   return yield* HttpServerResponse.redirect("/").pipe(
-    HttpServerResponse.setCookie(SESSION_COOKIE, sessionToken, cookieOptions(config.publicUrl, config.sessionTtlSeconds)),
-    Effect.flatMap(HttpServerResponse.expireCookie(STATE_COOKIE, { path: "/" })),
+    HttpServerResponse.setCookie(
+      cookieName(config.publicUrl, SESSION_COOKIE),
+      sessionToken,
+      cookieOptions(config.publicUrl, config.sessionTtlSeconds),
+    ),
+    Effect.flatMap(HttpServerResponse.expireCookie(cookieName(config.publicUrl, STATE_COOKIE), baseCookieOptions(config.publicUrl))),
   );
 });
 
 export const logout = Effect.gen(function* () {
   const req = yield* HttpServerRequest.HttpServerRequest;
-  const token = req.cookies[SESSION_COOKIE];
+  const { publicUrl } = yield* HarnessConfig;
+  const name = cookieName(publicUrl, SESSION_COOKIE);
+  const token = req.cookies[name];
   if (token) yield* (yield* Store).deleteSession(sha256(token));
-  return yield* HttpServerResponse.redirect("/").pipe(HttpServerResponse.expireCookie(SESSION_COOKIE, { path: "/" }));
+  return yield* HttpServerResponse.redirect("/").pipe(HttpServerResponse.expireCookie(name, baseCookieOptions(publicUrl)));
 });
 
 /** A usable user access token, refreshed when it is about to expire. */

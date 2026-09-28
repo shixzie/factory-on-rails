@@ -1,8 +1,8 @@
-import { GitHubAppApi, GitHubError, Store, type RunRow } from "@factory/core";
+import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type RunRow } from "@factory/core";
 import { Data, Duration, Effect, Option, Redacted, Schedule } from "effect";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
-import type { AgentSettings } from "./config.js";
+import type { AgentSettings, PreviewSettings } from "./config.js";
 import {
   AGENT_RAN_FILE,
   branchName,
@@ -17,6 +17,9 @@ import {
   WORKFLOWS_PERMISSION_REFUSAL,
   commitMessage,
   NO_CHANGES_MARKER,
+  PREVIEW_AGENT_FILE,
+  PREVIEW_TOKEN_FILE,
+  previewAgentScript,
   publishScript,
   pullRequestBody,
   REPO_DIR,
@@ -47,6 +50,8 @@ export interface ExecuteOptions {
   readonly agent: Omit<AgentSettings, "passthroughEnv"> & { readonly env: Record<string, string> };
   readonly git: { readonly authorName: string; readonly authorEmail: string };
   readonly harnessUrl: Option.Option<string>;
+  /** Starts the sandbox's preview agent each turn when set. */
+  readonly preview?: Option.Option<PreviewSettings>;
   readonly heartbeatEvery?: Duration.DurationInput;
   /** How often the user's new messages are handed to the running agent. */
   readonly inboxEvery?: Duration.DurationInput;
@@ -114,7 +119,10 @@ const openPullRequest = (run: RunRow, token: Redacted.Redacted<string>, branch: 
  * The sandbox is left running for the next turn once it holds the checkout;
  * the runner stops it when it sits idle (see worker.ts).
  */
-const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions) =>
+const work = (
+  run: RunRow,
+  { log, agent, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions,
+) =>
   Effect.gen(function* () {
     const sandboxes = yield* Sandboxes;
     const github = yield* GitHubAppApi;
@@ -221,6 +229,19 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
     for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
 
     yield* step("Preparing the agent", agent.setupCommand);
+
+    // Lets the user open servers running in the sandbox (see packages/core/src/preview.ts).
+    // Previews are a convenience: if this fails the turn carries on without them.
+    if (Option.isSome(preview)) {
+      yield* Effect.gen(function* () {
+        const grant = signPreviewGrant(Redacted.value(preview.value.signingKey), tunnelGrant(run.id));
+        log.addSecret(grant);
+        yield* sandbox.writeFile(PREVIEW_TOKEN_FILE, grant, 0o600);
+        yield* sandbox.writeFile(PREVIEW_AGENT_FILE, PREVIEW_AGENT_SCRIPT);
+        const started = yield* sandbox.exec(withHome(previewAgentScript(preview.value.tunnelUrl)), { timeoutSec: 30 });
+        if (started.exitCode !== 0) yield* log.info(`Previews are unavailable this turn: the preview agent exited with ${started.exitCode}`);
+      }).pipe(Effect.catchAll((err) => log.info(`Previews are unavailable this turn: ${err.message}`)));
+    }
 
     // What the agent is doing, as the run page shows it: its stream parsed into
     // events, the questions it is waiting on, and whether files may have changed.
