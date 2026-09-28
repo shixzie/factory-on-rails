@@ -90,7 +90,7 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
         const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
         const run = yield* queueRun;
-        yield* waitForRun(run.id, () => sandboxes.state.commands.includes("run-agent"));
+        yield* waitForRun(run.id, () => sandboxes.state.commands.some((c) => c.includes("run-agent")));
 
         yield* Effect.flatMap(Store, (store) => store.requestCancel(run.id, run.user_id));
         const finished = yield* waitForRun(run.id, (r) => r.status === "cancelled");
@@ -107,7 +107,7 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
         const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
         const run = yield* queueRun;
-        yield* waitForRun(run.id, () => sandboxes.state.commands.includes("run-agent"));
+        yield* waitForRun(run.id, () => sandboxes.state.commands.some((c) => c.includes("run-agent")));
 
         yield* Fiber.interrupt(worker);
         const [row] = yield* Effect.flatMap(
