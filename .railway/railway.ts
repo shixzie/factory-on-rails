@@ -22,6 +22,8 @@ export default defineRailway((ctx) => {
 
   // The harness is served on a custom domain in production (DNS via Cloudflare,
   // SSL mode Full). Other environments use their generated Railway domain.
+  // Change the domain, its port or PUBLIC_URL here rather than in the
+  // dashboard: a dashboard edit invalidates any open PR's pinned plan.
   const production = ctx.isEnvironment("production");
   const harnessUrl = production ? "https://factory.shixzie.com" : "https://${{harness.RAILWAY_PUBLIC_DOMAIN}}";
 
@@ -37,9 +39,9 @@ export default defineRailway((ctx) => {
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
     // Pin the port so the custom domain's target port always matches.
-    domains: production ? [{ domain: "factory.shixzie.com", port: 3000 }] : [],
+    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
     env: {
-      PORT: "3000",
+      PORT: "8080",
       PUBLIC_URL: harnessUrl,
       DATABASE_URL: db.env.DATABASE_URL,
       GITHUB_APP_SLUG: ctx.shared.GITHUB_APP_SLUG,
