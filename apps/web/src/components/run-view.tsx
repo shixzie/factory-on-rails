@@ -17,18 +17,20 @@ import { toast } from "sonner";
 import { ChangedFiles, DiffPanel, DiffStat, useDiffFiles } from "@/components/diff-view";
 import { PageHeader } from "@/components/page-header";
 import { RunActivity } from "@/components/run-activity";
-import { isActive, StatusLabel } from "@/components/run-status";
+import { isActive, SandboxLabel, sandboxHint, StatusLabel } from "@/components/run-status";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { openQuestion, toBlocks } from "@/lib/activity";
-import { api, runInBrowser, type Api } from "@/lib/api";
+import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
 import { ago, duration, taskTitle } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const POLL_MS = 2000;
+/** While a finished run's sandbox is up, check now and then whether it has been stopped. */
+const SANDBOX_POLL_MS = 15_000;
 
 /** Re-renders every second while `on`, for live durations. */
 function useNow(on: boolean) {
@@ -41,14 +43,22 @@ function useNow(on: boolean) {
   return now;
 }
 
-/** The box at the bottom while a run is live: answers and new direction go straight to the agent. */
+/**
+ * The box at the bottom of a run. While it is live, answers and new direction
+ * go straight to the agent; once it has finished, a message starts its next turn.
+ */
 function MessageComposer({
   question,
+  live,
+  hint,
   disabled,
   sending,
   onSend,
 }: {
   question: boolean;
+  live: boolean;
+  /** What happens when you send, once the run has finished. */
+  hint?: string;
   disabled: boolean;
   sending: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -87,13 +97,19 @@ function MessageComposer({
         }}
         disabled={disabled}
         rows={2}
-        placeholder={question ? "Answer the agent's question…" : "Send the agent a message while it works…"}
+        placeholder={
+          question ? "Answer the agent's question…" : live ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
+        }
         aria-label="Message to the agent"
         className="field-sizing-content block max-h-60 min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
       />
       <div className="flex items-center gap-2 px-2.5 pb-2.5">
-        <span className="px-1.5 text-[11px] text-muted-foreground">
-          {question ? "The agent is waiting for you." : "It reads your message after its current step."}
+        <span className="min-w-0 px-1.5 text-[11px] text-muted-foreground">
+          {question
+            ? "The agent is waiting for you."
+            : live
+              ? "It reads your message after its current step."
+              : (hint ?? "The agent picks up where it left off.")}
         </span>
         <span className="ml-auto hidden items-center gap-1 text-[11px] text-muted-foreground sm:inline-flex">
           <Kbd>⌘</Kbd>
@@ -153,7 +169,7 @@ function Outcome({ run }: { run: Api.ApiRun }) {
  * said and did (polled while the run is live), questions it asked, and the
  * outcome, with the files it changed in a diff panel beside it.
  */
-export function RunView({ initial, children }: { initial: Api.RunDetail; children?: React.ReactNode }) {
+export function RunView({ initial }: { initial: Api.RunDetail }) {
   const router = useRouter();
   const [run, setRun] = useState(initial.run);
   const [events, setEvents] = useState(initial.events);
@@ -163,6 +179,8 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
   const [cancelling, startCancel] = useTransition();
   const [sending, setSending] = useState(false);
   const active = isActive(run.status);
+  // A finished run's sandbox is stopped after a few idle minutes; keep the label honest.
+  const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
   const now = useNow(active);
   const bottomRef = useRef<HTMLDivElement>(null);
   const pollNow = useRef<() => void>(() => {});
@@ -170,7 +188,7 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
   // Poll for new activity while the run is live (and page through a long
   // finished run); refresh the sidebar when the run settles.
   useEffect(() => {
-    if (!isActive(run.status) && !initial.hasMore) return;
+    if (!isActive(run.status) && !initial.hasMore && !sandboxUp) return;
     let stopped = false;
     let after = events.at(-1)?.id ?? "0";
     let diffAt = diff?.updatedAt.getTime() ?? 0;
@@ -198,7 +216,8 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
         if (page.hasMore) delay = 0;
         else if (!isActive(page.run.status)) {
           if (isActive(run.status)) router.refresh();
-          return;
+          if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return;
+          delay = SANDBOX_POLL_MS;
         }
       }
       timer = setTimeout(tick, delay);
@@ -208,14 +227,14 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
       clearTimeout(timer);
       void tick();
     };
-    timer = setTimeout(tick, initial.hasMore ? 0 : POLL_MS);
+    timer = setTimeout(tick, initial.hasMore ? 0 : active ? POLL_MS : SANDBOX_POLL_MS);
     return () => {
       stopped = true;
       clearTimeout(timer);
       pollNow.current = () => {};
     };
-    // Restart only when the run or its liveness changes; cursors are tracked inside.
-  }, [run.id, active]);
+    // Restart only when the run, its liveness or its sandbox changes; cursors are tracked inside.
+  }, [run.id, active, sandboxUp]);
 
   // The sidebar shows which runs need an answer; keep it in step.
   const awaiting = run.awaitingInput;
@@ -260,6 +279,8 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
     }
     setRun(result.right);
     pollNow.current();
+    // A message to a finished run starts its next turn; the sidebar shows it working again.
+    if (!active) router.refresh();
     return true;
   };
 
@@ -267,7 +288,9 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
   const elapsed = duration(started, run.finishedAt ?? new Date(now));
   const liveLabel =
     run.status === "queued"
-      ? "Waiting for a sandbox"
+      ? run.sandboxState === "stopped" || run.sandboxState === "stopping"
+        ? "Starting the sandbox again"
+        : "Waiting for a sandbox"
       : run.status === "cancelling"
         ? "Stopping the agent"
         : question
@@ -310,6 +333,7 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
           {run.repo}
         </Badge>
         <StatusLabel status={run.status} awaiting={run.awaitingInput} className="shrink-0" />
+        <SandboxLabel state={run.sandboxState} className="hidden shrink-0 md:inline-flex" />
       </PageHeader>
 
       <div className="flex flex-1">
@@ -338,7 +362,10 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
                   <span suppressHydrationWarning>{liveLabel}</span>
                 </div>
               ) : run.startedAt ? (
-                <div className="px-1 text-[11px] text-muted-foreground">Worked for {elapsed}</div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-muted-foreground">
+                  <span>Worked for {elapsed}</span>
+                  <SandboxLabel state={run.sandboxState} className="md:hidden" />
+                </div>
               ) : null}
 
               <ChangedFiles files={files} onOpen={openDiff} />
@@ -347,13 +374,21 @@ export function RunView({ initial, children }: { initial: Api.RunDetail; childre
             </div>
           </div>
 
-          {active ? (
-            <div className="sticky bottom-0 bg-gradient-to-t from-background via-background to-transparent px-4 pt-6 pb-4">
-              <MessageComposer question={!!question} disabled={run.status === "cancelling"} sending={sending} onSend={send} />
-            </div>
-          ) : (
-            children
-          )}
+          <div className="sticky bottom-0 bg-gradient-to-t from-background via-background to-transparent px-4 pt-6 pb-4">
+            <MessageComposer
+              question={!!question}
+              live={active}
+              hint={sandboxHint(run.sandboxState)}
+              disabled={run.status === "cancelling"}
+              sending={sending}
+              onSend={send}
+            />
+            {!active ? (
+              <p className="mx-auto mt-2 max-w-3xl px-1 text-center text-[11px] text-muted-foreground/80">
+                Runs are deleted after {Api.RUN_RETENTION_DAYS} days without activity, along with their sandbox.
+              </p>
+            ) : null}
+          </div>
         </div>
 
         {diffOpen ? (

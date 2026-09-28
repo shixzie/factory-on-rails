@@ -5,10 +5,12 @@ import {
   Store,
   TokenCipher,
   type RunRow,
+  type RunSandbox,
 } from "@factory/core";
-import { Effect, FiberSet, Option, Queue, Schedule, Stream } from "effect";
+import { Duration, Effect, FiberSet, Option, Queue, Schedule, Stream } from "effect";
 import { RunnerConfig } from "./config.js";
 import { executeRun } from "./execute.js";
+import { SCRUB_SCRIPT, withHome } from "./plan.js";
 import { makeRunLog } from "./run-log.js";
 import { Sandboxes } from "./sandbox.js";
 
@@ -58,28 +60,111 @@ export const handleRun = (run: RunRow) =>
     yield* Effect.logInfo(`Run ${outcome.status}`);
   }).pipe(
     Effect.scoped,
-    // A stopping runner (redeploy, scale down) interrupts its runs: the sandbox
-    // is torn down on the way out and the run is marked failed, not left hanging.
+    // A stopping runner (redeploy, scale down) interrupts its runs: the agent is
+    // killed and the run is marked failed, not left hanging. Its sandbox is kept,
+    // so a message picks the run up again where it stopped.
     Effect.onInterrupt(() =>
       Effect.flatMap(Store, (store) =>
-        store.finishRun(run.id, "failed", "The runner stopped before this run finished. Start it again."),
+        store.finishRun(run.id, "failed", "The runner stopped before this run finished. Send a message to pick it up again."),
       ).pipe(Effect.ignore),
     ),
     Effect.catchAllCause((cause) => Effect.logError("Run crashed", cause)),
     Effect.annotateLogs({ run: run.id, repo: run.repo_full_name }),
   );
 
-/** Fails runs whose runner died and tears down the sandboxes they left behind. */
+/**
+ * Fails runs whose runner died. Their sandboxes stay, and are stopped like any
+ * other idle sandbox (see stopIdleSandboxes).
+ */
 export const reap = Effect.gen(function* () {
   const config = yield* RunnerConfig;
   const store = yield* Store;
-  const sandboxes = yield* Sandboxes;
   for (const stale of yield* store.reapStaleRuns(config.staleRunSeconds)) {
     yield* Effect.logWarning(`Reaped stale run ${stale.id}`);
-    if (stale.sandbox_id) {
-      yield* sandboxes.destroy(stale.sandbox_id).pipe(Effect.catchAll((err) => Effect.logWarning(err.message)));
-    }
   }
+});
+
+/** A runner that died mid-stop gives the sandbox back after this long. */
+const STOPPING_STALE_SECONDS = 15 * 60;
+
+/** Unique per stop: Railway wants a fresh name for each checkpoint. */
+export const checkpointName = (runId: string, now = Date.now()) => `run-${runId}-${now.toString(36)}`;
+
+/**
+ * Stops one idle sandbox: Railway can't pause a sandbox, so its disk is saved
+ * as a checkpoint and the VM destroyed. The next message boots a new sandbox
+ * from the checkpoint (see execute.ts). A sandbox that can't be saved is
+ * destroyed anyway, and the next turn starts over from the pushed branch.
+ */
+const stopSandbox = (run: RunSandbox) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const sandboxes = yield* Sandboxes;
+    const gone = (note?: string) =>
+      Effect.zipRight(
+        store.updateRun(run.id, { sandbox_state: "deleted", sandbox_checkpoint_id: null, sandbox_checkpoint_name: null }),
+        note ? store.appendEvents(run.id, [{ kind: "info", message: note }]) : Effect.void,
+      );
+
+    const handle = run.sandbox_id ? yield* sandboxes.connect(run.sandbox_id) : Option.none();
+    // Already gone, e.g. Railway's own idle timeout got there first.
+    if (Option.isNone(handle)) return yield* gone();
+    const id = handle.value.id;
+
+    yield* handle.value.exec(withHome(SCRUB_SCRIPT), { timeoutSec: 30 }).pipe(Effect.ignore);
+    const saved = yield* sandboxes.checkpoint(id, checkpointName(run.id)).pipe(Effect.either);
+    if (saved._tag === "Left") {
+      yield* Effect.logWarning(saved.left.message);
+      yield* sandboxes.destroy(id);
+      return yield* gone(
+        "The sandbox could not be saved before it was stopped, so the next message starts a new one from the branch.",
+      );
+    }
+    // Saved, so record it as stopped even if this fails: Railway's idle timeout removes the VM.
+    yield* sandboxes.destroy(id).pipe(Effect.catchAll((err) => Effect.logWarning(err.message)));
+    yield* store.updateRun(run.id, {
+      sandbox_state: "stopped",
+      sandbox_checkpoint_id: saved.right.id,
+      sandbox_checkpoint_name: saved.right.name,
+    });
+    yield* Effect.logInfo(`Stopped idle sandbox ${id}`);
+  }).pipe(
+    // Left `stopping`; another pass takes it back after STOPPING_STALE_SECONDS.
+    Effect.catchAllCause((cause) => Effect.logWarning("Could not stop the sandbox", cause)),
+    Effect.annotateLogs({ run: run.id }),
+  );
+
+/** Stops the sandboxes of finished runs nobody has touched for `sandboxIdleStop`. */
+export const stopIdleSandboxes = Effect.gen(function* () {
+  const config = yield* RunnerConfig;
+  const store = yield* Store;
+  const idle = yield* store.claimIdleSandboxes(Duration.toSeconds(config.sandboxIdleStop), STOPPING_STALE_SECONDS, 10);
+  yield* Effect.forEach(idle, stopSandbox, { concurrency: 3, discard: true });
+});
+
+/** Deletes one expired run: its sandbox or checkpoint first, then the run, its events and its diff. */
+const deleteRun = (run: RunSandbox, days: number) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const sandboxes = yield* Sandboxes;
+    if (run.sandbox_state === "running" && run.sandbox_id) yield* sandboxes.destroy(run.sandbox_id);
+    if (run.sandbox_checkpoint_id) yield* sandboxes.deleteCheckpoint(run.sandbox_checkpoint_id);
+    // Not deleted if the user came back meanwhile; the next turn starts a new sandbox.
+    if (yield* store.deleteExpiredRun(run.id, days)) {
+      yield* Effect.logInfo(`Deleted run ${run.id} after ${days} days without activity`);
+    }
+  }).pipe(
+    // Tried again on the next pass.
+    Effect.catchAllCause((cause) => Effect.logWarning("Could not delete the expired run", cause)),
+    Effect.annotateLogs({ run: run.id }),
+  );
+
+/** Deletes runs with no activity for `runRetentionDays`, along with their sandboxes. */
+export const deleteExpiredRuns = Effect.gen(function* () {
+  const config = yield* RunnerConfig;
+  const store = yield* Store;
+  const expired = yield* store.expiredRuns(config.runRetentionDays, 20);
+  yield* Effect.forEach(expired, (run) => deleteRun(run, config.runRetentionDays), { concurrency: 3, discard: true });
 });
 
 /** Claims and runs queued runs until interrupted; interrupting it stops every run in flight. */
@@ -103,6 +188,11 @@ export const runner = Effect.gen(function* () {
   yield* reap.pipe(
     Effect.catchAllCause((cause) => Effect.logError("Reaper failed", cause)),
     Effect.repeat(Schedule.spaced(config.pollInterval)),
+    Effect.forkScoped,
+  );
+  yield* Effect.zipRight(stopIdleSandboxes, deleteExpiredRuns).pipe(
+    Effect.catchAllCause((cause) => Effect.logError("Sandbox cleanup failed", cause)),
+    Effect.repeat(Schedule.spaced(config.lifecycleInterval)),
     Effect.forkScoped,
   );
 

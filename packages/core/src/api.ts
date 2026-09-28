@@ -8,6 +8,15 @@ import { Schema } from "effect";
 export const RunStatus = Schema.Literal("queued", "running", "cancelling", "succeeded", "failed", "cancelled");
 export type RunStatus = typeof RunStatus.Type;
 
+/** Where a run's sandbox is; see `SandboxState` in the store. */
+export const SandboxState = Schema.Literal("none", "running", "stopping", "stopped", "deleted");
+export type SandboxState = typeof SandboxState.Type;
+
+/** A finished run's sandbox is stopped (checkpointed, then destroyed) after this long without activity. */
+export const SANDBOX_IDLE_STOP_MINUTES = 5;
+/** A run with no activity for this long is deleted, with its sandbox. */
+export const RUN_RETENTION_DAYS = 7;
+
 export const ApiUser = Schema.Struct({
   login: Schema.String,
   name: Schema.NullOr(Schema.String),
@@ -47,6 +56,9 @@ export const ApiRun = Schema.Struct({
   finishedAt: Schema.NullOr(Schema.Date),
   /** The agent asked a question and is waiting for the user's answer. */
   awaitingInput: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  sandboxState: Schema.optionalWith(SandboxState, { default: () => "none" as const }),
+  /** The last agent activity or user message; the run is deleted `RUN_RETENTION_DAYS` after it. */
+  lastActivityAt: Schema.optionalWith(Schema.NullOr(Schema.Date), { default: () => null }),
 });
 export type ApiRun = typeof ApiRun.Type;
 
@@ -104,7 +116,10 @@ export const RunEventsPage = Schema.Struct({
 });
 export type RunEventsPage = typeof RunEventsPage.Type;
 
-/** A message to a running agent: an answer to its question, or new direction. */
+/**
+ * A message to the agent: an answer to its question or new direction while it
+ * runs, or, once it has finished, the next turn of the conversation.
+ */
 export const SendMessageBody = Schema.Struct({ text: Schema.String });
 export type SendMessageBody = typeof SendMessageBody.Type;
 

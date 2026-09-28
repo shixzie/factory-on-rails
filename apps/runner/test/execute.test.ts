@@ -3,7 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Option } from "effect";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
-import { MAX_DIFF_BYTES, NO_CHANGES_MARKER } from "../src/plan.js";
+import { HAS_SESSION_MARKER, MAX_DIFF_BYTES, NO_CHANGES_MARKER, TOKEN_FILE, UP_TO_DATE_MARKER } from "../src/plan.js";
 import { makeRunLog } from "../src/run-log.js";
 import { fakeGitHub, fakeSandboxes, recordingStore } from "./stubs.js";
 
@@ -13,7 +13,23 @@ const run = {
   installation_id: "42",
   base_branch: "main",
   task: "Add a README\n\nWith a heading.",
+  turns: 1,
+  sandbox_id: null,
+  sandbox_state: "none",
+  sandbox_checkpoint_id: null,
+  sandbox_checkpoint_name: null,
+  pull_request_url: null,
+  delivered_message_id: "0",
 } as RunRow;
+
+const PR = "https://github.com/shixzie/demo/pull/1";
+
+/** The same run on its next turn, after the user sent `message` (event id 5). */
+const followUp = (patch: Partial<RunRow>) => ({ ...run, turns: 2, branch: "factory/run-0123abcd", pull_request_url: PR, ...patch }) as RunRow;
+const withMessage = (store = recordingStore(), text = "Also add a license") => {
+  store.userMessages.push({ id: "5", run_id: run.id, at: new Date(0), kind: "user_message", message: text, data: null });
+  return store;
+};
 
 const agent: ExecuteOptions["agent"] = {
   setupCommand: "setup-agent",
@@ -27,19 +43,23 @@ const execute = (
   sandboxes: ReturnType<typeof fakeSandboxes>,
   store = recordingStore(),
   extra: Partial<ExecuteOptions> = {},
+  { turn = run, prOpen = false }: { turn?: RunRow; prOpen?: boolean } = {},
 ) => {
   const github: unknown[][] = [];
   return Effect.gen(function* () {
     const log = yield* makeRunLog(run.id);
     log.addSecret(agent.env.ANTHROPIC_API_KEY!);
-    const outcome = yield* executeRun(run, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ...extra });
+    const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ...extra });
     yield* log.flush;
     return { outcome, github, events: store.events.map((e) => `${e.kind}:${e.message}`) };
-  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github))));
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { prOpen }))));
 };
 
+/** The line each command ran after the shared prelude (HOME and the GitHub token). */
+const firstLines = (commands: string[]) => commands.map((c) => c.split("\n")[2]);
+
 describe("executeRun", () => {
-  it.effect("runs the agent, pushes and opens a PR, then destroys the sandbox", () =>
+  it.effect("runs the agent, pushes and opens a PR, and keeps the sandbox for the next turn", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
       const store = recordingStore();
@@ -51,7 +71,10 @@ describe("executeRun", () => {
         42,
         { repositories: ["demo"], permissions: { contents: "write", pull_requests: "write", metadata: "read" } },
       ]);
-      expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", GH_TOKEN: "ghs_repo_token", IS_SANDBOX: "1" });
+      expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", IS_SANDBOX: "1" });
+      // The token goes in a file each turn (it expires), readable only by its owner.
+      expect(sandboxes.state.files[TOKEN_FILE]).toBe("ghs_repo_token");
+      expect(sandboxes.state.modes[TOKEN_FILE]).toBe(0o600);
       expect(github[1]).toEqual([
         "createPullRequest",
         "ghs_repo_token",
@@ -59,7 +82,8 @@ describe("executeRun", () => {
         expect.objectContaining({ title: "Add a README", head: "factory/run-0123abcd", base: "main" }),
       ]);
       expect(sandboxes.state.commands.every((c) => c.startsWith('export HOME="${HOME:-/root}"\n'))).toBe(true);
-      expect(sandboxes.state.commands.map((c) => c.split("\n")[1])).toEqual([
+      expect(sandboxes.state.commands[0]).toContain(`export GH_TOKEN="$(cat ${TOKEN_FILE})"`);
+      expect(firstLines(sandboxes.state.commands)).toEqual([
         expect.stringMatching(/^for i in/),
         "set -eu",
         "setup-agent",
@@ -76,11 +100,19 @@ describe("executeRun", () => {
         FACTORY_MCP_CONFIG: "/workspace/.factory/mcp.json",
         FACTORY_SETTINGS_FILE: "/workspace/.factory/settings.json",
       });
+      expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
+      expect(sandboxes.state.files["/workspace/TASK.md"]).toBe(run.task);
       expect(store.updates).toEqual([
-        { sandbox_id: "sbx_1", branch: "factory/run-0123abcd" },
-        { pull_request_url: "https://github.com/shixzie/demo/pull/1" },
+        {
+          sandbox_id: "sbx_1",
+          branch: "factory/run-0123abcd",
+          sandbox_state: "running",
+          sandbox_checkpoint_id: null,
+          sandbox_checkpoint_name: null,
+        },
+        { pull_request_url: PR },
       ]);
-      expect(sandboxes.state.destroyed).toBe(true);
+      expect(sandboxes.state.destroyed).toBe(false);
     }),
   );
 
@@ -90,18 +122,17 @@ describe("executeRun", () => {
       const { outcome, github } = yield* execute(sandboxes);
       expect(outcome).toEqual({ status: "succeeded" });
       expect(github.map((c) => c[0])).toEqual(["installationToken"]);
-      expect(sandboxes.state.destroyed).toBe(true);
+      expect(sandboxes.state.destroyed).toBe(false);
     }),
   );
 
-  it.effect("fails when the agent exits non-zero, and still cleans up", () =>
+  it.effect("fails when the agent exits non-zero, and keeps the sandbox so a message can carry on", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes({ "run-agent": { exitCode: 2 } });
       const { outcome, events } = yield* execute(sandboxes);
       expect(outcome).toEqual({ status: "failed", error: "Running the agent: exited with code 2" });
-      expect(events).toContain("error:Running the agent: exited with code 2");
-      expect(events.at(-1)).toBe("info:Sandbox destroyed");
-      expect(sandboxes.state.destroyed).toBe(true);
+      expect(events.at(-1)).toBe("error:Running the agent: exited with code 2");
+      expect(sandboxes.state.destroyed).toBe(false);
     }),
   );
 
@@ -113,14 +144,16 @@ describe("executeRun", () => {
           stdout: "Railway recovery console: your sandbox VM has lost outbound network connectivity.\n",
         },
       });
-      const { outcome } = yield* execute(sandboxes);
+      const { outcome, events } = yield* execute(sandboxes);
       expect(outcome).toEqual({
         status: "failed",
         error:
           "Checking the sandbox can reach GitHub: the Railway sandbox has no outbound network (it started in Railway's recovery console). Try the run again.",
       });
       expect(sandboxes.state.commands).toHaveLength(1);
+      // It never got a checkout, so it is no use to a later turn.
       expect(sandboxes.state.destroyed).toBe(true);
+      expect(events.at(-1)).toBe("info:Sandbox destroyed");
     }),
   );
 
@@ -131,7 +164,7 @@ describe("executeRun", () => {
     }),
   );
 
-  it.live("stops the agent and destroys the sandbox when the run is cancelled", () =>
+  it.live("stops the agent when the run is cancelled, and keeps the sandbox", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
       // Report cancellation once the agent is running.
@@ -141,7 +174,7 @@ describe("executeRun", () => {
       expect(outcome).toEqual({ status: "cancelled" });
       expect(sandboxes.state.killed).toBe(true);
       expect(sandboxes.state.commands).not.toContainEqual(expect.stringContaining("git push"));
-      expect(sandboxes.state.destroyed).toBe(true);
+      expect(sandboxes.state.destroyed).toBe(false);
       expect(events).toContain("info:Run cancelled");
     }),
   );
@@ -216,4 +249,96 @@ describe("executeRun", () => {
       expect(flags).toEqual([{ awaiting_input: true }, { awaiting_input: false }]);
     }),
   );
+
+  describe("a later turn", () => {
+    it.effect("continues the agent's session in the sandbox the last turn left running", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ "git remote set-url": { stdout: `${HAS_SESSION_MARKER}\n` } }, { alive: ["sbx_live"] });
+        const store = withMessage();
+        const turn = followUp({ sandbox_state: "running", sandbox_id: "sbx_live", delivered_message_id: "3" });
+        const { outcome, events, github } = yield* execute(sandboxes, store, {}, { turn, prOpen: true });
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.createdWith).toBeUndefined();
+        expect(firstLines(sandboxes.state.commands)).toEqual([
+          expect.stringMatching(/^for i in/),
+          "set -eu",
+          "setup-agent",
+          "run-agent",
+          "set -eu",
+          "set -eu",
+        ]);
+        expect(sandboxes.state.commands[1]).toContain("git remote set-url origin https://github.com/shixzie/demo.git");
+        expect(sandboxes.state.commands[1]).not.toContain("git clone");
+        expect(sandboxes.state.envs[3]).toMatchObject({ FACTORY_CONTINUE: "1" });
+        // The agent remembers the task; it only needs what the user said since.
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Also add a license");
+        expect(sandboxes.state.files["/workspace/COMMIT_MSG"]).toMatch(/^Also add a license\n/);
+        expect(store.updates).toContainEqual({ delivered_message_id: "5" });
+        // The PR from the first turn is still open, so the push lands there.
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest"]);
+        expect(events).toContain(`info:Pushed the changes to ${PR}`);
+        expect(store.updates).not.toContainEqual({ pull_request_url: expect.anything() });
+        expect(sandboxes.state.destroyed).toBe(false);
+      }),
+    );
+
+    it.effect("boots a stopped sandbox from its checkpoint, then deletes the checkpoint", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ "git push": { stdout: `${UP_TO_DATE_MARKER}\n` } }, { checkpoints: { cp_9: "run-x" } });
+        const turn = followUp({ sandbox_state: "stopped", sandbox_id: "sbx_old", sandbox_checkpoint_id: "cp_9", sandbox_checkpoint_name: "run-x" });
+        const store = withMessage();
+        const { outcome, events, github } = yield* execute(sandboxes, store, {}, { turn });
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.restoredFrom).toBe("run-x");
+        expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", IS_SANDBOX: "1" });
+        expect(sandboxes.state.deletedCheckpoints).toEqual(["cp_9"]);
+        expect(store.updates[0]).toMatchObject({ sandbox_id: "sbx_restored", sandbox_state: "running", sandbox_checkpoint_id: null });
+        expect(events).toContain("info:No new changes this turn");
+        expect(github.map((c) => c[0])).toEqual(["installationToken"]);
+        // No session to continue (the agent never ran here), so it gets the whole story.
+        expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
+        const task = sandboxes.state.files["/workspace/TASK.md"]!;
+        expect(task).toContain("Add a README");
+        expect(task).toContain("Also add a license");
+      }),
+    );
+
+    it.effect("starts a new sandbox from the pushed branch when the old one can't come back", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { failRestore: "checkpoint not found" });
+        const turn = followUp({ sandbox_state: "stopped", sandbox_checkpoint_id: "cp_9", sandbox_checkpoint_name: "run-x" });
+        const { outcome, events } = yield* execute(sandboxes, withMessage(), {}, { turn, prOpen: true });
+
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(events).toContain("info:checkpoint not found. Starting a new sandbox from the branch instead");
+        expect(events).toContain("info:Cloning shixzie/demo@factory/run-0123abcd");
+        expect(sandboxes.state.commands[1]).toContain("git fetch -q --depth 50 origin 'refs/heads/factory/run-0123abcd");
+        expect(sandboxes.state.deletedCheckpoints).toEqual(["cp_9"]);
+      }),
+    );
+
+    it.effect("starts a new sandbox when the running one is gone", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes();
+        const turn = followUp({ sandbox_state: "running", sandbox_id: "sbx_gone" });
+        const { events } = yield* execute(sandboxes, withMessage(), {}, { turn, prOpen: true });
+        expect(events).toContain("info:The sandbox from the last turn is gone, so this turn starts a new one");
+        expect(sandboxes.state.createdWith).toBeDefined();
+      }),
+    );
+
+    it.effect("opens a new PR when the earlier one was merged", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const store = recordingStore();
+        const turn = followUp({ sandbox_state: "running", sandbox_id: "sbx_live", pull_request_url: "https://github.com/shixzie/demo/pull/0" });
+        const { outcome, events } = yield* execute(sandboxes, withMessage(store), {}, { turn });
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(events).toContain(`info:Opened ${PR}`);
+        expect(store.updates).toContainEqual({ pull_request_url: PR });
+      }),
+    );
+  });
 });

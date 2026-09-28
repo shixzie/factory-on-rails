@@ -5,22 +5,27 @@ import { Duration, Effect, Fiber, Layer, Option, Schedule } from "effect";
 import { randomBytes } from "node:crypto";
 import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { RunnerConfig } from "../src/config.js";
-import { runner } from "../src/worker.js";
+import { HAS_SESSION_MARKER } from "../src/plan.js";
+import { deleteExpiredRuns, runner } from "../src/worker.js";
 import { fakeGitHub, fakeSandboxes } from "./stubs.js";
 
 const key = randomBytes(32);
 const API_KEY = "sk-ant-api03-worker-test-key";
 
-const config = Layer.succeed(RunnerConfig, {
+const settings = {
   harnessUrl: Option.some("https://factory.example"),
   workerId: "test-runner",
   maxConcurrentRuns: 2,
   pollInterval: Duration.millis(50),
   staleRunSeconds: 180,
   heartbeatInterval: Duration.millis(20),
+  sandboxIdleStop: Duration.minutes(5),
+  runRetentionDays: 7,
+  lifecycleInterval: Duration.millis(50),
   agent: { setupCommand: "setup-agent", command: "run-agent", timeoutSec: 60, passthroughEnv: {} },
   git: { authorName: "A", authorEmail: "a@x" },
-});
+};
+const config = Layer.succeed(RunnerConfig, settings);
 
 const Base = Layer.mergeAll(Store.Live, Layer.succeed(TokenCipher, TokenCipher.fromKey(key)), config).pipe(
   Layer.provideMerge(TestDbLive),
@@ -78,7 +83,8 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         expect(finished.pull_request_url).toBe("https://github.com/shixzie/demo/pull/1");
         expect(finished.claimed_by).toBe("test-runner");
         expect(sandboxes.state.createdWith?.ANTHROPIC_API_KEY).toBe(API_KEY);
-        expect(sandboxes.state.destroyed).toBe(true);
+        expect(finished).toMatchObject({ sandbox_state: "running", sandbox_id: "sbx_1", turns: 1 });
+        expect(sandboxes.state.destroyed).toBe(false);
         const log = (yield* events(run.id)).join("\n");
         expect(log).not.toContain(API_KEY);
         expect(log).not.toContain("ghs_repo_token");
@@ -98,11 +104,11 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
 
         expect(finished.status).toBe("cancelled");
         expect(sandboxes.state.killed).toBe(true);
-        expect(sandboxes.state.destroyed).toBe(true);
+        expect(sandboxes.state.destroyed).toBe(false);
       }),
     );
 
-    it.effect("fails in-flight runs and destroys their sandboxes when the runner stops", () =>
+    it.effect("fails in-flight runs and keeps their sandboxes when the runner stops", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
         const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
@@ -114,9 +120,74 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
           SqlClient.SqlClient,
           (sql) => sql<{ status: string; error: string }>`select status, error from runs where id = ${run.id}`,
         );
-        expect(row).toEqual({ status: "failed", error: "The runner stopped before this run finished. Start it again." });
+        expect(row).toEqual({
+          status: "failed",
+          error: "The runner stopped before this run finished. Send a message to pick it up again.",
+        });
         expect(sandboxes.state.killed).toBe(true);
-        expect(sandboxes.state.destroyed).toBe(true);
+        expect(sandboxes.state.destroyed).toBe(false);
+      }),
+    );
+
+    it.effect("stops an idle sandbox with a checkpoint, and resumes it from there on the next message", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        // Earlier tests left sandboxes "running"; they would be stopped too.
+        yield* Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set sandbox_state = 'deleted'`);
+        // The restored disk remembers that the agent ran, so it continues its session.
+        const sandboxes = fakeSandboxes({ "git remote set-url": { stdout: `${HAS_SESSION_MARKER}\n` } });
+        const worker = yield* runner.pipe(
+          // Idle straight away, so the test doesn't wait five minutes.
+          Effect.provide(Layer.mergeAll(sandboxes.layer, fakeGitHub(), Layer.succeed(RunnerConfig, { ...settings, sandboxIdleStop: Duration.zero }))),
+          Effect.fork,
+        );
+        const run = yield* queueRun;
+
+        const stopped = yield* waitForRun(run.id, (r) => r.status === "succeeded" && r.sandbox_state === "stopped");
+        expect(stopped.sandbox_checkpoint_id).toBe("cp_1");
+        expect(stopped.sandbox_checkpoint_name).toMatch(new RegExp(`^run-${run.id}-`));
+        expect(sandboxes.state.destroyedIds).toEqual(["sbx_1"]);
+        // The token file is removed before the disk is saved.
+        expect(sandboxes.state.commands.at(-1)).toContain("rm -f /workspace/.factory/gh-token");
+
+        yield* store.continueRun(run.id, "Now add a license");
+        const resumed = yield* waitForRun(run.id, (r) => r.status === "succeeded" && r.turns === 2);
+        yield* Fiber.interrupt(worker);
+
+        expect(sandboxes.state.restoredFrom).toBe(stopped.sandbox_checkpoint_name);
+        expect(sandboxes.state.deletedCheckpoints).toContain("cp_1");
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Now add a license");
+        expect(sandboxes.state.envs.findLast((e) => e?.FACTORY_RUN_ID)?.FACTORY_CONTINUE).toBe("1");
+        expect(resumed.delivered_message_id).not.toBe("0");
+        expect(resumed.pull_request_url).toBe("https://github.com/shixzie/demo/pull/1");
+      }),
+    );
+
+    it.effect("deletes runs untouched for a week, with their checkpoint, and keeps the rest", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* Store;
+        const sandboxes = fakeSandboxes({}, { checkpoints: { cp_old: "run-old" } });
+        const old = yield* queueRun;
+        const recent = yield* queueRun;
+        yield* store.appendEvents(old.id, [{ kind: "info", message: "hello" }]);
+        yield* store.saveDiff(old.id, "diff --git a/x b/x\n", false);
+        yield* sql`
+          update runs set status = 'succeeded', sandbox_state = 'stopped', sandbox_checkpoint_id = 'cp_old',
+            last_activity_at = now() - interval '8 days'
+          where id = ${old.id}`;
+        yield* sql`
+          update runs set status = 'succeeded', sandbox_state = 'stopped', sandbox_checkpoint_id = 'cp_recent',
+            last_activity_at = now() - interval '6 days'
+          where id = ${recent.id}`;
+
+        yield* deleteExpiredRuns.pipe(Effect.provide(sandboxes.layer));
+
+        expect(Option.isNone(yield* store.getRun(old.id))).toBe(true);
+        expect(yield* store.listEvents(old.id)).toEqual([]);
+        expect(Option.isNone(yield* store.getDiff(old.id))).toBe(true);
+        expect(sandboxes.state.deletedCheckpoints).toEqual(["cp_old"]);
+        expect(Option.isSome(yield* store.getRun(recent.id))).toBe(true);
       }),
     );
   });
