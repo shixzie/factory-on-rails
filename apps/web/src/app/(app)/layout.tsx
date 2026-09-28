@@ -11,7 +11,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   return (
     <SidebarProvider defaultOpen={open}>
       <AppSidebar me={me} runs={runs} />
-      <SidebarInset className="min-h-svh">{children}</SidebarInset>
+      <SidebarInset className="min-h-svh min-w-0">{children}</SidebarInset>
     </SidebarProvider>
   );
 }
