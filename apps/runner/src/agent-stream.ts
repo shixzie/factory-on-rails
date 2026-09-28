@@ -50,6 +50,24 @@ function toolResultText(content: unknown): string {
     .join("\n");
 }
 
+const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+
+/**
+ * What a finished subagent (the Agent/Task tool) reported about itself, which
+ * Claude Code puts on the tool result message as `tool_use_result`.
+ */
+function subagentStats(result: unknown): Json | undefined {
+  if (!isObject(result)) return undefined;
+  const stats: Json = {};
+  const durationMs = num(result.totalDurationMs);
+  const tokens = num(result.totalTokens);
+  const toolUses = num(result.totalToolUseCount);
+  if (durationMs !== undefined) stats.durationMs = durationMs;
+  if (tokens !== undefined) stats.tokens = tokens;
+  if (toolUses !== undefined) stats.toolUses = toolUses;
+  return Object.keys(stats).length ? stats : undefined;
+}
+
 /**
  * Parses one line of agent stdout. Returns the events it stands for (possibly
  * none, for stream messages we don't show), or `undefined` when the line is
@@ -103,13 +121,16 @@ export function parseAgentLine(line: string): RunEvent[] | undefined {
     }
     case "user": {
       const content = isObject(msg.message) && Array.isArray(msg.message.content) ? msg.message.content : [];
+      // tool_use_result describes the message's one result; don't guess which of several it means.
+      const results = content.filter((b) => isObject(b) && b.type === "tool_result").length;
+      const stats = results === 1 ? subagentStats(msg.tool_use_result) : undefined;
       const events: RunEvent[] = [];
       for (const block of content) {
         if (!isObject(block) || block.type !== "tool_result") continue;
         events.push({
           kind: "tool_result",
           message: truncateText(toolResultText(block.content)),
-          data: { toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, ...nested },
+          data: { toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, ...nested, ...(stats ? { stats } : {}) },
         });
       }
       return events;

@@ -49,12 +49,22 @@ describe("toBlocks", () => {
     expect(openQuestion(answered)).toBeUndefined();
   });
 
-  it("keeps a subagent's messages inside the work log", () => {
+  it("nests what a subagent did inside the call that started it", () => {
     const blocks = toBlocks([
-      ev("tool_call", "Task", { id: "task", name: "Task", input: { description: "look around" } }),
+      ev("tool_call", "Agent", { id: "task", name: "Agent", input: { description: "look around" } }),
+      ev("tool_call", "Read", { id: "r1", name: "Read", input: { file_path: "/a" }, parentToolUseId: "task" }),
       ev("message", "found it", { parentToolUseId: "task" }),
+      ev("tool_result", "a", { toolUseId: "r1", isError: false, parentToolUseId: "task" }),
+      ev("tool_result", "Found it.", { toolUseId: "task", isError: false, stats: { durationMs: 900, tokens: 12, toolUses: 1 } }),
     ]);
     expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.type === "work" && blocks[0]!.items.map((i) => i.type)).toEqual(["tool", "note"]);
+    const work = blocks[0]!;
+    if (work.type !== "work") throw new Error("expected a work log");
+    expect(work.items.map((i) => i.type)).toEqual(["tool"]);
+    const task = work.items[0]!;
+    if (task.type !== "tool") throw new Error("expected the subagent call");
+    expect(task.children?.map((i) => i.type)).toEqual(["tool", "note"]);
+    expect(task.stats).toEqual({ durationMs: 900, tokens: 12, toolUses: 1 });
+    expect(task.result?.text).toBe("Found it.");
   });
 });

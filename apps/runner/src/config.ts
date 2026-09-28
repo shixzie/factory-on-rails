@@ -7,13 +7,16 @@ export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm ins
  * Claude Code in headless mode, streaming JSON so the run page can show each
  * message and tool call, with the factory's ask-the-user tool and inbox hook
  * (see agent-tools.ts). On a later turn in the same sandbox FACTORY_CONTINUE
- * is set, and it continues its earlier session. Any CLI that edits the working
- * tree works as AGENT_COMMAND; plain text output is shown as a log.
+ * is set, and it continues its earlier session. Subagents' own prose and
+ * thinking are forwarded too when the installed CLI supports it, so the run
+ * page can show what each one is doing. Any CLI that edits the working tree
+ * works as AGENT_COMMAND; plain text output is shown as a log.
  */
 export const DEFAULT_AGENT_COMMAND = [
   'claude ${FACTORY_CONTINUE:+--continue} -p "$(cat "$FACTORY_TASK_FILE")"',
   "--dangerously-skip-permissions",
   "--output-format stream-json --verbose",
+  "$(claude --help 2>/dev/null | grep -q -- --forward-subagent-text && echo --forward-subagent-text)",
   '--mcp-config "$FACTORY_MCP_CONFIG"',
   '--settings "$FACTORY_SETTINGS_FILE"',
   '--append-system-prompt "$(cat "$FACTORY_SYSTEM_PROMPT_FILE")"',

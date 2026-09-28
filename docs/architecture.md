@@ -105,7 +105,8 @@ A run page reads like a t3code turn (see "Watching and talking to the agent"
 below): the agent's messages as prose, the tool calls between them as one-line
 entries that expand to their input and output (commands with their output,
 edits as diffs, the agent's plan as a checklist), its questions as cards, and
-a diff panel beside the thread with every file the run changed.
+a side panel with the run's flow map or its diff. While the run is live the
+page follows the newest activity until you scroll up.
 
 ## Infrastructure as Code
 
@@ -271,6 +272,15 @@ run page while it works.
   with details in its `data` column. Lines that aren't agent JSON stay
   `stdout`, so other agent CLIs still get a log. Long tool inputs and outputs
   are capped at 16 KB each, and everything counts toward the 5 MB budget.
+- **Subagents.** Events from a subagent carry `data.parentToolUseId`, the id
+  of the Agent (formerly Task) call that started it. The default command adds
+  `--forward-subagent-text` when the installed CLI supports it, so a
+  subagent's prose and thinking arrive too, not only its tool calls. When a
+  subagent finishes, its duration, token count and tool count go into the
+  result's `data.stats`. The run page nests each subagent's work in a card of
+  its own and draws the run as a flow map (`apps/web/src/lib/flow.ts`): you,
+  the agent, each subagent, the workspace, the web and the pull request, with
+  every event sent as a packet along the lane between two of them.
 - **Files changed.** While the agent runs, the runner snapshots
   `git diff` of the branch against the commit it started from (committed and
   uncommitted work, new files included) a few seconds after each tool call,
