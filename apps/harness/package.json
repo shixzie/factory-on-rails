@@ -13,7 +13,6 @@
     "@effect/platform-node": "0.108.2",
     "@effect/sql": "0.52.1",
     "@factory/core": "workspace:*",
-    "effect": "3.22.2",
-    "hono": "^4.9.0"
+    "effect": "3.22.2"
   }
 }

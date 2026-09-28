@@ -7,7 +7,8 @@ TypeScript with [Effect](https://effect.website).
 
 ```
 .railway/railway.ts     Railway infrastructure as code (services, database)
-apps/harness            Web app: GitHub login, repos, runs, live logs
+apps/web                Web UI (Next.js + shadcn/ui): runs as threads, composer, settings
+apps/harness            API and auth backend: GitHub login, repos, runs, keys (JSON)
 apps/runner             Worker: runs each task in a Railway sandbox, opens the PR
 packages/core           Schema, data access, GitHub App auth, encryption
 docs/architecture.md    How it fits together and what comes next

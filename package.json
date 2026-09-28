@@ -8,11 +8,12 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b && tsc -p tsconfig.test.json && tsc -p .railway/tsconfig.json",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json && tsc -p .railway/tsconfig.json && pnpm --filter @factory/web typecheck",
     "test": "vitest run",
     "migrate": "pnpm build && node --env-file-if-exists=.env packages/core/dist/db.js",
     "dev:harness": "pnpm build && node --env-file=.env apps/harness/dist/index.js",
-    "dev:runner": "pnpm build && node --env-file=.env apps/runner/dist/index.js"
+    "dev:runner": "pnpm build && node --env-file=.env apps/runner/dist/index.js",
+    "dev:web": "pnpm build && pnpm --filter @factory/web dev"
   },
   "dependencies": {
     "railway": "^3.11.0"

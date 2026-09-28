@@ -5,3 +5,5 @@ dist/
 .env.*
 !.env.example
 railway-plan.json
+.next/
+next-env.d.ts
