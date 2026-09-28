@@ -9,9 +9,13 @@
  *   agent calls it with a question; it waits for the next inbox message and
  *   returns it as the answer. The run page sees the call (it is an ordinary
  *   tool call in the agent's stream) and shows the question.
- * - `inbox-hook.mjs` is a Claude Code hook. After every tool call it hands
- *   the agent any messages the user sent meanwhile, and when the agent is
- *   about to stop with unread messages it keeps it going.
+ * - `inbox-hook.mjs` is a Claude Code hook (Codex hooks take the same
+ *   output). After every tool call it hands the agent any messages the user
+ *   sent meanwhile, and when the agent is about to stop with unread messages
+ *   it keeps it going.
+ * - Claude Code reads the server and hooks from `mcp.json` and
+ *   `settings.json`; Codex gets them as `-c` config overrides, one per line
+ *   of `codex-config`.
  *
  * The scripts are plain Node (the agent CLI is a Node program, so Node is in
  * the sandbox) with no dependencies.
@@ -29,6 +33,7 @@ const files = (dir: string) => ({
   systemPrompt: `${dir}/system-prompt.md`,
   askServer: `${dir}/ask-server.mjs`,
   inboxHook: `${dir}/inbox-hook.mjs`,
+  codexConfig: `${dir}/codex-config`,
 });
 
 /** Shared by both scripts: claims unread messages, oldest first. */
@@ -153,10 +158,33 @@ if (messages.length > 0) {
 export const SYSTEM_PROMPT = `You are working unattended in a Factory on Rails sandbox, on a fresh branch of the repository in the current directory. When you finish, the factory commits whatever you changed and opens a pull request, so leave your changes in the working tree and do not push or open a pull request yourself.
 
 The person who started this run is following along and can talk to you:
-- If you need a decision only they can make, call the ask_user tool (mcp__factory__ask_user) with one clear question and, when it helps, a few short options. It waits for their answer. Decide everything you reasonably can on your own; don't ask for permission or confirmation.
+- If you need a decision only they can make, call the ask_user tool (from the "factory" MCP server) with one clear question and, when it helps, a few short options. It waits for their answer. Decide everything you reasonably can on your own; don't ask for permission or confirmation.
 - They may also send you messages while you work. Those arrive as additional context after a tool call. Follow them.
 
 End with a short summary of what you changed and anything they should check.`;
+
+/** TOML for a string; a JSON string is also a valid TOML basic string. */
+const tomlString = (value: string) => JSON.stringify(value);
+
+/**
+ * Codex's config overrides, one `-c key=value` per line (the default
+ * CODEX_COMMAND reads them into its arguments): the ask_user server with a
+ * tool timeout long enough to wait for a person, the inbox hooks, and the
+ * factory's instructions as developer instructions. The user's own
+ * ~/.codex/config.toml and sign-in (from a sandbox snapshot) still apply.
+ */
+export function codexConfig(dir = FACTORY_DIR): string {
+  const f = files(dir);
+  const hook = (event: string) => `[{hooks=[{type="command",command=${tomlString(`node ${f.inboxHook} ${event}`)},timeout=30}]}]`;
+  return [
+    `mcp_servers.factory.command="node"`,
+    `mcp_servers.factory.args=[${tomlString(f.askServer)}]`,
+    `mcp_servers.factory.tool_timeout_sec=${Math.round(ASK_TIMEOUT_MS / 1000) + 60}`,
+    `hooks.PostToolUse=${hook("post-tool-use")}`,
+    `hooks.Stop=${hook("stop")}`,
+    `developer_instructions=${tomlString(SYSTEM_PROMPT)}`,
+  ].join("\n") + "\n";
+}
 
 /** What the runner writes into the sandbox before the agent starts, as [path, content] pairs. */
 export function agentToolFiles(dir = FACTORY_DIR): ReadonlyArray<readonly [string, string]> {
@@ -166,6 +194,7 @@ export function agentToolFiles(dir = FACTORY_DIR): ReadonlyArray<readonly [strin
     [f.askServer, ASK_SERVER_SCRIPT],
     [f.inboxHook, INBOX_HOOK_SCRIPT],
     [f.systemPrompt, SYSTEM_PROMPT],
+    [f.codexConfig, codexConfig(dir)],
     [f.mcpConfig, JSON.stringify({ mcpServers: { factory: { type: "stdio", command: "node", args: [f.askServer] } } }, null, 2)],
     [
       f.settings,
@@ -191,6 +220,7 @@ export function agentToolEnv(dir = FACTORY_DIR): Record<string, string> {
     FACTORY_MCP_CONFIG: f.mcpConfig,
     FACTORY_SETTINGS_FILE: f.settings,
     FACTORY_SYSTEM_PROMPT_FILE: f.systemPrompt,
+    FACTORY_CODEX_CONFIG: f.codexConfig,
     // Claude Code gives up on an MCP tool call after this long; ask_user waits for a person.
     MCP_TOOL_TIMEOUT: String(ASK_TIMEOUT_MS + 60_000),
   };

@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import { api, runInBrowser, type Api } from "@/lib/api";
+import { Api, api, runInBrowser } from "@/lib/api";
 
 function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: ReadonlyArray<Api.ApiKeySlot>) => void }) {
   const [key, setKey] = useState("");
@@ -22,7 +22,7 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
       setError(null);
       setKey("");
       onChange(result.right);
-      toast.success(`${slot.label} key saved.`);
+      toast.success(`${slot.label} saved.`);
     });
 
   const remove = () =>
@@ -30,7 +30,7 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
       const result = await runInBrowser(api.deleteKey(slot.provider));
       if (result._tag === "Left") return void toast.error(result.left.message);
       onChange(result.right);
-      toast.success(`${slot.label} key removed.`);
+      toast.success(`${slot.label} removed.`);
     });
 
   return (
@@ -53,9 +53,10 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
             )}
           </div>
           <div className="text-xs text-muted-foreground">
-            {slot.saved ? `Saved ${slot.saved.updatedAt.toISOString().slice(0, 10)}.` : "Runs can't start until you add a key."}{" "}
+            <InlineCode text={slot.description} />{" "}
+            {slot.saved ? `Saved ${slot.saved.updatedAt.toISOString().slice(0, 10)}.` : null}{" "}
             <a href={slot.consoleUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 underline underline-offset-4">
-              Get a key <ExternalLinkIcon className="size-3" />
+              {slot.consoleLabel} <ExternalLinkIcon className="size-3" />
             </a>
           </div>
         </div>
@@ -78,7 +79,7 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
           value={key}
           onChange={(e) => setKey(e.target.value)}
           placeholder={slot.saved ? "Paste a new key to replace it" : slot.placeholder}
-          aria-label={`${slot.label} API key`}
+          aria-label={slot.label}
           aria-invalid={!!error || undefined}
           className="font-mono"
         />
@@ -91,20 +92,44 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
   );
 }
 
+/** Text with `code` spans, as the provider descriptions use. */
+function InlineCode({ text }: { text: string }) {
+  return text.split("`").map((part, i) =>
+    i % 2 ? (
+      <code key={i} className="rounded bg-muted px-1 font-mono text-[11px] text-foreground/85">
+        {part}
+      </code>
+    ) : (
+      part
+    ),
+  );
+}
+
+/** The keys a user can save, grouped by the agent that uses them. */
 export function ApiKeys({ initial }: { initial: ReadonlyArray<Api.ApiKeySlot> }) {
   const router = useRouter();
   const [slots, setSlots] = useState(initial);
+  const agents = [...new Set(slots.map((s) => s.agent))];
   return (
-    <div className="divide-y rounded-xl border bg-card">
-      {slots.map((slot) => (
-        <KeyRow
-          key={slot.provider}
-          slot={slot}
-          onChange={(next) => {
-            setSlots(next);
-            router.refresh();
-          }}
-        />
+    <div className="flex flex-col gap-4">
+      {agents.map((agent) => (
+        <div key={agent} className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium text-muted-foreground">{Api.AGENT_LABELS[agent]}</h3>
+          <div className="divide-y rounded-xl border bg-card">
+            {slots
+              .filter((slot) => slot.agent === agent)
+              .map((slot) => (
+                <KeyRow
+                  key={slot.provider}
+                  slot={slot}
+                  onChange={(next) => {
+                    setSlots(next);
+                    router.refresh();
+                  }}
+                />
+              ))}
+          </div>
+        </div>
       ))}
     </div>
   );

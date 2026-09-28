@@ -141,8 +141,11 @@ Railway Sandboxes are isolated Linux VMs created on demand and scoped to a
 Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"`):
 
 1. `Sandbox.create({ environmentId, env, region, networkIsolation: "ISOLATED", idleTimeoutMinutes })`,
-   or `Sandbox.create(checkpointName, …)` when `SANDBOX_CHECKPOINT` is set.
-   `SANDBOX_REGION` pins sandboxes to the factory's region (Railway's default is us-west2).
+   or `Sandbox.create(checkpointName, …)` from the user's sandbox snapshot
+   (see below) or, failing that, `SANDBOX_CHECKPOINT` when it is set.
+   `SANDBOX_REGION` pins blank sandboxes to the factory's region (Railway's
+   default is us-west2); one from a checkpoint boots where the checkpoint was
+   captured, and asking for another region is an error.
    The runner then runs `true` until the exec gateway accepts commands: it can still
    refuse with "status: CREATING" (close code 1008) just after the API reports RUNNING.
 2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
@@ -198,6 +201,26 @@ new run ──▶ running ──(5 min idle)──▶ stopping ──▶ stopped
   exports it as `GH_TOKEN`, and git reads it through a credential helper, so it
   never lands in `.git/config` or a checkpoint.
 
+### Sandbox snapshots
+
+A snapshot is a sandbox someone prepared by hand (signed Codex or Claude Code
+in to a subscription, installed toolchains) and saved as a named checkpoint in
+the `agents` environment ([setup.md](setup.md), step 7). A user picks one under
+Settings, and every new sandbox for their runs boots from it; a sandbox
+resumed from a stopped run's checkpoint already has its contents.
+
+- **Who may use one.** Railway checkpoints have no owner, and a snapshot can
+  hold someone's sign-in, so users can't name a checkpoint themselves. The
+  operator declares each snapshot and the GitHub logins allowed to use it in
+  `SANDBOX_SNAPSHOTS` (`name=login|login`, `*` for everyone). The harness only
+  offers and saves those (`GET`/`PUT /api/settings/snapshot`, stored in
+  `users.sandbox_snapshot`), and the runner checks again when it picks a run
+  up, failing it with a clear message if the snapshot was taken away. Names
+  starting with `run-` are the runner's own and are never accepted.
+- **Credentials.** An agent with a key saved in Settings gets that key, which
+  takes precedence over a sign-in in the snapshot; with no key, it runs on the
+  snapshot's sign-in, and a user with a snapshot can start runs without a key.
+
 Decisions:
 
 - **Separate `agents` environment.** Sandboxes live in their own environment
@@ -211,10 +234,10 @@ Decisions:
   `env` when the sandbox is created, and the GitHub token is written to a file
   (see above), never per `exec`, which keeps them out of `ps` inside the VM.
   The runner also scrubs both values from stored run output.
-- **Checkpoints for speed.** The standard image already has git and Node. Once
-  the agent CLI and common toolchains are installed, capture a checkpoint
-  (`sandbox.checkpoint("agent-base")`) and set `SANDBOX_CHECKPOINT` so every run
-  boots from it instead of installing again.
+- **Checkpoints for speed.** The standard image already has git, Node and
+  common coding agents. A checkpoint with toolchains installed can be set as
+  `SANDBOX_CHECKPOINT` so every run without a snapshot of its own boots from
+  it; it is shared by everyone, so it holds no one's sign-in.
 
 ## The harness and the run lifecycle
 
@@ -236,11 +259,13 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 3. The runner mints an installation token scoped to that one repository
    (contents and pull requests write), creates the sandbox, clones the base
    branch, and checks out `factory/run-<id>`.
-4. It runs `AGENT_SETUP_COMMAND` and then `AGENT_COMMAND` in the repo. The
-   default agent is Claude Code in headless mode
-   (`claude -p … --output-format stream-json`, plus the factory's
-   ask-the-user tool and inbox hook); any CLI that edits files in the working
-   tree works, and plain text output is shown as a log.
+4. It runs the run's agent in the repo: `AGENT_SETUP_COMMAND` and
+   `AGENT_COMMAND` for Claude Code, in headless mode
+   (`claude -p … --output-format stream-json`), or `CODEX_SETUP_COMMAND` and
+   `CODEX_COMMAND` for Codex (`codex exec --json`), each with the factory's
+   ask-the-user tool and inbox hook (see "Agents" below). Any CLI that edits
+   files in the working tree works as a command, and plain text output is
+   shown as a log.
 5. It commits whatever the agent left uncommitted, pushes the branch if it
    moved, and opens a pull request. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
@@ -260,14 +285,41 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 Run output is stored in `run_events` (batched once a second, capped at 5 MB per
 run) and the run page polls it.
 
+## Agents
+
+A run uses Claude Code or Codex, picked in the composer (`runs.agent`; the
+new-run page starts on the agent used last). Both get the same tools and
+show up the same way on the run page.
+
+| | Claude Code | Codex |
+|---|---|---|
+| Command | `claude -p "<task>" --output-format stream-json` | `codex exec --json - < TASK.md` |
+| Next turn | `--continue` | `codex exec resume --last` |
+| Unattended | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` (the Railway sandbox is the boundary) |
+| ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` |
+| Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` |
+| Output parser | `agent-stream.ts` | `codex-stream.ts` |
+| Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY` |
+
+Codex prints `thread.started`, `turn.*` and `item.*` events. Each item maps
+onto the Claude Code tool it stands for, so the run page, the subagent cards
+and the flow map need nothing Codex-specific beyond one tool:
+`command_execution` becomes `Bash`, `mcp_tool_call` becomes
+`mcp__<server>__<tool>` (so `ask_user` shows as a question), `todo_list`
+becomes `TodoWrite`, `web_search` becomes `WebSearch`, a `spawn_agent` call
+becomes `Agent`, and `file_change`, which names the files a patch touched but
+not its lines, becomes `FileChange` (the Diff panel has the lines). Its hooks
+take the same JSON as Claude Code's, so the inbox hook serves both.
+
 ## Watching and talking to the agent
 
 The runner turns the agent's stream into structured events and gives the
 agent a way to reach the user, so a run can be followed and steered from the
 run page while it works.
 
-- **Activity.** Claude Code's `stream-json` output is parsed line by line
-  (`apps/runner/src/agent-stream.ts`) into `message`, `thinking`, `tool_call`
+- **Activity.** The agent's JSON output (Claude Code's `stream-json`, or
+  Codex's events, see "Agents" above) is parsed line by line
+  (`apps/runner/src/agent-stream.ts`, `codex-stream.ts`) into `message`, `thinking`, `tool_call`
   (name and input), `tool_result` and `agent_result` events in `run_events`,
   with details in its `data` column. Lines that aren't agent JSON stay
   `stdout`, so other agent CLIs still get a log. Long tool inputs and outputs
@@ -334,12 +386,18 @@ key under **Settings**, and it is used for their runs only.
 - Keys are validated for shape, encrypted with AES-256-GCM
   (`TOKEN_ENCRYPTION_KEY`) and stored in `user_api_keys`, one per user and
   provider. The UI only ever shows the last four characters.
-- The harness refuses to queue a run for a user with no key and sends them to
-  Settings. The runner decrypts the run owner's keys when it picks the run up
-  and injects each one under its provider's env var (`ANTHROPIC_API_KEY` for
-  Anthropic), so the agent CLI in the sandbox bills that user's account.
-- Providers live in `packages/core/src/providers.ts`. Adding one (for another
-  agent CLI) is a new entry there with its env var and key check.
+- Providers: an Anthropic API key and a Claude subscription token (from
+  `claude setup-token`, which bills the user's Pro, Max, Team or Enterprise
+  plan) for Claude Code, and an OpenAI API key for Codex.
+- The harness refuses to queue a run whose agent has no credential (unless
+  the user picked a sandbox snapshot, which can carry the agent's sign-in)
+  and sends them to Settings. The runner decrypts the one credential the
+  run's agent should use when it picks the run up and injects it under its
+  env var, so the agent CLI in the sandbox bills that user's account. Only
+  one goes in: Claude Code prefers an API key over a subscription token, so
+  a saved subscription token is passed alone.
+- Providers and agents live in `packages/core/src/providers.ts`. Adding one
+  is a new entry there with its env var and key check.
 - The agent can read the key inside its sandbox, which is inherent to running
   an agent with the user's credentials. The sandbox is isolated from the
   platform's network, stopped after a few idle minutes and deleted with the
@@ -359,13 +417,16 @@ key under **Settings**, and it is used for their runs only.
   a stopped one boots from, `last_activity_at`, `turns`, and the last user
   message handed to the agent.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
+- `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):
+  the agent a run uses, and the snapshot a user's runs start from.
 
 ## What this foundation does not do yet
 
 These are the natural next steps, roughly in order:
 
-1. **Agent base checkpoint.** A small script that builds a sandbox with the
-   agent CLI and toolchains installed and saves it as a checkpoint.
+1. **Snapshots from the web app.** Let users prepare their own snapshot from
+   Settings (a sandbox with a browser terminal, saved and owned by them)
+   instead of an operator preparing it with the Railway CLI.
 2. **Iterating on a PR.** Re-run against an existing branch with review
    comments as the task, and react to GitHub webhooks (PR comments, CI results).
 3. **Pipelines.** Multi-step factories (plan, implement, test, review) with a

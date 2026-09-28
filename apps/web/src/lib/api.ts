@@ -65,6 +65,8 @@ export const api = {
     call(json("PUT", `/api/settings/keys/${encodeURIComponent(provider)}`, { key }), Schema.Array(Api.ApiKeySlot)),
   deleteKey: (provider: string) =>
     call(HttpClientRequest.del(`/api/settings/keys/${encodeURIComponent(provider)}`), Schema.Array(Api.ApiKeySlot)),
+  snapshot: call(HttpClientRequest.get("/api/settings/snapshot"), Api.SnapshotSettings),
+  saveSnapshot: (snapshot: string | null) => call(json("PUT", "/api/settings/snapshot", { snapshot }), Api.SnapshotSettings),
 };
 
 /** An HttpClient that sends every request to `baseUrl`, with extra headers and no caching. */

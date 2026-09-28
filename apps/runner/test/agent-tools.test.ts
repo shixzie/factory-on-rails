@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { agentToolEnv, agentToolFiles, deliverMessageScript } from "../src/agent-tools.js";
+import { agentToolEnv, agentToolFiles, deliverMessageScript, SYSTEM_PROMPT } from "../src/agent-tools.js";
+import { DEFAULT_CODEX_COMMAND } from "../src/config.js";
 
 /** Writes the agent tools into a temp dir, as the runner does in the sandbox. */
 function setup() {
@@ -29,6 +30,47 @@ const hook = (dir: string, env: NodeJS.ProcessEnv, event: string) =>
   });
 
 describe("agent tools", () => {
+  it("gives Codex the MCP server, the hooks and the instructions as one -c override each", async () => {
+    const { dir, env } = setup();
+    // A stand-in `codex` that prints its arguments and the prompt it got on stdin.
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "codex"),
+      `#!/usr/bin/env node\nlet stdin = "";\nprocess.stdin.on("data", (d) => (stdin += d)).on("end", () => console.log(JSON.stringify({ args: process.argv.slice(2), stdin })));\n`,
+      { mode: 0o755 },
+    );
+    const task = join(dir, "TASK.md");
+    writeFileSync(task, "- a task that starts with a dash");
+    const invoke = async (extra: Record<string, string> = {}) => {
+      const { stdout } = await run("sh", ["-c", DEFAULT_CODEX_COMMAND], {
+        env: { ...env, ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task },
+      });
+      return JSON.parse(stdout) as { args: string[]; stdin: string };
+    };
+
+    const first = await invoke();
+    expect(first.stdin).toBe("- a task that starts with a dash");
+    expect(first.args.slice(0, 5)).toEqual([
+      "exec",
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--dangerously-bypass-hook-trust",
+      "--skip-git-repo-check",
+    ]);
+    expect(first.args.at(-1)).toBe("-");
+    const overrides = first.args.filter((_, i) => first.args[i - 1] === "-c");
+    expect(overrides).toContain('mcp_servers.factory.command="node"');
+    expect(overrides).toContain(`mcp_servers.factory.args=[${JSON.stringify(join(dir, "ask-server.mjs"))}]`);
+    expect(overrides).toContain("mcp_servers.factory.tool_timeout_sec=1860");
+    expect(overrides).toContain(`hooks.Stop=[{hooks=[{type="command",command=${JSON.stringify(`node ${join(dir, "inbox-hook.mjs")} stop`)},timeout=30}]}]`);
+    const instructions = overrides.find((o) => o.startsWith("developer_instructions="))!;
+    expect(JSON.parse(instructions.slice("developer_instructions=".length))).toBe(SYSTEM_PROMPT);
+
+    const later = await invoke({ FACTORY_CONTINUE: "1" });
+    expect(later.args.slice(0, 4)).toEqual(["exec", "resume", "--last", "--json"]);
+  });
+
   it("points Claude Code at the MCP server and the hooks", () => {
     const { dir } = setup();
     const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));

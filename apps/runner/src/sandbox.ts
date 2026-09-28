@@ -39,7 +39,11 @@ export interface Checkpoint {
 export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
   Sandboxes,
   {
-    readonly create: (env: Record<string, string>) => Effect.Effect<SandboxHandle, SandboxError>;
+    /**
+     * A new sandbox, booted from `snapshot` (a prepared checkpoint) when given,
+     * else from SANDBOX_CHECKPOINT when set, else blank.
+     */
+    readonly create: (env: Record<string, string>, snapshot?: string) => Effect.Effect<SandboxHandle, SandboxError>;
     /** Boots a new sandbox from a checkpoint taken with `checkpoint`. */
     readonly restore: (checkpointName: string, env: Record<string, string>) => Effect.Effect<SandboxHandle, SandboxError>;
     /** The sandbox, if it still exists and is running. */
@@ -69,10 +73,13 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
             if (!(cause instanceof SandboxNotFoundError)) throw cause;
           }
         });
-      const options = (env: Record<string, string>) => ({
+      // A sandbox from a checkpoint boots in the region the checkpoint was
+      // captured in, and asking for another one is an error, so the region only
+      // goes with a blank sandbox. (Snapshots made with the CLI are in us-west2.)
+      const options = (env: Record<string, string>, fromCheckpoint: boolean) => ({
         ...auth,
         env,
-        region: Option.getOrUndefined(config.region),
+        region: fromCheckpoint ? undefined : Option.getOrUndefined(config.region),
         // Railway's own backstop: it destroys a sandbox left idle this long (the runner stops them sooner).
         idleTimeoutMinutes: config.idleTimeoutMinutes,
         // Agents get internet egress but no route to the factory's own services or database.
@@ -85,15 +92,16 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
           Effect.map(wrapSandbox),
         );
       return {
-        create: (env) =>
-          boot("Could not create a sandbox", () =>
-            Option.match(config.checkpoint, {
-              onNone: () => Sandbox.create(options(env)),
-              onSome: (checkpoint) => Sandbox.create(checkpoint, options(env)),
-            }),
-          ),
+        create: (env, snapshot) => {
+          const from = snapshot ?? Option.getOrUndefined(config.checkpoint);
+          return from === undefined
+            ? boot("Could not create a sandbox", () => Sandbox.create(options(env, false)))
+            : boot(`Could not create a sandbox from snapshot ${from}`, () => Sandbox.create(from, options(env, true)));
+        },
         restore: (checkpointName, env) =>
-          boot(`Could not start the sandbox from checkpoint ${checkpointName}`, () => Sandbox.create(checkpointName, options(env))),
+          boot(`Could not start the sandbox from checkpoint ${checkpointName}`, () =>
+            Sandbox.create(checkpointName, options(env, true)),
+          ),
         connect: (id) =>
           attempt(`Could not reach sandbox ${id}`, async () => {
             try {
