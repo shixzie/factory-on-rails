@@ -5,6 +5,8 @@ import {
   branchName,
   cloneScript,
   COMMIT_MSG_FILE,
+  networkCheckScript,
+  RECOVERY_CONSOLE_BANNER,
   commitMessage,
   NO_CHANGES_MARKER,
   publishScript,
@@ -12,6 +14,7 @@ import {
   REPO_DIR,
   summarizeTask,
   TASK_FILE,
+  withHome,
 } from "./plan.js";
 import type { RunLog } from "./run-log.js";
 import { Sandboxes, type ExecOptions, type SandboxHandle } from "./sandbox.js";
@@ -62,12 +65,25 @@ const work = (run: RunRow, { log, agent, git, harnessUrl }: ExecuteOptions) =>
     const step = (label: string, command: string, opts: Omit<ExecOptions, "onOutput"> = {}) =>
       Effect.gen(function* () {
         yield* log.info(label);
-        const result = yield* sandbox.exec(command, { ...opts, onOutput: log.push });
+        let offline = false;
+        const result = yield* sandbox.exec(withHome(command), {
+          ...opts,
+          onOutput: (stream, chunk) => {
+            if (chunk.includes(RECOVERY_CONSOLE_BANNER)) offline = true;
+            log.push(stream, chunk);
+          },
+        });
+        if (offline && result.exitCode !== 0) {
+          return yield* new StepFailed({
+            message: `${label}: the Railway sandbox has no outbound network (it started in Railway's recovery console). Try the run again.`,
+          });
+        }
         if (result.timedOut) return yield* new StepFailed({ message: `${label}: timed out after ${opts.timeoutSec}s` });
         if (result.exitCode !== 0) return yield* new StepFailed({ message: `${label}: exited with code ${result.exitCode}` });
         return result;
       });
 
+    yield* step("Checking the sandbox can reach GitHub", networkCheckScript({ repo: run.repo_full_name }));
     yield* step(
       `Cloning ${run.repo_full_name}@${run.base_branch}`,
       cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...git }),

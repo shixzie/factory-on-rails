@@ -72,6 +72,8 @@ export default defineRailway((ctx) => {
       TOKEN_ENCRYPTION_KEY: ctx.shared.TOKEN_ENCRYPTION_KEY,
       RAILWAY_SANDBOX_TOKEN: ctx.shared.RAILWAY_SANDBOX_TOKEN,
       SANDBOX_ENVIRONMENT_ID: ctx.shared.SANDBOX_ENVIRONMENT_ID,
+      // Without a region Railway puts sandboxes in us-west2; keep them next to the factory.
+      SANDBOX_REGION: "us-east4-eqdc4a",
       MAX_CONCURRENT_RUNS: ctx.isEnvironment("production") ? "5" : "1",
     },
   });

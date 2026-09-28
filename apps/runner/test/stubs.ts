@@ -56,13 +56,15 @@ export const fakeSandboxes = (
   const state: FakeSandbox = { commands: [], destroyed: false, killed: false };
   const handle: SandboxHandle = {
     id: "sbx_1",
-    exec: (command) => {
+    exec: (command, options) => {
       state.commands.push(command);
       if (hang && command.includes(hang)) {
         return Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (state.killed = true))));
       }
       const key = Object.keys(results).find((k) => command.includes(k));
-      return Effect.succeed({ exitCode: 0, stdout: "", timedOut: false, ...(key ? results[key] : {}) });
+      const result = { exitCode: 0, stdout: "", timedOut: false, ...(key ? results[key] : {}) };
+      if (result.stdout) options?.onOutput?.("stdout", result.stdout);
+      return Effect.succeed(result);
     },
     writeFile: () => Effect.void,
   };

@@ -20,6 +20,33 @@ export function summarizeTask(task: string, max = 72): string {
   return first.length > max ? `${first.slice(0, max - 1)}…` : first;
 }
 
+/** Printed by Railway when a sandbox VM boots without outbound network. */
+export const RECOVERY_CONSOLE_BANNER = "Railway recovery console";
+
+/**
+ * Every step runs through this. Railway's exec can start a shell without HOME,
+ * and git refuses `--global` config (and the agent CLI its config dir) without it.
+ */
+export function withHome(command: string): string {
+  return `export HOME="\${HOME:-/root}"\n${command}`;
+}
+
+/**
+ * Waits until the sandbox can reach the repo on GitHub, so a sandbox without
+ * outbound network fails with a clear message instead of a git error mid-clone.
+ */
+export function networkCheckScript(p: { repo: string; attempts?: number; delaySec?: number }): string {
+  const attempts = p.attempts ?? 12;
+  return [
+    `for i in $(seq 1 ${attempts}); do`,
+    `  git ls-remote "https://x-access-token:$GH_TOKEN@github.com/${p.repo}.git" HEAD >/dev/null 2>&1 && exit 0`,
+    `  sleep ${p.delaySec ?? 5}`,
+    "done",
+    `echo "Cannot reach github.com/${p.repo} from the sandbox" >&2`,
+    "exit 1",
+  ].join("\n");
+}
+
 /**
  * Clones with the repo-scoped installation token, which is baked into the
  * sandbox env as GH_TOKEN at create time (so it never appears in `ps`).
