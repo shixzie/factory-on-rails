@@ -190,6 +190,10 @@ export interface StoreService {
   readonly deleteApiKey: (userId: string, provider: string) => Q<void>;
   /** Encrypted keys for the runner to decrypt and inject into a run's sandbox. */
   readonly encryptedApiKeys: (userId: string) => Q<ReadonlyArray<{ provider: string; key_enc: string }>>;
+  // instance settings (see instance.ts)
+  readonly getSetting: (key: string) => Q<Option.Option<unknown>>;
+  /** Saves a setting. With `onlyIfAbsent` an existing value is kept, and the result says whether this one was saved. */
+  readonly putSetting: (key: string, value: unknown, options?: { readonly onlyIfAbsent?: boolean }) => Q<boolean>;
 }
 
 const make = Effect.gen(function* () {
@@ -407,6 +411,22 @@ const make = Effect.gen(function* () {
 
     encryptedApiKeys: (userId) =>
       sql<{ provider: string; key_enc: string }>`select provider, key_enc from user_api_keys where user_id = ${userId}`,
+
+    getSetting: (key) =>
+      sql<{ value: unknown }>`select value from instance_settings where key = ${key}`.pipe(
+        Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.value)),
+      ),
+
+    putSetting: (key, value, options) => {
+      const row = { key, value: JSON.stringify(value) };
+      const saved = options?.onlyIfAbsent
+        ? sql`insert into instance_settings ${sql.insert(row)} on conflict (key) do nothing returning key`
+        : sql`
+            insert into instance_settings ${sql.insert(row)}
+            on conflict (key) do update set value = excluded.value, updated_at = now()
+            returning key`;
+      return Effect.map(saved, (rows) => rows.length > 0);
+    },
   };
   return service;
 });

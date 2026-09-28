@@ -1,4 +1,5 @@
 import { Config, Context, Data, Duration, Effect, Layer, Option, Redacted, Schedule } from "effect";
+import { InstanceSettings } from "@factory/core";
 import { ExecInterruptedError, Sandbox, SandboxNotFoundError } from "railway";
 
 export class SandboxError extends Data.TaggedError("SandboxError")<{ message: string; cause?: unknown }> {}
@@ -58,15 +59,27 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
     Sandboxes,
     Effect.gen(function* () {
       const config = yield* SandboxConfig;
-      const auth = {
-        // An env-scoped project token for the `agents` environment. Kept separate
-        // from RAILWAY_TOKEN so the runner can never touch its own environment.
-        token: Redacted.value(config.token),
-        authType: "project-token" as const,
-        environmentId: config.environmentId,
-      };
+      const settings = yield* InstanceSettings;
+      // Where sandboxes go, read per call: the setup page can create the environment while the runner is up.
+      const target = Effect.flatMap(settings.sandboxTarget, Option.match({
+        onNone: () =>
+          Effect.fail(new SandboxError({ message: "Sandboxes are not set up yet: finish setup on the factory's /setup page." })),
+        onSome: (t) =>
+          Effect.succeed({
+            // An env-scoped project token for the `agents` environment. Kept separate
+            // from RAILWAY_TOKEN so the runner can never touch its own environment.
+            token: Redacted.value(t.token),
+            authType: "project-token" as const,
+            environmentId: t.environmentId,
+          }),
+      }));
+      type Auth = Effect.Effect.Success<typeof target>;
+      /** Runs an SDK call with the current credentials. */
+      const withAuth = <A>(context: string, f: (auth: Auth) => Promise<A>) =>
+        Effect.flatMap(target, (auth) => attempt(context, () => f(auth)));
+
       const destroy = (id: string) =>
-        attempt(`Could not destroy sandbox ${id}`, async () => {
+        withAuth(`Could not destroy sandbox ${id}`, async (auth) => {
           try {
             await (await Sandbox.connect(id, auth)).destroy();
           } catch (cause) {
@@ -76,7 +89,7 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
       // A sandbox from a checkpoint boots in the region the checkpoint was
       // captured in, and asking for another one is an error, so the region only
       // goes with a blank sandbox. (Snapshots made with the CLI are in us-west2.)
-      const options = (env: Record<string, string>, fromCheckpoint: boolean) => ({
+      const options = (auth: Auth, env: Record<string, string>, fromCheckpoint: boolean) => ({
         ...auth,
         env,
         region: fromCheckpoint ? undefined : Option.getOrUndefined(config.region),
@@ -85,8 +98,8 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
         // Agents get internet egress but no route to the factory's own services or database.
         networkIsolation: "ISOLATED" as const,
       });
-      const boot = (context: string, create: () => Promise<Sandbox>) =>
-        attempt(context, create).pipe(
+      const boot = (context: string, create: (auth: Auth) => Promise<Sandbox>) =>
+        withAuth(context, create).pipe(
           // Don't leak a sandbox that never starts taking commands.
           Effect.tap((sandbox) => waitUntilReady(sandbox).pipe(Effect.tapError(() => Effect.ignore(destroy(sandbox.id))))),
           Effect.map(wrapSandbox),
@@ -95,15 +108,15 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
         create: (env, snapshot) => {
           const from = snapshot ?? Option.getOrUndefined(config.checkpoint);
           return from === undefined
-            ? boot("Could not create a sandbox", () => Sandbox.create(options(env, false)))
-            : boot(`Could not create a sandbox from snapshot ${from}`, () => Sandbox.create(from, options(env, true)));
+            ? boot("Could not create a sandbox", (auth) => Sandbox.create(options(auth, env, false)))
+            : boot(`Could not create a sandbox from snapshot ${from}`, (auth) => Sandbox.create(from, options(auth, env, true)));
         },
         restore: (checkpointName, env) =>
-          boot(`Could not start the sandbox from checkpoint ${checkpointName}`, () =>
-            Sandbox.create(checkpointName, options(env, true)),
+          boot(`Could not start the sandbox from checkpoint ${checkpointName}`, (auth) =>
+            Sandbox.create(checkpointName, options(auth, env, true)),
           ),
         connect: (id) =>
-          attempt(`Could not reach sandbox ${id}`, async () => {
+          withAuth(`Could not reach sandbox ${id}`, async (auth) => {
             try {
               const sandbox = await Sandbox.connect(id, auth);
               return sandbox.status === "RUNNING" ? Option.some(wrapSandbox(sandbox)) : Option.none();
@@ -113,13 +126,13 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
             }
           }),
         checkpoint: (id, name) =>
-          attempt(`Could not checkpoint sandbox ${id}`, async () => {
+          withAuth(`Could not checkpoint sandbox ${id}`, async (auth) => {
             const { id: checkpointId, key } = await (await Sandbox.connect(id, auth)).checkpoint(name);
             return { id: checkpointId, name: key };
           }),
         destroy,
         deleteCheckpoint: (id) =>
-          attempt(`Could not delete checkpoint ${id}`, async () => {
+          withAuth(`Could not delete checkpoint ${id}`, async (auth) => {
             try {
               await Sandbox.deleteCheckpoint(id, auth);
             } catch (cause) {
@@ -132,9 +145,11 @@ export class Sandboxes extends Context.Tag("@factory/Sandboxes")<
   );
 }
 
+/**
+ * How sandboxes are created. Where they go (RAILWAY_SANDBOX_TOKEN and
+ * SANDBOX_ENVIRONMENT_ID, or what the setup page stored) comes from `InstanceSettings`.
+ */
 export const SandboxConfig = Config.all({
-  token: Config.redacted("RAILWAY_SANDBOX_TOKEN"),
-  environmentId: Config.string("SANDBOX_ENVIRONMENT_ID"),
   region: Config.option(Config.nonEmptyString("SANDBOX_REGION")),
   /** Boot from a named checkpoint (e.g. one with the agent CLI preinstalled) instead of a blank sandbox. */
   checkpoint: Config.option(Config.nonEmptyString("SANDBOX_CHECKPOINT")),

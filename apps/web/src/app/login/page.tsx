@@ -1,13 +1,20 @@
+import { Either } from "effect";
 import type { Metadata } from "next";
+import { redirect } from "next/navigation";
 import { Logo } from "@/components/logo";
 import { Button } from "@/components/ui/button";
+import { api } from "@/lib/api";
+import { serverApiEither } from "@/lib/server";
 
 export const metadata: Metadata = { title: "Sign in" };
+export const dynamic = "force-dynamic";
 
 type Props = { searchParams: Promise<{ error?: string }> };
 
 export default async function LoginPage({ searchParams }: Props) {
-  const { error } = await searchParams;
+  const [{ error }, setup] = await Promise.all([searchParams, serverApiEither(api.setup)]);
+  // A fresh deployment has no GitHub App to sign in with yet.
+  if (Either.isRight(setup) && setup.right.githubApp === null) redirect("/setup");
   return (
     <main className="flex min-h-svh flex-col items-center justify-center px-4">
       <div className="flex w-full max-w-sm flex-col items-center gap-6 text-center">

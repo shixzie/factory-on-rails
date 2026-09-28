@@ -39,3 +39,15 @@ export const OAuthTokenResponse = Schema.Struct({
   error_description: Schema.optional(Schema.String),
 });
 export type OAuthTokenResponse = typeof OAuthTokenResponse.Type;
+
+/** `POST /app-manifests/{code}/conversions`: the new App, with the credentials GitHub shows only once. */
+export const ManifestConversion = Schema.Struct({
+  id: Schema.Number,
+  slug: Schema.String,
+  html_url: Schema.String,
+  owner: Schema.NullOr(Schema.Struct({ login: Schema.String })),
+  client_id: Schema.String,
+  client_secret: Schema.String,
+  pem: Schema.String,
+});
+export type ManifestConversion = typeof ManifestConversion.Type;

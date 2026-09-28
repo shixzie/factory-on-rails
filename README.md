@@ -17,7 +17,8 @@ apps/harness            API and auth backend: GitHub login, repos, runs, keys (J
 apps/runner             Worker: runs each task in a Railway sandbox, opens the PR
 packages/core           Schema, data access, GitHub App auth, encryption
 docs/architecture.md    How it fits together and what comes next
-docs/setup.md           One-time setup (GitHub App, tokens, shared variables)
+docs/setup.md           Setup by hand: GitHub App, tokens, shared variables, IaC
+docs/railway-template.md  How the one-click Railway template is put together
 ```
 
 ```bash
@@ -26,5 +27,51 @@ pnpm run typecheck
 pnpm test
 ```
 
-Start with [docs/setup.md](docs/setup.md) to deploy, and
-[docs/architecture.md](docs/architecture.md) for the design.
+See [docs/architecture.md](docs/architecture.md) for the design.
+
+## Host your own
+
+<!-- Deploy button: replace TEMPLATE_CODE with the template's code (docs/railway-template.md, step 4), then uncomment.
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=factory-on-rails)
+-->
+
+Factory on Rails runs entirely on [Railway](https://railway.com). The Railway
+template deploys the web UI, the API, the runner and Postgres, already wired
+together with a generated encryption key. What's left is what only you can
+do, and the app walks you through it on its setup page:
+
+1. **Deploy the template.** Railway asks for one value, `ALLOWED_GITHUB_LOGINS`:
+   your GitHub username (comma-separate several). Only those accounts can sign
+   in, and the GitHub App has to belong to one of them.
+2. **Open the web service's URL** once it's deployed (Railway shows it on the
+   `web` service). It takes you to `/setup`.
+3. **Create the GitHub App.** Click **Create GitHub App**, check what GitHub
+   shows you, and confirm. The App's callback URL and permissions are filled
+   in, and its credentials go straight into the factory's database, encrypted.
+   To own it with an organization, type the organization's name and add it to
+   `ALLOWED_GITHUB_LOGINS` first.
+4. **Install the App** on the repositories the factory should work on
+   (**Install on GitHub** on the setup page), then **sign in** with GitHub.
+5. **Connect Railway sandboxes.** Create an account or workspace token at
+   [railway.com/account/tokens](https://railway.com/account/tokens) and paste
+   it. The factory uses it once to create an empty `agents` environment in the
+   project and a token that can only reach that environment, then forgets it;
+   you can delete the token afterwards.
+6. **Save your agent credential** under **Settings** (a Claude subscription
+   token or Anthropic API key for Claude Code, an OpenAI API key for Codex)
+   and start a run.
+
+Costs: services and sandboxes are billed to the Railway workspace you deploy
+into; each user's model usage goes to their own key or subscription. To open sign-in to
+any GitHub account, set `ALLOWED_GITHUB_LOGINS` to `*` on the `harness` service
+after setup.
+
+For a custom domain, add it to the `web` service in Railway, then set
+`PUBLIC_URL` on `harness` and `HARNESS_URL` on `runner` to `https://<your domain>`,
+and add `https://<your domain>/auth/callback` to the GitHub App's callback URLs.
+
+To run it without the template, with every credential in environment
+variables and the infrastructure in `.railway/railway.ts` applied by CI (how
+the maintainers' own deployment runs), follow [docs/setup.md](docs/setup.md).
+How the template itself is built is in
+[docs/railway-template.md](docs/railway-template.md).

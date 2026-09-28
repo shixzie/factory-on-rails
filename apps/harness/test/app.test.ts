@@ -4,51 +4,91 @@ import {
   decrypt,
   GitHubError,
   GitHubUserApi,
+  InstanceSettings,
   sha256,
   Store,
   TokenCipher,
   type GitHubRepo,
 } from "@factory/core";
 import { afterAll, beforeAll, describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Effect, Layer, ManagedRuntime, Option } from "effect";
 import { randomBytes } from "node:crypto";
 import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { app, originCheck } from "../src/app.js";
 import { HarnessConfig } from "../src/config.js";
+import { RailwayApi, RailwayError } from "../src/railway.js";
 
 const ORIGIN = "https://factory.example";
 const key = randomBytes(32);
 
-/** A scriptable GitHub: tests set the viewer login and the repos the app can see. */
-const github = { login: "shixzie", repos: [] as GitHubRepo[] };
-const GitHubTest = Layer.succeed(GitHubUserApi, {
-  clientId: "Iv1.test",
-  appSlug: "factory-on-rails",
-  exchangeCode: (code) =>
-    code === "good"
-      ? Effect.succeed({ accessToken: "ghu_x", accessTokenExpiresAt: null, refreshToken: null, refreshTokenExpiresAt: null })
-      : Effect.fail(new GitHubError({ status: 400, message: "bad code" })),
-  refresh: () => Effect.fail(new GitHubError({ status: 400, message: "no refresh" })),
-  viewer: () => Effect.succeed({ id: 99, login: github.login, name: null, avatar_url: "" }),
-  installations: () => Effect.succeed([{ id: 1, account: { login: "shixzie" } }]),
-  installationRepos: () => Effect.succeed(github.repos),
-  createRepo: () => Effect.fail(new GitHubError({ status: 422, message: "name already exists" })),
+/**
+ * A scriptable GitHub: tests set the viewer login and the repos the app can see.
+ * `envApp` stands for a GitHub App configured with environment variables; with
+ * it off, the App is whatever the setup page stored (read through InstanceSettings).
+ */
+const github = { login: "shixzie", repos: [] as GitHubRepo[], envApp: true, manifestOwner: "shixzie" };
+const GitHubTest = Layer.effect(
+  GitHubUserApi,
+  Effect.map(InstanceSettings, (settings) => ({
+    app: Effect.suspend(() =>
+      github.envApp
+        ? Effect.succeed(Option.some({ clientId: "Iv1.test", slug: "factory-on-rails", owner: null }))
+        : Effect.map(settings.githubOAuth, Option.map(({ clientId, slug, owner }) => ({ clientId, slug, owner }))),
+    ),
+    exchangeCode: (code: string) =>
+      code === "good"
+        ? Effect.succeed({ accessToken: "ghu_x", accessTokenExpiresAt: null, refreshToken: null, refreshTokenExpiresAt: null })
+        : Effect.fail(new GitHubError({ status: 400, message: "bad code" })),
+    refresh: () => Effect.fail(new GitHubError({ status: 400, message: "no refresh" })),
+    viewer: () => Effect.succeed({ id: 99, login: github.login, name: null, avatar_url: "" }),
+    installations: () => Effect.succeed([{ id: 1, account: { login: "shixzie" } }]),
+    installationRepos: () => Effect.succeed(github.repos),
+    createRepo: () => Effect.fail(new GitHubError({ status: 422, message: "name already exists" })),
+    convertManifest: (code: string) =>
+      code === "manifest-code"
+        ? Effect.succeed({
+            appId: "4242",
+            slug: "factory-on-rails-abc123",
+            clientId: "Iv23.fresh",
+            clientSecret: "fresh-client-secret",
+            privateKey: "-----BEGIN RSA PRIVATE KEY-----\nfresh\n-----END RSA PRIVATE KEY-----",
+            owner: github.manifestOwner,
+            htmlUrl: "https://github.com/apps/factory-on-rails-abc123",
+          })
+        : Effect.fail(new GitHubError({ status: 404, message: "code expired" })),
+  })),
+);
+
+/** Railway's API: records what it was asked, and accepts only the token "good-railway-token". */
+const railwayCalls: string[][] = [];
+const RailwayTest = Layer.succeed(RailwayApi, {
+  provisionSandboxes: (token, projectId) =>
+    Effect.suspend(() => {
+      railwayCalls.push([token, projectId]);
+      return token === "good-railway-token"
+        ? Effect.succeed({ projectId, environmentId: "env-agents", environmentName: "agents", token: "project-token-secret" })
+        : Effect.fail(new RailwayError({ message: "Railway did not accept that token." }));
+    }),
 });
 
 const TestLayer = Layer.mergeAll(
-  Store.Live,
   GitHubTest,
-  Layer.succeed(TokenCipher, TokenCipher.fromKey(key)),
+  RailwayTest,
   Layer.succeed(HarnessConfig, {
     publicUrl: ORIGIN,
     allowedLogins: ["shixzie"],
     sessionTtlSeconds: 3600,
+    railwayProjectId: Option.some("project-1"),
     snapshots: [
       { name: "snap-agents", logins: ["snapper"] },
       { name: "node-base", logins: ["*"] },
     ],
   }),
-).pipe(Layer.provideMerge(TestDbLive));
+).pipe(
+  Layer.provideMerge(InstanceSettings.Live),
+  Layer.provideMerge(Layer.mergeAll(Store.Live, Layer.succeed(TokenCipher, TokenCipher.fromKey(key)))),
+  Layer.provideMerge(TestDbLive),
+);
 
 describe.skipIf(!testDatabaseUrl)("harness app", () => {
   const runtime = ManagedRuntime.make(TestLayer);
@@ -86,6 +126,8 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
 
   beforeAll(async () => {
     handler = HttpApp.toWebHandlerRuntime(await runtime.runtime())(app.pipe(originCheck));
+    // A runner whose own variables say where sandboxes go, as on a deployment configured by hand.
+    await run(Effect.flatMap(InstanceSettings, (s) => s.reportRunner(true)));
   }, 30_000);
   afterAll(() => runtime.dispose());
 
@@ -383,5 +425,138 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     const res = await post("/api/repos", cookie, { name: "taken", private: true });
     expect(res.status).toBe(400);
     expect(await json(res)).toEqual({ code: "github", error: "name already exists" });
+  });
+  describe("first-run setup", () => {
+    const setupStatus = (cookie = "") => json(request("/api/setup", { headers: cookie ? { cookie } : {} }));
+    const startApp = (organization?: string) =>
+      request("/api/setup/github-app", {
+        method: "POST",
+        headers: { origin: ORIGIN, "content-type": "application/json" },
+        body: JSON.stringify(organization ? { organization } : {}),
+      });
+    const callback = (code: string, state: string, cookieState = state) =>
+      request(`/auth/setup/github-app?code=${code}&state=${state}`, { headers: { cookie: `factory_setup_state=${cookieState}` } });
+    const errorOf = (res: Response) => new URL(res.headers.get("location")!, ORIGIN).searchParams.get("error");
+
+    beforeAll(async () => {
+      github.envApp = false;
+      await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`delete from instance_settings`));
+    });
+    afterAll(() => {
+      github.envApp = true;
+    });
+
+    it("reports a fresh deployment as not set up, and sends sign-in to /setup", async () => {
+      expect(await setupStatus()).toEqual({
+        githubApp: null,
+        sandboxes: { ready: false, fromEnv: false },
+        owners: ["shixzie"],
+        viewer: null,
+      });
+      const login = await request("/auth/login");
+      expect(login.status).toBe(302);
+      expect(login.headers.get("location")).toBe("/setup");
+    });
+
+    it("refuses to start runs until sandboxes are set up", async () => {
+      const { cookie } = await signIn("byok", 3);
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-" + "s".repeat(30) });
+      const res = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x" });
+      expect(res.status).toBe(400);
+      expect((await json(res)).code).toBe("setup_required");
+      await send("DELETE", "/api/settings/keys/anthropic", cookie);
+    });
+
+    it("hands the browser a manifest form for GitHub, with a state cookie", async () => {
+      const res = await startApp();
+      expect(res.status).toBe(200);
+      const form = await json(res);
+      const action = new URL(form.action);
+      expect(action.origin + action.pathname).toBe("https://github.com/settings/apps/new");
+      const state = action.searchParams.get("state")!;
+      expect(res.headers.get("set-cookie")).toContain(`factory_setup_state=${state}`);
+      const manifest = JSON.parse(form.manifest);
+      expect(manifest).toMatchObject({
+        url: ORIGIN,
+        redirect_url: `${ORIGIN}/auth/setup/github-app`,
+        callback_urls: [`${ORIGIN}/auth/callback`],
+        public: false,
+        default_permissions: { contents: "write", pull_requests: "write", workflows: "write" },
+        hook_attributes: { active: false },
+      });
+      expect(manifest.name).toMatch(/^Factory on Rails [0-9a-f]{6}$/);
+
+      const org = await json(startApp("acme"));
+      expect(org.error).toMatch(/Add acme to ALLOWED_GITHUB_LOGINS/);
+    });
+
+    it("rejects a callback whose state does not match", async () => {
+      const res = await callback("manifest-code", "evil", "fine");
+      expect(res.status).toBe(302);
+      expect(errorOf(res)).toMatch(/state did not match/);
+    });
+
+    it("won't use an App created under an account the allowlist doesn't name", async () => {
+      github.manifestOwner = "mallory";
+      const res = await callback("manifest-code", "s1");
+      github.manifestOwner = "shixzie";
+      expect(errorOf(res)).toMatch(/created under mallory/);
+      expect((await setupStatus()).githubApp).toBeNull();
+    });
+
+    it("stores the new App encrypted and signs in with it", async () => {
+      const res = await callback("manifest-code", "s2");
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/setup");
+
+      const [row] = await run(
+        Effect.flatMap(SqlClient.SqlClient, (sql) => sql<{ value: Record<string, string> }>`select value from instance_settings where key = 'github_app'`),
+      );
+      expect(JSON.stringify(row!.value)).not.toContain("fresh-client-secret");
+      expect(decrypt(row!.value.clientSecretEnc!, key)).toBe("fresh-client-secret");
+      expect(await setupStatus()).toMatchObject({
+        githubApp: {
+          slug: "factory-on-rails-abc123",
+          fromEnv: false,
+          owner: "shixzie",
+          installUrl: "https://github.com/apps/factory-on-rails-abc123/installations/new",
+        },
+        owners: [],
+      });
+
+      const login = await request("/auth/login");
+      expect(new URL(login.headers.get("location")!).searchParams.get("client_id")).toBe("Iv23.fresh");
+      const auth = await run(Effect.flatMap(InstanceSettings, (s) => s.githubAppAuth));
+      expect(Option.map(auth, (a) => a.appId)).toEqual(Option.some("4242"));
+
+      // The first App wins: a second registration is turned away before it is converted.
+      expect((await startApp()).status).toBe(409);
+      expect(errorOf(await callback("manifest-code", "s3"))).toMatch(/already set up/);
+    });
+
+    it("lets only an admin set up sandboxes, with a Railway token it doesn't keep", async () => {
+      const other = await signIn("other", 2);
+      expect((await setupStatus(other.cookie)).viewer).toEqual({ login: "other", admin: false });
+      expect((await post("/api/setup/sandboxes", other.cookie, { token: "good-railway-token" })).status).toBe(403);
+
+      const admin = await signIn("shixzie", 100);
+      const refused = await post("/api/setup/sandboxes", admin.cookie, { token: "wrong" });
+      expect(refused.status).toBe(400);
+      expect(await json(refused)).toEqual({ code: "railway", error: "Railway did not accept that token." });
+
+      const res = await post("/api/setup/sandboxes", admin.cookie, { token: "good-railway-token" });
+      expect(res.status).toBe(200);
+      expect(await json(res)).toMatchObject({ sandboxes: { ready: true, fromEnv: false }, viewer: { login: "shixzie", admin: true } });
+      expect(railwayCalls.at(-1)).toEqual(["good-railway-token", "project-1"]);
+
+      const [row] = await run(
+        Effect.flatMap(SqlClient.SqlClient, (sql) => sql<{ value: unknown }>`select value from instance_settings where key = 'sandboxes'`),
+      );
+      const stored = JSON.stringify(row!.value);
+      expect(stored).not.toContain("good-railway-token");
+      expect(stored).not.toContain("project-token-secret");
+      const target = await run(Effect.flatMap(InstanceSettings, (s) => s.sandboxTarget));
+      expect(Option.map(target, (t) => [t.source, t.environmentId])).toEqual(Option.some(["setup", "env-agents"]));
+    });
   });
 });

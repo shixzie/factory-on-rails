@@ -38,6 +38,8 @@ export async function serverApi<A>(effect: Effect.Effect<A, ApiRequestError, Htt
 
 // Deduplicated per request, so the layout and the page can both ask.
 export const getMe = cache(() => serverApi(api.me));
+/** Public: what a fresh deployment still needs (see /setup). */
+export const getSetup = cache(() => serverApi(api.setup));
 export const getRuns = cache(() => serverApi(api.runs));
 /** Repositories come from GitHub, so a GitHub hiccup degrades the composer instead of failing the page. */
 export const getRepos = cache(async () => {

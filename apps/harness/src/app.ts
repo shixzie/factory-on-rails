@@ -6,6 +6,7 @@ import {
   DEFAULT_AGENT,
   GitHubError,
   GitHubUserApi,
+  InstanceSettings,
   isModelProvider,
   keyHint,
   MODEL_PROVIDERS,
@@ -19,25 +20,17 @@ import {
   type RunRow,
   type UserRow,
 } from "@factory/core";
-import { Data, Effect, Option, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from "./auth.js";
 import { HarnessConfig } from "./config.js";
+import { fail } from "./errors.js";
+import { appInstallUrl, setupRoutes } from "./setup.js";
 
 /**
  * The harness is the web app's API and auth backend. Pages live in apps/web,
  * which serves the public domain and forwards `/api/*` and `/auth/*` here, so
  * the session cookie, OAuth callback and Origin check all see one origin.
  */
-
-/** A request the API refuses, answered as `Api.ApiError` JSON. */
-export class ApiFailure extends Data.TaggedError("ApiFailure")<{
-  readonly status: 400 | 401 | 403 | 404 | 500;
-  readonly code: string;
-  readonly message: string;
-}> {}
-
-const fail = (status: ApiFailure["status"], code: string, message: string) =>
-  Effect.fail(new ApiFailure({ status, code, message }));
 
 const json =
   <A, I>(schema: Schema.Schema<A, I>) =>
@@ -111,7 +104,9 @@ const accessibleRepos = (user: UserRow) =>
     return perInstallation.flat().sort((a, b) => a.fullName.localeCompare(b.fullName));
   });
 
-const installUrl = Effect.map(GitHubUserApi, (gh) => `https://github.com/apps/${gh.appSlug}/installations/new`);
+const installUrl = Effect.map(Effect.flatMap(GitHubUserApi, (gh) => gh.app), (app) =>
+  Option.match(app, { onNone: () => "/setup", onSome: ({ slug }) => appInstallUrl(slug) }),
+);
 
 const keySlots = (user: UserRow) =>
   Effect.gen(function* () {
@@ -187,6 +182,9 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.get("/auth/login", beginLogin),
   HttpRouter.get("/auth/callback", completeLogin),
   HttpRouter.post("/auth/logout", logout),
+
+  // ---- first-run setup ------------------------------------------------------------
+  HttpRouter.concat(setupRoutes),
 
   // ---- session ----------------------------------------------------------------
   HttpRouter.get(
@@ -311,6 +309,9 @@ export const router = HttpRouter.empty.pipe(
       if (!body.repo || !task) return yield* fail(400, "bad_request", "Pick a repository and describe the task.");
       const agent = body.agent ?? DEFAULT_AGENT;
       if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
+      if (!(yield* (yield* InstanceSettings).sandboxesReady).ready) {
+        return yield* fail(400, "setup_required", "Sandboxes aren't set up yet. Finish setup at /setup first.");
+      }
 
       // Never trust the client: the repo must be one this user can reach through that installation.
       const repo = (yield* accessibleRepos(user)).find(
@@ -419,6 +420,8 @@ export const app = router.pipe(
     Unauthorized: () => Effect.succeed(errorJson(401, "unauthorized", "Sign in to continue.")),
     ReauthRequired: () => Effect.succeed(errorJson(401, "reauth", "Your GitHub sign-in expired. Sign in again.")),
     LoginRejected: (e) => Effect.succeed(loginPage(e.message)),
+    SetupRejected: (e) => Effect.succeed(HttpServerResponse.redirect(`/setup?error=${encodeURIComponent(e.message)}`, { status: 302 })),
+    RailwayError: (e) => Effect.succeed(errorJson(400, "railway", e.message)),
     RouteNotFound: () => Effect.succeed(errorJson(404, "not_found", "Not found.")),
     ParseError: () => Effect.succeed(errorJson(400, "bad_request", "Bad request.")),
     RequestError: () => Effect.succeed(errorJson(400, "bad_request", "Bad request.")),

@@ -378,6 +378,42 @@ Sessions are random 256-bit tokens in an HttpOnly, SameSite=Lax cookie, stored
 server-side as SHA-256 hashes, and every state-changing request must carry our
 own `Origin`.
 
+## First-run setup
+
+A deployment gets its GitHub App and sandbox environment one of two ways,
+resolved by `InstanceSettings` (`packages/core/src/instance.ts`):
+
+- **Environment variables** (`GITHUB_APP_*`, `RAILWAY_SANDBOX_TOKEN`,
+  `SANDBOX_ENVIRONMENT_ID`; see [setup.md](setup.md)). They always win.
+  Production runs this way.
+- **The setup page** (`/setup` in the web app, `apps/harness/src/setup.ts`),
+  which is what the [Railway template](railway-template.md) relies on. It
+  stores what it creates in `instance_settings`, secrets encrypted with
+  `TOKEN_ENCRYPTION_KEY`, and the harness and runner read it per call, so
+  nothing needs a redeploy.
+
+The setup page has two steps:
+
+1. **GitHub App from a manifest.** The harness builds the manifest (callback
+   URL, permissions, webhooks off) and a state cookie; the browser posts it to
+   GitHub, the person confirms, and GitHub redirects to
+   `/auth/setup/github-app` with a code the harness converts into the App's id,
+   slug, client secret and private key. Nobody can sign in yet, so this step
+   is open to anyone: the harness only keeps an App whose owner is named in
+   `ALLOWED_GITHUB_LOGINS`, so a stranger who finds a fresh deployment can't
+   plant their own App in it. The first App stored wins.
+2. **Sandbox environment.** A signed-in admin (named in
+   `ALLOWED_GITHUB_LOGINS`, or the App's owner) pastes a Railway account or
+   workspace token. The harness uses it once, through Railway's public API,
+   to find or create the `agents` environment in its own project
+   (`RAILWAY_PROJECT_ID`) and to mint a project token scoped to it, which is
+   what gets stored. The pasted token is never stored or logged.
+
+The runner reports at startup whether its own variables configure sandboxes,
+so the harness (which can't see the runner's variables) knows a hand-configured
+deployment is ready. Until sandboxes are ready the harness refuses new runs
+with `setup_required` and the web app shows a banner linking to `/setup`.
+
 ## Bring your own key
 
 There is no platform-wide model API key. Each user saves their own provider
@@ -419,6 +455,9 @@ key under **Settings**, and it is used for their runs only.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
 - `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):
   the agent a run uses, and the snapshot a user's runs start from.
+- `instance_settings`: what the setup page created, one JSON value per key
+  (`github_app`, `sandboxes`, and the runner's `runner` report), secrets
+  encrypted (`006_instance_settings.sql`).
 
 ## What this foundation does not do yet
 

@@ -14,6 +14,8 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
     readonly sessionTtlSeconds: number;
     /** Sandbox snapshots users may start their runs from, and who may use each (SANDBOX_SNAPSHOTS). */
     readonly snapshots: ReadonlyArray<SandboxSnapshot>;
+    /** The Railway project this runs in (Railway sets it), where the setup page creates the sandbox environment. */
+    readonly railwayProjectId: Option.Option<string>;
   }
 >() {
   static readonly Live = Layer.effect(
@@ -46,6 +48,7 @@ export class HarnessConfig extends Context.Tag("@factory/HarnessConfig")<
         publicUrl: publicUrl.replace(/\/$/, ""),
         allowedLogins,
         sessionTtlSeconds: yield* Config.integer("SESSION_TTL_SECONDS").pipe(Config.withDefault(7 * 24 * 3600)),
+        railwayProjectId: yield* Config.option(Config.nonEmptyString("RAILWAY_PROJECT_ID")),
       };
     }),
   );

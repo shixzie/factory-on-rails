@@ -1,8 +1,15 @@
 # Setup
 
-One-time steps to bring Factory on Rails up in the Railway project
-`f4356592-cac1-4edf-a3bd-b58d0a8c023a`. Everything after these steps is driven
-by `.railway/railway.ts` and CI.
+One-time steps to bring Factory on Rails up by hand, with every credential in
+environment variables and the infrastructure applied from `.railway/railway.ts`
+by CI. This is how the maintainers' deployment (Railway project
+`f4356592-cac1-4edf-a3bd-b58d0a8c023a`, factory.shixzie.com) runs.
+
+To host your own copy, the Railway template is quicker: it wires the services
+together, and the app's `/setup` page creates the GitHub App and the `agents`
+environment for you (see the README's "Host your own"). Variables set as below
+take precedence over what the setup page stored, so a template deployment can
+switch to this way at any time.
 
 ## 1. Create the GitHub App
 

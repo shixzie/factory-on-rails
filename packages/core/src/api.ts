@@ -192,9 +192,45 @@ export const SaveSnapshotBody = Schema.Struct({ snapshot: Schema.NullOr(Schema.S
 export type SaveSnapshotBody = typeof SaveSnapshotBody.Type;
 
 /**
+ * What a fresh deployment still needs, for the setup page (public: it works
+ * before anyone can sign in). A deployment configured with environment
+ * variables reports everything as ready.
+ */
+export const SetupStatus = Schema.Struct({
+  githubApp: Schema.NullOr(
+    Schema.Struct({
+      slug: Schema.String,
+      /** Configured with environment variables rather than created on the setup page. */
+      fromEnv: Schema.Boolean,
+      /** The account the setup page created it under. */
+      owner: Schema.NullOr(Schema.String),
+      installUrl: Schema.String,
+    }),
+  ),
+  sandboxes: Schema.Struct({ ready: Schema.Boolean, fromEnv: Schema.Boolean }),
+  /** The GitHub accounts named in ALLOWED_GITHUB_LOGINS, shown until the App exists (the App must belong to one). */
+  owners: Schema.Array(Schema.String),
+  /** The signed-in user, and whether they may finish setup (named in ALLOWED_GITHUB_LOGINS, or the App's owner). */
+  viewer: Schema.NullOr(Schema.Struct({ login: Schema.String, admin: Schema.Boolean })),
+});
+export type SetupStatus = typeof SetupStatus.Type;
+
+/** Creates the GitHub App under the signed-in GitHub account, or under an organization. */
+export const CreateGitHubAppBody = Schema.Struct({ organization: Schema.optional(Schema.String) });
+export type CreateGitHubAppBody = typeof CreateGitHubAppBody.Type;
+
+/** The form the browser posts to GitHub to register the App from its manifest. */
+export const GitHubAppForm = Schema.Struct({ action: Schema.String, manifest: Schema.String });
+export type GitHubAppForm = typeof GitHubAppForm.Type;
+
+/** A Railway account or workspace token, used once to set up the sandbox environment and never stored. */
+export const SetupSandboxesBody = Schema.Struct({ token: Schema.String });
+export type SetupSandboxesBody = typeof SetupSandboxesBody.Type;
+
+/**
  * Every non-2xx JSON answer. `code` is stable for the UI to branch on:
  * `unauthorized` (sign in), `reauth` (sign in again), `api_key_required`
- * (add a key for the agent in Settings, or pick a snapshot), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
+ * (add a key for the agent in Settings, or pick a snapshot), `setup_required` (finish /setup), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
  */
 export const ApiError = Schema.Struct({ code: Schema.String, error: Schema.String });
 export type ApiError = typeof ApiError.Type;

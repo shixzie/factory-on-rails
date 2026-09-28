@@ -67,6 +67,9 @@ export const api = {
     call(HttpClientRequest.del(`/api/settings/keys/${encodeURIComponent(provider)}`), Schema.Array(Api.ApiKeySlot)),
   snapshot: call(HttpClientRequest.get("/api/settings/snapshot"), Api.SnapshotSettings),
   saveSnapshot: (snapshot: string | null) => call(json("PUT", "/api/settings/snapshot", { snapshot }), Api.SnapshotSettings),
+  setup: call(HttpClientRequest.get("/api/setup"), Api.SetupStatus),
+  createGitHubApp: (body: Api.CreateGitHubAppBody) => call(json("POST", "/api/setup/github-app", body), Api.GitHubAppForm),
+  setupSandboxes: (token: string) => call(json("POST", "/api/setup/sandboxes", { token }), Api.SetupStatus),
 };
 
 /** An HttpClient that sends every request to `baseUrl`, with extra headers and no caching. */

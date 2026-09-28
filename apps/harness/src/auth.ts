@@ -18,6 +18,9 @@ export const SESSION_COOKIE = "factory_session";
 /** `*` in the allowlist admits any GitHub account; otherwise logins match case-insensitively. */
 export const isAllowedLogin = (allowed: ReadonlyArray<string>, login: string): boolean =>
   allowed.includes("*") || allowed.includes(login.toLowerCase());
+
+/** Logins named in the allowlist itself: `*` lets anyone sign in, but names nobody. */
+export const namedLogins = (allowed: ReadonlyArray<string>): ReadonlyArray<string> => allowed.filter((l) => l !== "*");
 export const STATE_COOKIE = "factory_oauth_state";
 
 /** No signed-in user: send them to the sign-in page. */
@@ -29,7 +32,7 @@ export class ReauthRequired extends Data.TaggedError("ReauthRequired") {}
 /** Sign-in refused, with a message for the sign-in page. */
 export class LoginRejected extends Data.TaggedError("LoginRejected")<{ readonly status: 400 | 403; readonly message: string }> {}
 
-const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
+export const cookieOptions = (publicUrl: string, maxAgeSeconds: number) => ({
   httpOnly: true,
   secure: publicUrl.startsWith("https://"),
   sameSite: "lax" as const,
@@ -54,9 +57,11 @@ export const requireUser = Effect.flatMap(currentUser, Option.match({
 
 export const beginLogin = Effect.gen(function* () {
   const { publicUrl } = yield* HarnessConfig;
-  const github = yield* GitHubUserApi;
+  const app = yield* (yield* GitHubUserApi).app;
+  // Nothing to sign in with until the setup page has created the GitHub App.
+  if (Option.isNone(app)) return HttpServerResponse.redirect("/setup", { status: 302 });
   const state = randomToken(16);
-  return yield* HttpServerResponse.redirect(authorizeUrl(github.clientId, redirectUri(publicUrl), state)).pipe(
+  return yield* HttpServerResponse.redirect(authorizeUrl(app.value.clientId, redirectUri(publicUrl), state)).pipe(
     HttpServerResponse.setCookie(STATE_COOKIE, state, cookieOptions(publicUrl, 600)),
   );
 });
