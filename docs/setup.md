@@ -80,7 +80,7 @@ railway config plan
 ## 5. Give the harness a domain
 
 Production serves the harness on `factory.shixzie.com`, declared in
-`.railway/railway.ts` (with `PUBLIC_URL`, and `PORT=3000` so the domain's
+`.railway/railway.ts` (with `PUBLIC_URL`, and `PORT=8080` so the domain's
 target port matches). Its DNS is on Cloudflare: keep the record proxied only
 with SSL/TLS mode **Full (strict)**. "Flexible" makes Cloudflare call Railway
 over HTTP, Railway redirects to HTTPS, and every request loops on a 301.

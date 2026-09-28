@@ -39,9 +39,9 @@ export default defineRailway((ctx) => {
     healthcheck: "/healthz",
     healthcheckTimeout: 60,
     // Pin the port so the custom domain's target port always matches.
-    domains: production ? [{ domain: "factory.shixzie.com", port: 3000 }] : [],
+    domains: production ? [{ domain: "factory.shixzie.com", port: 8080 }] : [],
     env: {
-      PORT: "3000",
+      PORT: "8080",
       PUBLIC_URL: harnessUrl,
       DATABASE_URL: db.env.DATABASE_URL,
       GITHUB_APP_SLUG: ctx.shared.GITHUB_APP_SLUG,
