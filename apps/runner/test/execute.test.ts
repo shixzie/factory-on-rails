@@ -256,6 +256,45 @@ describe("executeRun", () => {
     }),
   );
 
+  it.live("reads Codex's JSON events when the run uses Codex, questions included", () =>
+    Effect.gen(function* () {
+      const line = (m: object) => `${JSON.stringify(m)}\n`;
+      const ask = { id: "m1", type: "mcp_tool_call", server: "factory", tool: "ask_user", arguments: { question: "Which?" }, result: null, error: null };
+      const sandboxes = fakeSandboxes({
+        "run-codex": (onOutput) =>
+          Effect.gen(function* () {
+            onOutput("stdout", line({ type: "thread.started", thread_id: "th_1" }) + line({ type: "turn.started" }));
+            onOutput("stdout", line({ type: "item.started", item: { ...ask, status: "in_progress" } }));
+            yield* Effect.sleep("150 millis");
+            onOutput(
+              "stdout",
+              line({ type: "item.completed", item: { ...ask, status: "completed", result: { content: [{ type: "text", text: "The user answered: A" }] } } }) +
+                line({ type: "item.completed", item: { id: "i2", type: "agent_message", text: "Went with A." } }) +
+                line({ type: "turn.completed", usage: {} }),
+            );
+            yield* Effect.sleep("50 millis");
+            return {};
+          }),
+      });
+      const store = recordingStore();
+      const { events } = yield* execute(sandboxes, store, {
+        agent: { ...agent, id: "codex", setupCommand: "setup-codex", command: "run-codex" },
+        inboxEvery: "10 millis",
+        diffEvery: "10 millis",
+      });
+      expect(events).toEqual(
+        expect.arrayContaining([
+          "info:Agent started (Codex)",
+          `tool_call:${ASK_USER_TOOL}`,
+          "tool_result:The user answered: A",
+          "message:Went with A.",
+          "agent_result:Went with A.",
+        ]),
+      );
+      expect(store.updates.filter((u) => "awaiting_input" in u)).toEqual([{ awaiting_input: true }, { awaiting_input: false }]);
+    }),
+  );
+
   it.effect("records the diff even when the agent fails, and caps a huge one", () =>
     Effect.gen(function* () {
       const big = ["a", "b"].map((f) => `diff --git a/${f} b/${f}\n+${"x".repeat(MAX_DIFF_BYTES / 2 + 10)}\n`).join("");

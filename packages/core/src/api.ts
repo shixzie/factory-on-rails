@@ -12,6 +12,11 @@ export type RunStatus = typeof RunStatus.Type;
 export const SandboxState = Schema.Literal("none", "running", "stopping", "stopped", "deleted");
 export type SandboxState = typeof SandboxState.Type;
 
+/** The coding agent a run uses; see `AGENTS` in providers.ts. */
+export const AgentId = Schema.Literal("claude", "codex");
+export type AgentId = typeof AgentId.Type;
+export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex" };
+
 /** A finished run's sandbox is stopped (checkpointed, then destroyed) after this long without activity. */
 export const SANDBOX_IDLE_STOP_MINUTES = 5;
 /** A run with no activity for this long is deleted, with its sandbox. */
@@ -24,10 +29,25 @@ export const ApiUser = Schema.Struct({
 });
 export type ApiUser = typeof ApiUser.Type;
 
+/** An agent a user can pick for a run, and whether they can start one with it. */
+export const ApiAgent = Schema.Struct({
+  id: AgentId,
+  label: Schema.String,
+  /** The user saved a credential for it, or picked a sandbox snapshot that can carry one. */
+  ready: Schema.Boolean,
+});
+export type ApiAgent = typeof ApiAgent.Type;
+
 /** The signed-in user and what the UI needs to know before it can start a run. */
 export const Me = Schema.Struct({
   user: ApiUser,
+  /** At least one agent is ready, so a run can start. */
   hasApiKey: Schema.Boolean,
+  agents: Schema.optionalWith(Schema.Array(ApiAgent), {
+    default: () => [{ id: "claude" as const, label: "Claude Code", ready: false }],
+  }),
+  /** The sandbox snapshot the user's runs start from, if they picked one. */
+  snapshot: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   /** Where to install the GitHub App or grant it more repositories. */
   installUrl: Schema.String,
 });
@@ -47,6 +67,7 @@ export const ApiRun = Schema.Struct({
   repo: Schema.String,
   baseBranch: Schema.String,
   task: Schema.String,
+  agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
   pullRequestUrl: Schema.NullOr(Schema.String),
@@ -127,8 +148,13 @@ export type SendMessageBody = typeof SendMessageBody.Type;
 export const ApiKeySlot = Schema.Struct({
   provider: Schema.String,
   label: Schema.String,
+  description: Schema.optionalWith(Schema.String, { default: () => "" }),
+  /** The agent that uses it. */
+  agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   placeholder: Schema.String,
+  /** Where to get one. */
   consoleUrl: Schema.String,
+  consoleLabel: Schema.optionalWith(Schema.String, { default: () => "Get a key" }),
   saved: Schema.NullOr(Schema.Struct({ hint: Schema.String, updatedAt: Schema.Date })),
 });
 export type ApiKeySlot = typeof ApiKeySlot.Type;
@@ -138,6 +164,7 @@ export const CreateRunBody = Schema.Struct({
   repo: Schema.String,
   task: Schema.String,
   baseBranch: Schema.optional(Schema.String),
+  agent: Schema.optional(AgentId),
 });
 export type CreateRunBody = typeof CreateRunBody.Type;
 
@@ -152,9 +179,22 @@ export const SaveKeyBody = Schema.Struct({ key: Schema.String });
 export type SaveKeyBody = typeof SaveKeyBody.Type;
 
 /**
+ * The sandbox snapshots (prepared Railway checkpoints) this user may start
+ * runs from, and the one they picked. `null` means the platform's default.
+ */
+export const SnapshotSettings = Schema.Struct({
+  available: Schema.Array(Schema.String),
+  selected: Schema.NullOr(Schema.String),
+});
+export type SnapshotSettings = typeof SnapshotSettings.Type;
+
+export const SaveSnapshotBody = Schema.Struct({ snapshot: Schema.NullOr(Schema.String) });
+export type SaveSnapshotBody = typeof SaveSnapshotBody.Type;
+
+/**
  * Every non-2xx JSON answer. `code` is stable for the UI to branch on:
  * `unauthorized` (sign in), `reauth` (sign in again), `api_key_required`
- * (add a key in Settings), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
+ * (add a key for the agent in Settings, or pick a snapshot), `forbidden`, `not_found`, `bad_request`, `github`, `internal`.
  */
 export const ApiError = Schema.Struct({ code: Schema.String, error: Schema.String });
 export type ApiError = typeof ApiError.Type;

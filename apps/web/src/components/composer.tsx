@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUpIcon, GitBranchIcon, KeyRoundIcon, PlugIcon } from "lucide-react";
+import { ArrowUpIcon, BotIcon, GitBranchIcon, KeyRoundIcon, PlugIcon } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
@@ -10,7 +10,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { api, runInBrowser, type Api } from "@/lib/api";
+import { Api, api, runInBrowser } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const repoKey = (r: Pick<Api.ApiRepo, "installationId" | "fullName">) => `${r.installationId}:${r.fullName}`;
@@ -25,7 +25,7 @@ function GitHubMark({ className }: { className?: string }) {
 
 /**
  * The prompt box pinned to the bottom of the main pane, as in t3code: a task,
- * then the repository and base branch it runs against, and send.
+ * then the agent, the repository and base branch it runs against, and send.
  */
 export function Composer({
   me,
@@ -33,6 +33,7 @@ export function Composer({
   reposError,
   defaultRepo,
   defaultBaseBranch,
+  defaultAgent,
   placeholder = "Describe the change you want. The agent works in its own sandbox and opens a pull request.",
   autoFocus,
 }: {
@@ -42,6 +43,8 @@ export function Composer({
   reposError?: string | null;
   defaultRepo?: string;
   defaultBaseBranch?: string;
+  /** The agent to start on (the one used last); otherwise the first one the user can run. */
+  defaultAgent?: Api.AgentId;
   placeholder?: string;
   autoFocus?: boolean;
 }) {
@@ -49,12 +52,16 @@ export function Composer({
   const initial = repos.find((r) => r.fullName === defaultRepo) ?? repos[0];
   const [repo, setRepo] = useState(initial ? repoKey(initial) : "");
   const [baseBranch, setBaseBranch] = useState(defaultBaseBranch ?? "");
+  const [agent, setAgent] = useState<Api.AgentId>(
+    () => (me.agents.find((a) => a.id === defaultAgent && a.ready) ?? me.agents.find((a) => a.ready) ?? me.agents[0])?.id ?? "claude",
+  );
   const [task, setTask] = useState("");
   const [pending, startTransition] = useTransition();
 
   const selected = repos.find((r) => repoKey(r) === repo);
+  const agentReady = me.agents.find((a) => a.id === agent)?.ready ?? false;
   const blocked = !me.hasApiKey || repos.length === 0;
-  const canSend = !blocked && !!selected && task.trim().length > 0 && !pending;
+  const canSend = !blocked && agentReady && !!selected && task.trim().length > 0 && !pending;
 
   const submit = () => {
     if (!canSend || !selected) return;
@@ -65,6 +72,7 @@ export function Composer({
           repo: selected.fullName,
           task,
           baseBranch: baseBranch.trim() || undefined,
+          agent,
         }),
       );
       if (result._tag === "Left") {
@@ -79,12 +87,19 @@ export function Composer({
   };
 
   const items = repos.map((r) => ({ value: repoKey(r), label: r.fullName }));
+  const agentItems = me.agents.map((a) => ({ value: a.id, label: a.label }));
+  const agentLabel = Api.AGENT_LABELS[agent];
 
   return (
     <div className="mx-auto w-full max-w-3xl">
       {!me.hasApiKey ? (
         <Notice icon={<KeyRoundIcon />}>
           Runs use your own model API key. <Link href="/settings" className="font-medium text-foreground underline underline-offset-4">Add it in Settings</Link> to start one.
+        </Notice>
+      ) : !agentReady ? (
+        <Notice icon={<KeyRoundIcon />}>
+          {agentLabel} needs your key.{" "}
+          <Link href="/settings" className="font-medium text-foreground underline underline-offset-4">Add it in Settings</Link> or pick another agent.
         </Notice>
       ) : reposError ? (
         <Notice icon={<PlugIcon />}>Couldn&apos;t load your repositories from GitHub: {reposError} Reload to try again.</Notice>
@@ -125,6 +140,24 @@ export function Composer({
           className="field-sizing-content block max-h-80 min-h-20 w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
         />
         <div className="flex flex-wrap items-center gap-1.5 px-2.5 pb-2.5">
+          <Select items={agentItems} value={agent} onValueChange={(v) => v && setAgent(v as Api.AgentId)} disabled={blocked || pending}>
+            <SelectTrigger
+              size="sm"
+              aria-label="Agent"
+              className="border-transparent bg-transparent text-xs text-muted-foreground hover:bg-accent dark:bg-transparent"
+            >
+              <BotIcon className="size-3.5" />
+              <SelectValue placeholder="Agent" />
+            </SelectTrigger>
+            <SelectContent>
+              {me.agents.map((a) => (
+                <SelectItem key={a.id} value={a.id} className="text-xs">
+                  {a.label}
+                  {a.ready ? null : <span className="text-muted-foreground">(needs a key)</span>}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Select items={items} value={repo} onValueChange={(v) => setRepo(String(v ?? ""))} disabled={blocked || pending}>
             <SelectTrigger
               size="sm"
