@@ -11,6 +11,7 @@ import {
   COMMIT_MSG_FILE,
   networkCheckScript,
   RECOVERY_CONSOLE_BANNER,
+  WORKFLOWS_PERMISSION_REFUSAL,
   commitMessage,
   NO_CHANGES_MARKER,
   publishScript,
@@ -52,10 +53,23 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
     const store = yield* Store;
     const branch = branchName(run.id);
 
-    const token = yield* github.installationToken(Number(run.installation_id), {
-      repositories: [run.repo_full_name.split("/")[1]!],
-      permissions: { contents: "write", pull_requests: "write", metadata: "read" },
-    });
+    const permissions = { contents: "write", pull_requests: "write", metadata: "read" } as const;
+    const tokenFor = (extra: Record<string, "write"> = {}) =>
+      github.installationToken(Number(run.installation_id), {
+        repositories: [run.repo_full_name.split("/")[1]!],
+        permissions: { ...permissions, ...extra },
+      });
+    // Workflows lets the agent change .github/workflows. GitHub answers 422 when
+    // the App was never granted it; the run then goes ahead without it.
+    const token = yield* tokenFor({ workflows: "write" }).pipe(
+      Effect.catchIf(
+        (err) => err.status === 422,
+        () =>
+          log
+            .info("The GitHub App has no Workflows permission, so this run can't change files in .github/workflows")
+            .pipe(Effect.zipRight(tokenFor())),
+      ),
+    );
     log.addSecret(Redacted.value(token));
 
     yield* log.info("Creating Railway sandbox");
@@ -74,17 +88,24 @@ const work = (run: RunRow, { log, agent, git, harnessUrl, inboxEvery = "2 second
       Effect.gen(function* () {
         yield* log.info(label);
         let offline = false;
+        let workflowsRefused = false;
         const onOutput = opts.onOutput ?? log.push;
         const result = yield* sandbox.exec(withHome(command), {
           ...opts,
           onOutput: (stream, chunk) => {
             if (chunk.includes(RECOVERY_CONSOLE_BANNER)) offline = true;
+            if (chunk.includes(WORKFLOWS_PERMISSION_REFUSAL)) workflowsRefused = true;
             onOutput(stream, chunk);
           },
         });
         if (offline && result.exitCode !== 0) {
           return yield* new StepFailed({
             message: `${label}: the Railway sandbox has no outbound network (it started in Railway's recovery console). Try the run again.`,
+          });
+        }
+        if (workflowsRefused && result.exitCode !== 0) {
+          return yield* new StepFailed({
+            message: `${label}: GitHub refused the push because the agent changed a file in .github/workflows and the GitHub App has no Workflows permission. Give the App "Workflows: Read and write", accept it on the installation, then run again.`,
           });
         }
         if (result.timedOut) return yield* new StepFailed({ message: `${label}: timed out after ${opts.timeoutSec}s` });

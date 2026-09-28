@@ -15,7 +15,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Expire user authorization tokens | On (default) |
 | Request user authorization (OAuth) during installation | Optional |
 | Webhook | Off for now |
-| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
+| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Workflows: **Read and write** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
 | Where can this App be installed | Only on this account |
 
 Then:
@@ -23,6 +23,13 @@ Then:
 - Note the **App ID**, **Client ID** and the app's **slug** (the last part of its public URL).
 - Generate a **client secret** and a **private key** (`.pem`).
 - **Install** the App on your account, for all repositories or the ones the factory should work on.
+
+Workflows lets agents change files in `.github/workflows`. Without it, GitHub
+rejects any push that touches them, and the run fails with a message saying so.
+To add it to an App you already created: App settings → Permissions & events →
+Repository permissions → Workflows: Read and write → Save changes. Then accept
+the new permission on the installation (GitHub emails you a link, or open
+Settings → Applications → Installed GitHub Apps → the App → Review request).
 
 ## 2. Create the `agents` environment and its token
 

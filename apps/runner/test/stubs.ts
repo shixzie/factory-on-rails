@@ -1,4 +1,4 @@
-import { GitHubAppApi, Store, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
 import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
@@ -29,12 +29,17 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
   return { events, updates, diffs, userMessages, layer };
 };
 
-export const fakeGitHub = (calls: unknown[][] = []) =>
+/** `grantedPermissions` mimics the App's settings: asking for anything else gets GitHub's 422. */
+export const fakeGitHub = (calls: unknown[][] = [], grantedPermissions?: string[]) =>
   Layer.succeed(GitHubAppApi, {
     installationToken: (...args) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         calls.push(["installationToken", ...args]);
-        return Redacted.make("ghs_repo_token");
+        const requested = Object.keys(args[1].permissions ?? {});
+        if (grantedPermissions && requested.some((p) => !grantedPermissions.includes(p))) {
+          return Effect.fail(new GitHubError({ status: 422, message: "The permissions requested are not granted to this installation." }));
+        }
+        return Effect.succeed(Redacted.make("ghs_repo_token"));
       }),
     createPullRequest: (token, repo, pr) =>
       Effect.sync(() => {
