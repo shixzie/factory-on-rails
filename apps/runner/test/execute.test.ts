@@ -57,7 +57,14 @@ describe("executeRun", () => {
         "shixzie/demo",
         expect.objectContaining({ title: "Add a README", head: "factory/run-0123abcd", base: "main" }),
       ]);
-      expect(sandboxes.state.commands.map((c) => c.split("\n")[0])).toEqual(["set -eu", "setup-agent", "run-agent", "set -eu"]);
+      expect(sandboxes.state.commands.every((c) => c.startsWith('export HOME="${HOME:-/root}"\n'))).toBe(true);
+      expect(sandboxes.state.commands.map((c) => c.split("\n")[1])).toEqual([
+        expect.stringMatching(/^for i in/),
+        "set -eu",
+        "setup-agent",
+        "run-agent",
+        "set -eu",
+      ]);
       expect(store.updates).toEqual([
         { sandbox_id: "sbx_1", branch: "factory/run-0123abcd" },
         { pull_request_url: "https://github.com/shixzie/demo/pull/1" },
@@ -87,6 +94,25 @@ describe("executeRun", () => {
     }),
   );
 
+  it.effect("says so when the sandbox has no outbound network", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes({
+        "git ls-remote": {
+          exitCode: 1,
+          stdout: "Railway recovery console: your sandbox VM has lost outbound network connectivity.\n",
+        },
+      });
+      const { outcome } = yield* execute(sandboxes);
+      expect(outcome).toEqual({
+        status: "failed",
+        error:
+          "Checking the sandbox can reach GitHub: the Railway sandbox has no outbound network (it started in Railway's recovery console). Try the run again.",
+      });
+      expect(sandboxes.state.commands).toHaveLength(1);
+      expect(sandboxes.state.destroyed).toBe(true);
+    }),
+  );
+
   it.effect("fails cleanly when no sandbox can be created", () =>
     Effect.gen(function* () {
       const { outcome } = yield* execute(fakeSandboxes({}, { failCreate: "sandbox limit reached" }));
@@ -98,7 +124,7 @@ describe("executeRun", () => {
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
       // Report cancellation once the agent is running.
-      const store = recordingStore(() => (sandboxes.state.commands.includes("run-agent") ? "cancelling" : "running"));
+      const store = recordingStore(() => (sandboxes.state.commands.some((c) => c.includes("run-agent")) ? "cancelling" : "running"));
       const { outcome, events } = yield* execute(sandboxes, store, { heartbeatEvery: "5 millis" });
 
       expect(outcome).toEqual({ status: "cancelled" });

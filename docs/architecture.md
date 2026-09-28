@@ -97,10 +97,13 @@ one-time manual steps in [setup.md](setup.md).
 Railway Sandboxes are isolated Linux VMs created on demand and scoped to a
 Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"`):
 
-1. `Sandbox.create({ environmentId, env, networkIsolation: "ISOLATED", idleTimeoutMinutes })`,
+1. `Sandbox.create({ environmentId, env, region, networkIsolation: "ISOLATED", idleTimeoutMinutes })`,
    or `Sandbox.create(checkpointName, …)` when `SANDBOX_CHECKPOINT` is set.
-2. `sandbox.exec(...)` to clone, run the agent, commit and push, with
-   `onStdout` / `onStderr` streaming into `run_events`.
+   `SANDBOX_REGION` pins sandboxes to the factory's region (Railway's default is us-west2).
+2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
+   agent, commit and push, with `onStdout` / `onStderr` streaming into
+   `run_events`. Every command starts with `export HOME="${HOME:-/root}"`,
+   because exec can start a shell without HOME and git needs it.
 3. `sandbox.files.write(...)` for the task text and commit message, so user
    input never has to be quoted into a shell command.
 4. `sandbox.destroy()` as the release step of a scoped resource, plus a reaper
