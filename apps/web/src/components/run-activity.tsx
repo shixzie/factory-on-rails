@@ -50,15 +50,24 @@ function Expandable({
   defaultOpen?: boolean;
   children?: React.ReactNode;
 }) {
+  // Follows `defaultOpen` both ways (a running command opens, then folds away when it
+  // finishes) until the reader opens or closes it themselves.
   const [open, setOpen] = useState(defaultOpen);
-  useEffect(() => setOpen((o) => o || defaultOpen), [defaultOpen]);
+  const touched = useRef(false);
+  useEffect(() => {
+    if (!touched.current) setOpen(defaultOpen);
+  }, [defaultOpen]);
   const expandable = !!children;
   return (
     <div className="py-0.5">
       <button
         type="button"
         disabled={!expandable}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          touched.current = true;
+          setOpen((o) => !o);
+        }}
+        aria-expanded={expandable ? open : undefined}
         className={cn(
           "group flex w-full min-w-0 items-center gap-2 rounded-md py-1 text-left text-xs",
           status === "error" ? "text-destructive" : "text-muted-foreground",
@@ -137,6 +146,7 @@ function ToolLine({ call, live, latestPlan }: { call: ToolCall; live: boolean; l
       return (
         <Expandable
           {...common}
+          defaultOpen={status === "pending"}
           icon={<TerminalIcon />}
           label={
             <>
