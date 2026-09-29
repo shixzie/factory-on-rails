@@ -8,7 +8,11 @@ TypeScript with [Effect](https://effect.website).
 <img src="docs/media/run-flow.webp" alt="A live run: the agent starts three subagents in parallel, the thread follows each one's work, and the Flow map animates every read, edit and command between you, the agent, its subagents and the workspace." width="100%">
 
 While a run works you can follow it live, answer the agent's questions, and
-watch its subagents and the flow of work between them on the Flow map.
+watch its subagents and the flow of work between them on the Flow map. Runs
+use Claude Code or Codex, with each user's own key or subscription. When the
+work is pushed the agent writes the pull request's title and description, and
+you can open the app it's running in its sandbox from the run's Preview tab,
+privately.
 
 Our own instance runs at [factory.shixzie.com](https://factory.shixzie.com), and
 its Railway infrastructure is public: you can look around the project behind it
@@ -20,6 +24,7 @@ at
 apps/web                Web UI (Next.js + shadcn/ui): runs as threads, composer, settings
 apps/harness            API and auth backend: GitHub login, repos, runs, keys (JSON)
 apps/runner             Worker: runs each task in a Railway sandbox, opens the PR
+apps/preview            Preview gateway: serves apps running in sandboxes to their run's owner
 packages/core           Schema, data access, GitHub App auth, encryption
 docs/architecture.md    How it fits together and what comes next
 docs/setup.md           Setup by hand: GitHub App, tokens, shared variables, IaC
@@ -71,9 +76,35 @@ into; each user's model usage goes to their own key or subscription. To open sig
 any GitHub account, set `ALLOWED_GITHUB_LOGINS` to `*` on the `harness` service
 after setup.
 
+### Previews (optional)
+
+Previews let a run's owner open what the agent is running in its sandbox (a
+dev server, an API) from the run's **Preview** tab. Each run and port gets its
+own subdomain, so previews need a wildcard domain you control, which a
+template can't bring. Everything else works without them. To turn them on:
+
+1. **Add a `preview` service** from this repository (`+ Create` → GitHub Repo)
+   with start command `node apps/preview/dist/index.js`, healthcheck
+   `/healthz`, one replica, and the variables in
+   [docs/railway-template.md](docs/railway-template.md#previews-not-in-the-template).
+   The signing key the template generated is shared with it by reference.
+2. **Add the wildcard domain** to it (Settings → Networking → Custom Domain,
+   e.g. `*.preview.example.com`, port 8080) and create the DNS records Railway
+   shows. On Cloudflare, leave them **DNS only** (grey cloud).
+3. **Point the others at it.** On `harness` set `PREVIEW_DOMAIN` to the domain
+   without `*.` (`preview.example.com`); on `runner` set `PREVIEW_TUNNEL_URL`
+   to `wss://tunnel.preview.example.com/connect`.
+
+Step 4 of the setup page turns green once the harness sees them.
+
+### Custom domain
+
 For a custom domain, add it to the `web` service in Railway, then set
-`PUBLIC_URL` on `harness` and `HARNESS_URL` on `runner` to `https://<your domain>`,
-and add `https://<your domain>/auth/callback` to the GitHub App's callback URLs.
+`PUBLIC_URL` on `harness` (and on `preview`, if you added it) and `HARNESS_URL`
+on `runner` to `https://<your domain>`, and add
+`https://<your domain>/auth/callback` to the GitHub App's callback URLs.
+
+### Without the template
 
 To run it without the template, with every credential in environment
 variables and the infrastructure in `.railway/railway.ts` applied by CI (how

@@ -51,7 +51,7 @@ function Step({
  */
 export default async function SetupPage({ searchParams }: Props) {
   const [{ error }, setup] = await Promise.all([searchParams, getSetup()]);
-  const { githubApp, sandboxes, owners, viewer } = setup;
+  const { githubApp, sandboxes, previews, owners, viewer } = setup;
   const ready = githubApp !== null && sandboxes.ready;
 
   return (
@@ -161,6 +161,26 @@ export default async function SetupPage({ searchParams }: Props) {
               </p>
             ) : (
               <p>Sign in first.</p>
+            )}
+          </Step>
+
+          <Step n={4} title="Previews (optional)" done={previews}>
+            {previews ? (
+              <p>Run owners can open servers running in their sandbox from the run's Preview tab.</p>
+            ) : (
+              <p>
+                Lets a run's owner open the app the agent is running in its sandbox. It needs a wildcard domain you
+                control, so it is set up by hand: see{" "}
+                <a
+                  href="https://github.com/shixzie/factory-on-rails#previews-optional"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-0.5 underline underline-offset-4"
+                >
+                  Previews in the README <ExternalLinkIcon className="size-3" />
+                </a>
+                . Everything else works without it.
+              </p>
             )}
           </Step>
         </ol>

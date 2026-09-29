@@ -500,6 +500,12 @@ so the harness (which can't see the runner's variables) knows a hand-configured
 deployment is ready. Until sandboxes are ready the harness refuses new runs
 with `setup_required` and the web app shows a banner linking to `/setup`.
 
+The page's last step, previews, is optional and only reports whether the
+harness has `PREVIEW_DOMAIN` and `PREVIEW_SIGNING_KEY`: the gateway needs a
+wildcard custom domain, which only its owner can add, so it is set up by hand
+(README, "Previews (optional)"). The template generates the signing key ahead
+of time.
+
 ## Bring your own key
 
 There is no platform-wide model API key. Each user saves their own provider

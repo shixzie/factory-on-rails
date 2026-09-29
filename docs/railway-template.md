@@ -66,6 +66,7 @@ over the private network.
 | `PORT` | `8080` | |
 | `HOST` | `::` | Listen on IPv6 so the private network reaches it. |
 | `SANDBOX_SNAPSHOTS` | *(empty, optional)* | Prepared sandbox checkpoints users may start runs from, as `name=login\|login`, comma-separated (see setup.md, step 7). |
+| `PREVIEW_SIGNING_KEY` | `${{secret(64, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}` | Signs preview links and sandbox tunnel grants. Generated, so turning previews on later only needs a domain; unused until then. |
 
 ### web
 
@@ -103,6 +104,7 @@ The worker that drives one sandbox per run. No networking.
 | `HARNESS_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | Links pull requests back to their run. |
 | `MAX_CONCURRENT_RUNS` | `3` (optional) | Runs at once, one sandbox each. |
 | `SANDBOX_SNAPSHOTS` | `${{harness.SANDBOX_SNAPSHOTS}}` | The same list as the harness; checked again when a run starts. |
+| `PREVIEW_SIGNING_KEY` | `${{harness.PREVIEW_SIGNING_KEY}}` | Same key as the harness. |
 | `SANDBOX_REGION` | *(empty, optional)* | Where sandboxes run, e.g. `us-east4-eqdc4a`. Railway's default is us-west2; put them near the factory's region. |
 
 The template sets no GitHub App or sandbox variables: the setup page creates
@@ -110,11 +112,30 @@ both and stores them in the database, encrypted with `TOKEN_ENCRYPTION_KEY`.
 Setting `GITHUB_APP_*`, `RAILWAY_SANDBOX_TOKEN` and `SANDBOX_ENVIRONMENT_ID`
 by hand still works and takes precedence ([setup.md](setup.md)).
 
-Previews of servers running in sandboxes are left out of the template: they
-need a wildcard custom domain, which a template can't bring. To add them
-later, create a `preview` service (start command
-`node apps/preview/dist/index.js`, healthcheck `/healthz`) and follow
-[setup.md](setup.md), step 8.
+### Previews: not in the template
+
+The preview gateway is left out: it needs a wildcard custom domain, which a
+template can't bring, and without one it won't start. The template generates
+`PREVIEW_SIGNING_KEY` so that adding it later is only the service and the
+domain, as the README's [Previews (optional)](../README.md#previews-optional)
+describes. For reference, the service it adds:
+
+| Setting | Value |
+|---|---|
+| Build command | `pnpm run build` |
+| Start command | `node apps/preview/dist/index.js` |
+| Healthcheck path | `/healthz` |
+| Watch paths | `apps/preview/**`, `packages/core/**`, `pnpm-lock.yaml` |
+| Public networking | the wildcard custom domain, port `8080` |
+| Replicas | 1 (sandboxes' tunnels live in its memory) |
+
+| Variable | Value |
+|---|---|
+| `PORT` | `8080` |
+| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+| `PREVIEW_DOMAIN` | e.g. `preview.example.com` (the wildcard without `*.`) |
+| `PUBLIC_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` |
+| `PREVIEW_SIGNING_KEY` | `${{harness.PREVIEW_SIGNING_KEY}}` |
 
 ## Overview text for the marketplace
 
@@ -124,7 +145,10 @@ later, create a `preview` service (start command
 Factory on Rails is a self-hosted software factory. Sign in with GitHub, pick
 a repository, describe a change, and a coding agent (Claude Code or Codex) does the work
 in its own Railway sandbox and opens a pull request. You can follow the agent
-live, answer its questions and keep the conversation going.
+live, answer its questions and keep the conversation going. When it's done,
+the agent writes the pull request's title and description itself, and with an
+optional wildcard domain you can open the app it's running in its sandbox,
+privately.
 
 ## About Hosting Factory on Rails
 
