@@ -3,7 +3,13 @@
  * preview agent, carrying many TCP streams (see `Frame` in @factory/core).
  * Each stream is a Duplex, so Node's HTTP client can use it as a socket.
  */
-import { decodeFrame, encodeFrame, Frame, type FrameType, type PreviewPort } from "@factory/core";
+import {
+  decodeFrame,
+  encodeFrame,
+  Frame,
+  type FrameType,
+  type PreviewPort,
+} from "@factory/core";
 import { Duplex } from "node:stream";
 import type { WebSocket } from "ws";
 
@@ -37,6 +43,9 @@ export class TunnelStream extends Duplex {
     readonly id: number,
   ) {
     super({ allowHalfOpen: true });
+    // Whoever is using the stream (Node's HTTP client, an upgraded socket)
+    // handles its errors; one nobody is using must not crash the gateway.
+    this.on("error", () => {});
   }
 
   // Node's HTTP client calls these on real sockets.
@@ -51,7 +60,11 @@ export class TunnelStream extends Duplex {
     return this;
   }
 
-  override _write(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void) {
+  override _write(
+    chunk: Buffer,
+    _enc: BufferEncoding,
+    cb: (err?: Error | null) => void,
+  ) {
     const go = () => this.tunnel.send(Frame.Data, this.id, chunk, cb);
     if (this.remotePaused) this.held = go;
     else go();
@@ -112,13 +125,21 @@ export class TunnelStream extends Duplex {
   /** @internal The tunnel went away. */
   lost() {
     this.remoteClosed = true;
-    this.destroy(new Error("The sandbox's preview connection closed"));
+    // A stream the app already finished cleanly lost nothing.
+    this.destroy(
+      this.remoteEnded
+        ? undefined
+        : new Error("The sandbox's preview connection closed"),
+    );
   }
 }
 
 export class Tunnel {
   private readonly streams = new Map<number, TunnelStream>();
-  private readonly pending = new Map<number, { resolve: () => void; reject: (err: Error) => void; port: number }>();
+  private readonly pending = new Map<
+    number,
+    { resolve: () => void; reject: (err: Error) => void; port: number }
+  >();
   private nextId = 1;
   private lastSeen = Date.now();
   private readonly pinger: ReturnType<typeof setInterval>;
@@ -128,11 +149,17 @@ export class Tunnel {
   constructor(
     private readonly ws: WebSocket,
     readonly runId: string,
-    private readonly events: { onPorts: (ports: ReadonlyArray<PreviewPort>) => void; onClose: () => void },
+    private readonly events: {
+      onPorts: (ports: ReadonlyArray<PreviewPort>) => void;
+      onClose: () => void;
+    },
   ) {
     ws.on("message", (data, isBinary) => {
       this.lastSeen = Date.now();
-      if (isBinary) this.receive(Buffer.isBuffer(data) ? data : Buffer.concat(data as Buffer[]));
+      if (isBinary)
+        this.receive(
+          Buffer.isBuffer(data) ? data : Buffer.concat(data as Buffer[]),
+        );
     });
     ws.on("pong", () => (this.lastSeen = Date.now()));
     ws.on("ping", () => (this.lastSeen = Date.now()));
@@ -147,8 +174,12 @@ export class Tunnel {
 
   /** A connection to `localhost:<port>` inside the sandbox. */
   open(port: number, timeoutMs = 15_000): Promise<TunnelStream> {
-    if (this.closed) return Promise.reject(new Error("The sandbox's preview connection closed"));
-    if (this.streams.size >= MAX_STREAMS) return Promise.reject(new Error("Too many connections to this sandbox"));
+    if (this.closed)
+      return Promise.reject(
+        new Error("The sandbox's preview connection closed"),
+      );
+    if (this.streams.size >= MAX_STREAMS)
+      return Promise.reject(new Error("Too many connections to this sandbox"));
     const id = this.nextId;
     this.nextId = this.nextId >= 0xffff_fff0 ? 1 : this.nextId + 1;
     const stream = new TunnelStream(this, id);
@@ -182,9 +213,19 @@ export class Tunnel {
   }
 
   /** @internal */
-  send(type: number, stream: number, payload?: Buffer, cb?: (err?: Error) => void) {
-    if (this.closed) return cb?.(new Error("The sandbox's preview connection closed"));
-    this.ws.send(encodeFrame(type as FrameType, stream, payload), { binary: true }, cb);
+  send(
+    type: number,
+    stream: number,
+    payload?: Buffer,
+    cb?: (err?: Error) => void,
+  ) {
+    if (this.closed)
+      return cb?.(new Error("The sandbox's preview connection closed"));
+    this.ws.send(
+      encodeFrame(type as FrameType, stream, payload),
+      { binary: true },
+      cb,
+    );
   }
 
   /** @internal */
@@ -209,7 +250,9 @@ export class Tunnel {
     if (pending && type === Frame.Close) {
       this.pending.delete(id);
       this.streams.get(id)?.receive(type, Buffer.alloc(0));
-      return pending.reject(new OpenFailed(pending.port, payload.toString("utf8") || "closed"));
+      return pending.reject(
+        new OpenFailed(pending.port, payload.toString("utf8") || "closed"),
+      );
     }
     this.streams.get(id)?.receive(type, payload);
   }
@@ -218,7 +261,8 @@ export class Tunnel {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.pinger);
-    for (const p of this.pending.values()) p.reject(new Error("The sandbox's preview connection closed"));
+    for (const p of this.pending.values())
+      p.reject(new Error("The sandbox's preview connection closed"));
     this.pending.clear();
     for (const s of [...this.streams.values()]) s.lost();
     this.streams.clear();
@@ -232,9 +276,16 @@ export function parsePorts(payload: Buffer): ReadonlyArray<PreviewPort> {
     const raw: unknown = JSON.parse(payload.toString("utf8"));
     if (!Array.isArray(raw)) return [];
     return raw
-      .filter((p): p is { port: number; process?: unknown } => typeof p?.port === "number" && p.port >= 1 && p.port <= 65535)
+      .filter(
+        (p): p is { port: number; process?: unknown } =>
+          typeof p?.port === "number" && p.port >= 1 && p.port <= 65535,
+      )
       .slice(0, 100)
-      .map((p) => (typeof p.process === "string" && p.process ? { port: p.port, process: p.process.slice(0, 80) } : { port: p.port }));
+      .map((p) =>
+        typeof p.process === "string" && p.process
+          ? { port: p.port, process: p.process.slice(0, 80) }
+          : { port: p.port },
+      );
   } catch {
     return [];
   }
