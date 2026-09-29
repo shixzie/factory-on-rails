@@ -10,6 +10,11 @@ TypeScript with [Effect](https://effect.website).
 While a run works you can follow it live, answer the agent's questions, and
 watch its subagents and the flow of work between them on the Flow map.
 
+Our own instance runs at [factory.shixzie.com](https://factory.shixzie.com), and
+its Railway infrastructure is public: you can look around the project behind it
+at
+[railway.com/project/f4356592-cac1-4edf-a3bd-b58d0a8c023a](https://railway.com/project/f4356592-cac1-4edf-a3bd-b58d0a8c023a).
+
 ```
 .railway/railway.ts     Railway infrastructure as code (services, database)
 apps/web                Web UI (Next.js + shadcn/ui): runs as threads, composer, settings
