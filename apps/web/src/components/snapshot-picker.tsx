@@ -21,7 +21,7 @@ export function SnapshotPicker({ initial }: { initial: Api.SnapshotSettings }) {
 
   if (settings.available.length === 0) {
     return (
-      <p className="rounded-xl border border-dashed px-4 py-3 text-sm text-muted-foreground">
+      <p className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
         No snapshots are set up for your account, so your runs start from the factory&apos;s default sandbox. Whoever runs
         this factory can prepare one for you (see &ldquo;Sandbox snapshots&rdquo; in docs/setup.md).
       </p>
@@ -43,7 +43,7 @@ export function SnapshotPicker({ initial }: { initial: Api.SnapshotSettings }) {
     });
 
   return (
-    <div className="flex items-center gap-3 rounded-xl border bg-card p-4">
+    <div className="flex items-center gap-3 rounded-lg border bg-card p-4">
       <span className="flex size-8 items-center justify-center rounded-lg border bg-muted/50">
         <BoxIcon className="size-4 text-muted-foreground" />
       </span>

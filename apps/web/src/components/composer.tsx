@@ -119,7 +119,7 @@ export function Composer({
           submit();
         }}
         className={cn(
-          "rounded-2xl border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
+          "rounded-lg border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
           blocked && "opacity-60",
         )}
       >
