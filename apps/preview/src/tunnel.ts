@@ -30,6 +30,7 @@ export class TunnelStream extends Duplex {
   /** We asked the agent to stop sending. */
   private pausedRemote = false;
   private remoteClosed = false;
+  private remoteEnded = false;
 
   constructor(
     private readonly tunnel: Tunnel,
@@ -81,11 +82,23 @@ export class TunnelStream extends Duplex {
         this.tunnel.send(Frame.Pause, this.id);
       }
     } else if (type === Frame.End) {
+      this.remoteEnded = true;
       this.push(null);
     } else if (type === Frame.Close) {
       this.remoteClosed = true;
       const reason = payload.toString("utf8");
-      this.destroy(reason ? new Error(reason) : undefined);
+      if (reason) return void this.destroy(new Error(reason));
+      // A clean close (the app closed its connection, e.g. after a
+      // `Connection: close` response). Whatever it sent may still be buffered
+      // here while the reader is paused, and Node's HTTP client treats 'close'
+      // before the body is read as an aborted response, so only go once the
+      // reader has had it all.
+      if (!this.remoteEnded) {
+        this.remoteEnded = true;
+        this.push(null);
+      }
+      if (this.readableEnded) this.destroy();
+      else this.once("end", () => this.destroy());
     } else if (type === Frame.Pause) {
       this.remotePaused = true;
     } else if (type === Frame.Resume) {
