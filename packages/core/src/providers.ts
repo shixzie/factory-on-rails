@@ -31,6 +31,16 @@ export const MODEL_PROVIDERS = {
     helpUrl: "https://platform.openai.com/api-keys",
     helpLabel: "Get a key",
   },
+  codex_oauth: {
+    label: "ChatGPT subscription",
+    description:
+      "Codex uses your eligible ChatGPT plan. Run `codex login --device-auth` on your computer, then paste the contents of `~/.codex/auth.json` here.",
+    envVar: "CODEX_AUTH_JSON",
+    placeholder: '{"auth_mode":"chatgpt","tokens":{...}}',
+    helpUrl: "https://developers.openai.com/codex/auth/",
+    helpLabel: "Code login instructions",
+    multiline: true,
+  },
 } as const;
 
 export type ModelProvider = keyof typeof MODEL_PROVIDERS;
@@ -41,8 +51,8 @@ export function isModelProvider(value: string): value is ModelProvider {
 
 /** Returns an error message, or null when the key looks usable. */
 export function validateApiKey(provider: ModelProvider, key: string): string | null {
-  if (key.length < 20 || key.length > 512) return "That doesn't look like a complete key.";
-  if (/\s/.test(key)) return "Keys can't contain spaces or line breaks.";
+  if (key.length < 20 || key.length > (provider === "codex_oauth" ? 32_768 : 512)) return "That doesn't look like a complete credential.";
+  if (provider !== "codex_oauth" && /\s/.test(key)) return "Keys can't contain spaces or line breaks.";
   switch (provider) {
     case "anthropic":
       if (key.startsWith("sk-ant-oat")) return "That is a subscription token. Save it as your Claude subscription token instead.";
@@ -54,10 +64,22 @@ export function validateApiKey(provider: ModelProvider, key: string): string | n
     case "openai":
       if (!key.startsWith("sk-")) return "OpenAI API keys start with sk-.";
       return null;
+    case "codex_oauth": {
+      try {
+        const auth = JSON.parse(key) as { auth_mode?: unknown; tokens?: { access_token?: unknown; refresh_token?: unknown } };
+        if (auth.auth_mode !== "chatgpt" || typeof auth.tokens?.access_token !== "string" || typeof auth.tokens.refresh_token !== "string") {
+          return "Paste the complete auth.json created by `codex login --device-auth`.";
+        }
+        return null;
+      } catch {
+        return "That is not valid JSON. Paste the contents of ~/.codex/auth.json.";
+      }
+    }
   }
 }
 
-export function keyHint(key: string): string {
+export function keyHint(key: string, provider?: ModelProvider): string {
+  if (provider === "codex_oauth") return "login";
   return key.slice(-4);
 }
 
@@ -69,7 +91,7 @@ export function keyHint(key: string): string {
  */
 export const AGENTS = {
   claude: { label: AGENT_LABELS.claude, providers: ["claude_oauth", "anthropic"] },
-  codex: { label: AGENT_LABELS.codex, providers: ["openai"] },
+  codex: { label: AGENT_LABELS.codex, providers: ["codex_oauth", "openai"] },
 } as const satisfies Record<string, { label: string; providers: ReadonlyArray<ModelProvider> }>;
 
 export type AgentId = keyof typeof AGENTS;

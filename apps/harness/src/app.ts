@@ -130,6 +130,7 @@ const keySlots = (user: UserRow) =>
         placeholder: meta.placeholder,
         consoleUrl: meta.helpUrl,
         consoleLabel: meta.helpLabel,
+        multiline: "multiline" in meta && meta.multiline,
         saved: key ? { hint: key.hint, updatedAt: key.updated_at } : null,
       };
     });
@@ -285,7 +286,7 @@ const routes = HttpRouter.empty.pipe(
       const error = validateApiKey(provider, key);
       if (error) return yield* fail(400, "bad_request", error);
       const cipher = yield* TokenCipher;
-      yield* (yield* Store).upsertApiKey({ user_id: user.id, provider, key_enc: cipher.encrypt(key), hint: keyHint(key) });
+      yield* (yield* Store).upsertApiKey({ user_id: user.id, provider, key_enc: cipher.encrypt(key), hint: keyHint(key, provider) });
       return yield* json(Schema.Array(Api.ApiKeySlot))(yield* keySlots(user));
     }),
   ),

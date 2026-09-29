@@ -173,6 +173,8 @@ export const ApiKeySlot = Schema.Struct({
   /** Where to get one. */
   consoleUrl: Schema.String,
   consoleLabel: Schema.optionalWith(Schema.String, { default: () => "Get a key" }),
+  /** Credentials such as an auth.json document need a multi-line input. */
+  multiline: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   saved: Schema.NullOr(Schema.Struct({ hint: Schema.String, updatedAt: Schema.Date })),
 });
 export type ApiKeySlot = typeof ApiKeySlot.Type;

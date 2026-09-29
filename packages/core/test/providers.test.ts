@@ -6,6 +6,7 @@ describe("model providers", () => {
     expect(isModelProvider("anthropic")).toBe(true);
     expect(isModelProvider("claude_oauth")).toBe(true);
     expect(isModelProvider("openai")).toBe(true);
+    expect(isModelProvider("codex_oauth")).toBe(true);
     expect(isModelProvider("toString")).toBe(false);
     expect(isModelProvider("nope")).toBe(false);
   });
@@ -29,8 +30,16 @@ describe("model providers", () => {
     expect(validateApiKey("openai", "pk-" + "x".repeat(40))).toMatch(/sk-/);
   });
 
+  it("validates Codex ChatGPT device-login documents", () => {
+    const auth = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "access", refresh_token: "refresh" } });
+    expect(validateApiKey("codex_oauth", auth)).toBeNull();
+    expect(validateApiKey("codex_oauth", "not json but definitely long enough")).toMatch(/valid JSON/);
+    expect(validateApiKey("codex_oauth", JSON.stringify({ auth_mode: "chatgpt", tokens: {} }))).toMatch(/complete auth.json/);
+  });
+
   it("hints with the last four characters", () => {
     expect(keyHint("sk-ant-api03-abcd1234")).toBe("1234");
+    expect(keyHint('{"tokens":{}}', "codex_oauth")).toBe("login");
   });
 });
 
@@ -42,6 +51,7 @@ describe("agents", () => {
     expect(agentCredential("claude", ["anthropic", "openai"])).toBe("anthropic");
     expect(agentCredential("codex", ["anthropic"])).toBeUndefined();
     expect(agentCredential("codex", ["openai"])).toBe("openai");
+    expect(agentCredential("codex", ["openai", "codex_oauth"])).toBe("codex_oauth");
   });
 });
 

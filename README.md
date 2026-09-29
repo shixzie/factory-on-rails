@@ -63,7 +63,8 @@ do, and the app walks you through it on its setup page:
    project and a token that can only reach that environment, then forgets it;
    you can delete the token afterwards.
 6. **Save your agent credential** under **Settings** (a Claude subscription
-   token or Anthropic API key for Claude Code, an OpenAI API key for Codex)
+   token or Anthropic API key for Claude Code, a ChatGPT device login or an
+   OpenAI API key for Codex)
    and start a run.
 
 Costs: services and sandboxes are billed to the Railway workspace you deploy

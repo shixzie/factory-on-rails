@@ -6,6 +6,7 @@ import { makeCodexParser } from "./codex-stream.js";
 import type { AgentCommands, PreviewSettings } from "./config.js";
 import {
   AGENT_RAN_FILE,
+  CODEX_AUTH_SCRIPT,
   branchName,
   capPatch,
   cloneScript,
@@ -263,7 +264,7 @@ const work = (
     yield* sandbox.writeFile(COMMIT_MSG_FILE, commitMessage(messages[0] ?? run.task, run.id));
     for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
 
-    yield* step("Preparing the agent", agent.setupCommand);
+    yield* step("Preparing the agent", agent.id === "codex" ? `${CODEX_AUTH_SCRIPT}\n${agent.setupCommand}` : agent.setupCommand);
 
     // Lets the user open servers running in the sandbox (see packages/core/src/preview.ts).
     // Previews are a convenience: if this fails the turn carries on without them.
