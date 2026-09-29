@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
 import { Api, api, runInBrowser } from "@/lib/api";
 
 function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: ReadonlyArray<Api.ApiKeySlot>) => void }) {
@@ -73,16 +74,28 @@ function KeyRow({ slot, onChange }: { slot: Api.ApiKeySlot; onChange: (slots: Re
           save();
         }}
       >
-        <Input
-          type="password"
-          autoComplete="off"
-          value={key}
-          onChange={(e) => setKey(e.target.value)}
-          placeholder={slot.saved ? "Paste a new key to replace it" : slot.placeholder}
-          aria-label={slot.label}
-          aria-invalid={!!error || undefined}
-          className="font-mono"
-        />
+        {slot.multiline ? (
+          <Textarea
+            autoComplete="off"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            placeholder={slot.saved ? "Paste a new auth.json to replace it" : slot.placeholder}
+            aria-label={slot.label}
+            aria-invalid={!!error || undefined}
+            className="min-h-24 font-mono text-xs [-webkit-text-security:disc]"
+          />
+        ) : (
+          <Input
+            type="password"
+            autoComplete="off"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            placeholder={slot.saved ? "Paste a new key to replace it" : slot.placeholder}
+            aria-label={slot.label}
+            aria-invalid={!!error || undefined}
+            className="font-mono"
+          />
+        )}
         <Button type="submit" disabled={pending || key.trim().length === 0}>
           {pending ? <Spinner /> : null} Save
         </Button>

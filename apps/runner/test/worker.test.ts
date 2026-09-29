@@ -129,6 +129,23 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
       }),
     );
 
+    it.effect("installs a ChatGPT device login for Codex instead of using the API key", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes();
+        const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+        const auth = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "access-secret", refresh_token: "refresh-secret" } });
+        const run = yield* queueRunWith({ agent: "codex", keys: { openai: "sk-proj-unused-key-0000", codex_oauth: auth } });
+
+        yield* waitForRun(run.id, (r) => r.status === "succeeded");
+        yield* Fiber.interrupt(worker);
+
+        expect(sandboxes.state.createdWith?.CODEX_AUTH_JSON).toBe(auth);
+        expect(sandboxes.state.createdWith?.CODEX_API_KEY).toBeUndefined();
+        expect(sandboxes.state.commands).toContainEqual(expect.stringContaining('"$HOME/.codex/auth.json"'));
+        expect((yield* events(run.id)).join("\n")).not.toContain("access-secret");
+      }),
+    );
+
     it.effect("prefers a Claude subscription token over an API key, and passes only the token", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes();

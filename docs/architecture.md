@@ -510,13 +510,16 @@ key under **Settings**, and it is used for their runs only.
   provider. The UI only ever shows the last four characters.
 - Providers: an Anthropic API key and a Claude subscription token (from
   `claude setup-token`, which bills the user's Pro, Max, Team or Enterprise
-  plan) for Claude Code, and an OpenAI API key for Codex.
+  plan) for Claude Code; a Codex ChatGPT device-login document and an OpenAI
+  API key for Codex.
 - The harness refuses to queue a run whose agent has no credential (unless
   the user picked a sandbox snapshot, which can carry the agent's sign-in)
   and sends them to Settings. The runner decrypts the one credential the
   run's agent should use when it picks the run up and injects it under its
-  env var, so the agent CLI in the sandbox bills that user's account. Only
-  one goes in: Claude Code prefers an API key over a subscription token, so
+  env var, so the agent CLI in the sandbox bills that user's account. A saved
+  ChatGPT login is written to `~/.codex/auth.json` for the user's sandbox and
+  is removed before checkpoints are saved. Only the selected credential goes
+  in: Claude Code prefers an API key over a subscription token, so
   a saved subscription token is passed alone.
 - Providers and agents live in `packages/core/src/providers.ts`. Adding one
   is a new entry there with its env var and key check.

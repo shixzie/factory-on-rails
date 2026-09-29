@@ -132,8 +132,12 @@ runs use it. Runs use Claude Code or Codex, picked per run in the composer:
 | Claude Code | Claude subscription token (`claude setup-token`) | Your Pro, Max, Team or Enterprise plan |
 | Claude Code | Anthropic API key | Your Anthropic Console account |
 | Codex | OpenAI API key | Your OpenAI Platform account |
+| Codex | ChatGPT device login (`codex login --device-auth`) | Your eligible ChatGPT plan |
 
-A run gets only its agent's credential. With both saved, Claude Code gets the
+A run gets only its agent's credential. For ChatGPT, run `codex login
+--device-auth` locally, finish the code login, and paste the contents of
+`~/.codex/auth.json` into the ChatGPT subscription field in Settings. With
+both saved, Claude Code gets the
 subscription token (it would prefer an API key if it had both). An agent can
 also run on the sign-in inside a sandbox snapshot (step 7).
 
