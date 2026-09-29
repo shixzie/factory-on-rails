@@ -10,18 +10,19 @@ const LABEL: Record<Api.RunStatus, string> = {
   cancelled: "Cancelled",
 };
 
+/** Tinted chips, the way Railway badges a deployment (ACTIVE, DEPLOYING, FAILED). */
 const TONE: Record<Api.RunStatus, string> = {
-  queued: "text-muted-foreground",
-  running: "text-sky-600 dark:text-sky-400",
-  cancelling: "text-warning",
-  succeeded: "text-success",
-  failed: "text-destructive",
-  cancelled: "text-muted-foreground",
+  queued: "bg-muted text-muted-foreground",
+  running: "bg-info/15 text-info",
+  cancelling: "bg-warning/15 text-warning",
+  succeeded: "bg-success/15 text-success",
+  failed: "bg-destructive/15 text-destructive",
+  cancelled: "bg-muted text-muted-foreground",
 };
 
 const DOT: Record<Api.RunStatus, string> = {
   queued: "bg-muted-foreground/50",
-  running: "bg-sky-500 animate-pulse",
+  running: "bg-info animate-pulse",
   cancelling: "bg-warning animate-pulse",
   succeeded: "bg-success",
   failed: "bg-destructive",
@@ -46,11 +47,17 @@ export function StatusDot({ status, awaiting, className }: { status: Api.RunStat
   );
 }
 
-/** A dot and a word, colored by state, the way t3code labels a thread. */
+/** A dot and a word on a chip tinted by state. */
 export function StatusLabel({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
   const input = needsInput(status, awaiting);
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-xs font-medium", input ? "text-warning" : TONE[status], className)}>
+    <span
+      className={cn(
+        "inline-flex h-5 items-center gap-1.5 rounded-sm px-1.5 text-[11px] font-medium tracking-wide uppercase",
+        input ? "bg-warning/15 text-warning" : TONE[status],
+        className,
+      )}
+    >
       <StatusDot status={status} awaiting={awaiting} />
       {input ? "Needs input" : LABEL[status]}
     </span>

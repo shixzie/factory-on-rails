@@ -168,7 +168,7 @@ export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.A
   const groups = useMemo(() => groupByRepo(runs), [runs]);
 
   return (
-    <Sidebar collapsible="offcanvas">
+    <Sidebar collapsible="offcanvas" variant="inset">
       <SidebarHeader className="gap-3 px-3 pt-3">
         <Link href="/" className="flex items-center gap-2 px-1">
           <Logo />

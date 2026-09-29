@@ -20,7 +20,7 @@ export function NewRepoForm({ installUrl }: { installUrl: string }) {
 
   if (created) {
     return (
-      <div className="flex flex-col gap-3 rounded-xl border bg-card p-5 text-sm">
+      <div className="flex flex-col gap-3 rounded-lg border bg-card p-5 text-sm">
         <p>
           Created{" "}
           <a href={created.htmlUrl} target="_blank" rel="noreferrer" className="font-medium underline underline-offset-4">
@@ -40,7 +40,7 @@ export function NewRepoForm({ installUrl }: { installUrl: string }) {
 
   return (
     <form
-      className="flex flex-col gap-5 rounded-xl border bg-card p-5"
+      className="flex flex-col gap-5 rounded-lg border bg-card p-5"
       onSubmit={(e) => {
         e.preventDefault();
         start(async () => {

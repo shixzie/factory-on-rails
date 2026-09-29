@@ -8,8 +8,8 @@ import { ago } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const LINE_TONE: Record<DiffLine["type"], string> = {
-  add: "bg-success/10 text-foreground",
-  del: "bg-destructive/10 text-foreground",
+  add: "bg-success/10 text-foreground dark:bg-success/15",
+  del: "bg-destructive/10 text-foreground dark:bg-destructive/15",
   ctx: "text-foreground/80",
   note: "text-muted-foreground italic",
 };
@@ -184,7 +184,7 @@ export function ChangedFiles({ files, onOpen }: { files: DiffFile[]; onOpen: (pa
   const totals = diffTotals(files);
   if (files.length === 0) return null;
   return (
-    <div className="rounded-xl border bg-card/40">
+    <div className="rounded-lg border bg-card/40">
       <button
         type="button"
         onClick={() => onOpen()}

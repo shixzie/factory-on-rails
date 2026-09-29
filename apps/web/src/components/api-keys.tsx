@@ -115,7 +115,7 @@ export function ApiKeys({ initial }: { initial: ReadonlyArray<Api.ApiKeySlot> })
       {agents.map((agent) => (
         <div key={agent} className="flex flex-col gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{Api.AGENT_LABELS[agent]}</h3>
-          <div className="divide-y rounded-xl border bg-card">
+          <div className="divide-y rounded-lg border bg-card">
             {slots
               .filter((slot) => slot.agent === agent)
               .map((slot) => (

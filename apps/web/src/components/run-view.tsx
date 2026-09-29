@@ -98,7 +98,7 @@ function MessageComposer({
         void submit();
       }}
       className={cn(
-        "mx-auto w-full max-w-3xl rounded-2xl border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
+        "mx-auto w-full max-w-3xl rounded-lg border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
         question && "border-warning/50",
         disabled && "opacity-60",
       )}
@@ -164,7 +164,7 @@ function MessageComposer({
 function Outcome({ run }: { run: Api.ApiRun }) {
   if (run.status === "succeeded" && run.pullRequestUrl) {
     return (
-      <div className="flex items-center gap-3 rounded-xl border bg-card px-4 py-3">
+      <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
         <span className="flex size-8 items-center justify-center rounded-lg bg-success/15 text-success">
           <GitPullRequestIcon className="size-4" />
         </span>
@@ -183,7 +183,7 @@ function Outcome({ run }: { run: Api.ApiRun }) {
   }
   if (run.status === "failed") {
     return (
-      <div className="flex items-start gap-2.5 rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
+      <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
         <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
         <div className="min-w-0">
           <div className="font-medium text-destructive">Run failed</div>
@@ -237,8 +237,11 @@ function SidePanel({
             aria-selected={tab === t.id}
             onClick={() => onTab(t.id)}
             className={cn(
-              "relative inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs transition-colors [&_svg]:size-3.5",
-              tab === t.id ? "bg-accent font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+              "relative inline-flex h-full items-center gap-1.5 px-2.5 text-xs transition-colors [&_svg]:size-3.5",
+              // Underlined like the tabs on a Railway service panel.
+              tab === t.id
+                ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
+                : "text-muted-foreground hover:text-foreground",
             )}
           >
             {t.icon}
@@ -487,7 +490,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           <div className="flex-1 px-4 pt-8 pb-6">
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
               <div className="flex flex-col items-end gap-1.5">
-                <div className="max-w-[85%] rounded-2xl rounded-br-md border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
+                <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {run.task}
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground" suppressHydrationWarning>
@@ -570,7 +573,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
             {panel === "preview" ? (
               <PreviewPane run={run} enabled={initial.previewsEnabled} />
             ) : panel === "flow" ? (
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="canvas-dots flex-1 overflow-y-auto p-4">
                 <RunFlow
                   events={events}
                   live={active}
