@@ -339,7 +339,7 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 
 A thread retains every associated PR in `runs.pull_request_urls`, exposed as
 `pullRequestUrls` in the API. Publishing a new PR appends its URL atomically;
-repeat publications keep one link per PR. Migration 009 preserves existing
+repeat publications keep one link per PR. Migration 010 preserves existing
 links. The singular `pull_request_url` remains the runner's current PR for
 follow-up work and is still returned as `pullRequestUrl` for older clients.
 

@@ -109,7 +109,7 @@ function MessageComposer({
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
             e.preventDefault();
             void submit();
           }
@@ -131,8 +131,7 @@ function MessageComposer({
               : (hint ?? "The agent picks up where it left off.")}
         </span>
         <span className="ml-auto hidden items-center gap-1 text-[11px] text-muted-foreground sm:inline-flex">
-          <Kbd>⌘</Kbd>
-          <Kbd>↵</Kbd>
+          <Kbd>↵</Kbd> send · <Kbd>Shift</Kbd><Kbd>↵</Kbd> new line
         </span>
         {showStop ? (
           <Tooltip>
@@ -499,6 +498,10 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                   <span>{run.repo}</span>
                   <span>·</span>
                   <span>{Api.AGENT_LABELS[run.agent]}</span>
+                  <span>·</span>
+                  <span>{run.model ?? "Default model"}</span>
+                  <span>·</span>
+                  <span>{run.reasoningEffort ? `${Api.REASONING_EFFORT_LABELS[run.reasoningEffort]} effort` : "Default effort"}</span>
                   <span>·</span>
                   <GitBranchIcon className="size-3" />
                   <span>{run.branch ? `${run.baseBranch} ← ${run.branch}` : run.baseBranch}</span>

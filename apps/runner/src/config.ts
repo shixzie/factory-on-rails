@@ -2,6 +2,11 @@ import { Api, previewSigningKeyConfig, snapshotsConfig, type AgentId, type Sandb
 import { Config, Context, Duration, Effect, Layer, Option, type Redacted } from "effect";
 import { hostname } from "node:os";
 
+/** Optional run choices are passed as single arguments, never evaluated as shell code. */
+const MODEL_ARGUMENT = '${FACTORY_MODEL:+--model "$FACTORY_MODEL"}';
+const CLAUDE_EFFORT_ARGUMENT = '${FACTORY_REASONING_EFFORT:+--effort "$FACTORY_REASONING_EFFORT"}';
+const CODEX_EFFORT_ARGUMENT = '${FACTORY_CODEX_EFFORT:+-c "$FACTORY_CODEX_EFFORT"}';
+
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
 /**
  * Claude Code in headless mode, streaming JSON so the run page can show each
@@ -14,6 +19,8 @@ export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm ins
  */
 export const DEFAULT_AGENT_COMMAND = [
   'claude ${FACTORY_CONTINUE:+--continue} -p "$(cat "$FACTORY_TASK_FILE")"',
+  MODEL_ARGUMENT,
+  CLAUDE_EFFORT_ARGUMENT,
   "--dangerously-skip-permissions",
   "--output-format stream-json --verbose",
   "$(claude --help 2>/dev/null | grep -q -- --forward-subagent-text && echo --forward-subagent-text)",
@@ -38,6 +45,8 @@ export const DEFAULT_CODEX_COMMAND = [
   [
     "codex exec ${FACTORY_CONTINUE:+resume --last} --json",
     "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --skip-git-repo-check",
+    MODEL_ARGUMENT,
+    CODEX_EFFORT_ARGUMENT,
     '"$@" - < "$FACTORY_TASK_FILE"',
   ].join(" "),
 ].join("\n");
@@ -51,6 +60,8 @@ export const DEFAULT_CODEX_COMMAND = [
  */
 export const DEFAULT_AGENT_DESCRIBE_COMMAND = [
   'claude --continue --no-session-persistence -p "$(cat "$FACTORY_DESCRIBE_FILE")"',
+  MODEL_ARGUMENT,
+  CLAUDE_EFFORT_ARGUMENT,
   '--dangerously-skip-permissions --tools "Bash,Read,Grep,Glob"',
   '> "$FACTORY_PR_FILE"',
 ].join(" ");
@@ -59,6 +70,8 @@ export const DEFAULT_AGENT_DESCRIBE_COMMAND = [
 export const DEFAULT_CODEX_DESCRIBE_COMMAND = [
   "codex exec resume --last --ephemeral",
   "--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check",
+  MODEL_ARGUMENT,
+  CODEX_EFFORT_ARGUMENT,
   '-o "$FACTORY_PR_FILE" - < "$FACTORY_DESCRIBE_FILE"',
 ].join(" ");
 

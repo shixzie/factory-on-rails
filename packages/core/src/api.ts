@@ -17,6 +17,18 @@ export const AgentId = Schema.Literal("claude", "codex");
 export type AgentId = typeof AgentId.Type;
 export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex" };
 
+/** Null leaves the agent's own model/effort configuration in control. */
+export const ReasoningEffort = Schema.Literal("low", "medium", "high", "xhigh", "max", "ultra");
+export type ReasoningEffort = typeof ReasoningEffort.Type;
+export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra",
+};
+export const AGENT_EFFORTS: Record<AgentId, readonly ReasoningEffort[]> = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["low", "medium", "high", "xhigh", "max", "ultra"],
+};
+export const ModelId = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._:/@+\[\]-]*$/));
+
 /** A finished run's sandbox is stopped (checkpointed, then destroyed) after this long without activity. */
 export const SANDBOX_IDLE_STOP_MINUTES = 5;
 /** A run with no activity for this long is deleted, with its sandbox. */
@@ -79,6 +91,8 @@ export const ApiRun = Schema.Struct({
   /** The user named the run themselves. */
   titleByUser: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
+  model: Schema.optionalWith(Schema.NullOr(ModelId), { default: () => null }),
+  reasoningEffort: Schema.optionalWith(Schema.NullOr(ReasoningEffort), { default: () => null }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
   /** Latest PR; retained for clients that only display one. */
@@ -187,6 +201,8 @@ export const CreateRunBody = Schema.Struct({
   task: Schema.String,
   baseBranch: Schema.optional(Schema.String),
   agent: Schema.optional(AgentId),
+  model: Schema.optional(Schema.NullOr(ModelId)),
+  reasoningEffort: Schema.optional(Schema.NullOr(ReasoningEffort)),
 });
 export type CreateRunBody = typeof CreateRunBody.Type;
 

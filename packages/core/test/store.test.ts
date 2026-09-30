@@ -41,7 +41,7 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
           // A temporary table shadows runs only within this transaction.
           yield* sql`create temporary table runs (pull_request_url text) on commit drop`;
           yield* sql`insert into runs (pull_request_url) values ('https://github.com/O/R/pull/1'), (null)`;
-          yield* sql.unsafe(readFileSync(new URL("../migrations/009_run_pull_requests.sql", import.meta.url), "utf8"));
+          yield* sql.unsafe(readFileSync(new URL("../migrations/010_run_pull_requests.sql", import.meta.url), "utf8"));
           const rows = yield* sql<{ pull_request_urls: string[] }>`select pull_request_urls from runs order by pull_request_url nulls last`;
           expect(rows.map((r) => r.pull_request_urls)).toEqual([["https://github.com/o/r/pull/1"], []]);
         }));
