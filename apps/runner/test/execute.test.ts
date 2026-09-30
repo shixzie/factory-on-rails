@@ -1,6 +1,6 @@
-import { PREVIEW_AGENT_SCRIPT, verifyPreviewGrant, type RunRow } from "@factory/core";
+import { GitHubError, PREVIEW_AGENT_SCRIPT, type CiCheck, verifyPreviewGrant, type RunRow } from "@factory/core";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Redacted } from "effect";
+import { Duration, Effect, Fiber, Layer, TestClock, Option, Redacted } from "effect";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
 import {
@@ -55,18 +55,19 @@ const execute = (
     turn = run,
     prOpen = false,
     grantedPermissions,
-  }: { turn?: RunRow; prOpen?: boolean; grantedPermissions?: string[] } = {},
+    ciChecks,
+  }: { turn?: RunRow; prOpen?: boolean; grantedPermissions?: string[]; ciChecks?: (sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError> } = {},
 ) => {
   const github: unknown[][] = [];
   return Effect.gen(function* () {
-    const log = yield* makeRunLog(run.id);
+    const log = yield* makeRunLog(run.id, { flushEvery: Duration.hours(1) });
     log.addSecret(agent.env.ANTHROPIC_API_KEY!);
-    const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ...extra });
+    const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ciDiscoveryGrace: "0 seconds", ...extra });
     yield* log.flush;
     return { outcome, github, events: store.events.map((e) => `${e.kind}:${e.message}`) };
   }).pipe(
     Effect.scoped,
-    Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { grantedPermissions, prOpen }))),
+    Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { grantedPermissions, prOpen, ciChecks }))),
   );
 };
 
@@ -77,6 +78,129 @@ const PREVIEW_KEY = "s".repeat(40);
 const preview = Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make(PREVIEW_KEY) });
 
 describe("executeRun", () => {
+  it.effect("waits for pending CI and checks the published commit again", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.sync(() => [{ name: "CI", state: ++polls === 1 ? "pending" : "passed", url: null }]),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(polls).toBe(1);
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("1 second");
+      const { outcome, github } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "ciChecks")).toEqual([["ciChecks", "a".repeat(40)], ["ciChecks", "a".repeat(40)]]);
+    }),
+  );
+
+  it.effect("resumes the agent on CI failure, pushes the fix, and verifies the new commit", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      const sandboxes = fakeSandboxes({
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
+      });
+      const { outcome, github } = yield* execute(sandboxes, recordingStore(), {}, {
+        ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : "passed", url: "https://github.com/shixzie/demo/actions/runs/1" }]),
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "ciChecks")).toEqual([["ciChecks", "a".repeat(40)], ["ciChecks", "b".repeat(40)]]);
+      expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(2);
+      const agents = sandboxes.state.commands.flatMap((c, i) => c.includes("run-agent") ? [i] : []);
+      expect(agents).toHaveLength(2);
+      expect(sandboxes.state.envs[agents[1]!]).toMatchObject({ FACTORY_CONTINUE: "1" });
+      expect(sandboxes.state.files["/workspace/TASK.md"]).toContain("https://github.com/shixzie/demo/actions/runs/1");
+    }),
+  );
+
+  it.effect("fails honestly when CI is broken and the agent leaves no fixes", () =>
+    Effect.gen(function* () {
+      let pushes = 0;
+      const sandboxes = fakeSandboxes({ "git push": Effect.sync(() => ({ stdout: ++pushes === 1 ? "" : UP_TO_DATE_MARKER })) });
+      const { outcome } = yield* execute(sandboxes, recordingStore(), {}, {
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "failed", url: null }]),
+      });
+      expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("no fixes to push") });
+    }),
+  );
+
+  it.effect("does not skip CI when a follow-up has no new changes", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes({ "git push": { stdout: UP_TO_DATE_MARKER } });
+      const { outcome } = yield* execute(sandboxes, recordingStore(), {}, {
+        turn: followUp({}), prOpen: true,
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "failed", url: null }]),
+      });
+      expect(outcome.status).toBe("failed");
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(2);
+    }),
+  );
+
+  it.effect("allows time for checks to appear before reporting no CI", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), { ciDiscoveryGrace: "60 seconds", agent: { ...agent, timeoutSec: 120 } }, {
+        ciChecks: () => Effect.succeed([]),
+      }));
+      yield* TestClock.adjust("59 seconds");
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("1 second");
+      const { outcome, events } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(events.some((e) => e.includes("No CI checks were reported"))).toBe(true);
+      expect(events.some((e) => e.includes("CI passed"))).toBe(false);
+    }),
+  );
+
+  it.effect("can cancel a run while CI is pending", () =>
+    Effect.gen(function* () {
+      let cancelling = false;
+      const store = recordingStore(() => cancelling ? "cancelling" : "running");
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), store, {}, {
+        ciChecks: () => Effect.sync(() => {
+          cancelling = true;
+          return [{ name: "Tests", state: "pending", url: null }];
+        }),
+      }));
+      yield* TestClock.adjust("10 seconds");
+      expect((yield* Fiber.join(fiber)).outcome.status).toBe("cancelled");
+    }),
+  );
+
+  it.effect("refreshes installation credentials during a long CI wait", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {
+        agent: { ...agent, timeoutSec: 3600 }, ciPollEvery: "45 minutes", heartbeatEvery: "50 minutes",
+      }, {
+        ciChecks: () => Effect.sync(() => [{ name: "Tests", state: ++polls === 1 ? "pending" : "passed", url: null }]),
+      }));
+      yield* TestClock.adjust("45 minutes");
+      const { outcome, github } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "installationToken")).toHaveLength(2);
+    }),
+  );
+
+  it.effect("never marks unreadable CI as successful", () =>
+    Effect.gen(function* () {
+      const { outcome } = yield* execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.fail(new GitHubError({ status: 403, message: "CI access denied" })),
+      });
+      expect(outcome).toEqual({ status: "failed", error: "CI access denied" });
+    }),
+  );
+
+  it.effect("times out pending CI without reporting success", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "pending", url: null }]),
+      }));
+      yield* TestClock.adjust("60 seconds");
+      const { outcome } = yield* Fiber.join(fiber);
+      expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("CI has not been verified green") });
+    }),
+  );
+
   it.effect("starts the sandbox's preview agent with this run's tunnel grant before the agent works", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
@@ -140,7 +264,7 @@ describe("executeRun", () => {
         42,
         {
           repositories: ["demo"],
-          permissions: { contents: "write", pull_requests: "write", metadata: "read", workflows: "write" },
+          permissions: { contents: "write", pull_requests: "write", metadata: "read", checks: "read", statuses: "read", actions: "read", workflows: "write" },
         },
       ]);
       expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", IS_SANDBOX: "1" });
@@ -162,6 +286,7 @@ describe("executeRun", () => {
         "run-agent",
         "set -eu",
         "set -eu",
+        "git rev-parse HEAD",
       ]);
       expect(sandboxes.state.commands[4]).toContain("git diff --cached");
       expect(Object.keys(sandboxes.state.files)).toEqual(
@@ -234,12 +359,12 @@ describe("executeRun", () => {
       const sandboxes = fakeSandboxes();
       const store = recordingStore();
       const { outcome, github, events } = yield* execute(sandboxes, store, {}, {
-        grantedPermissions: ["contents", "pull_requests", "metadata"],
+        grantedPermissions: ["contents", "pull_requests", "metadata", "checks", "statuses", "actions"],
       });
       expect(outcome.status).toBe("succeeded");
       expect(github.filter((c) => c[0] === "installationToken").map((c) => Object.keys((c[2] as { permissions: object }).permissions))).toEqual([
-        ["contents", "pull_requests", "metadata", "workflows"],
-        ["contents", "pull_requests", "metadata"],
+        ["contents", "pull_requests", "metadata", "checks", "statuses", "actions", "workflows"],
+        ["contents", "pull_requests", "metadata", "checks", "statuses", "actions"],
       ]);
       expect(events).toContain(
         "info:The GitHub App has no Workflows permission, so this run can't change files in .github/workflows",
@@ -416,6 +541,7 @@ describe("executeRun", () => {
           "run-agent",
           "set -eu",
           "set -eu",
+          "git rev-parse HEAD",
         ]);
         expect(sandboxes.state.commands[1]).toContain("git remote set-url origin https://github.com/shixzie/demo.git");
         expect(sandboxes.state.commands[1]).not.toContain("git clone");
@@ -425,7 +551,7 @@ describe("executeRun", () => {
         expect(sandboxes.state.files["/workspace/COMMIT_MSG"]).toMatch(/^Also add a license\n/);
         expect(store.updates).toContainEqual({ delivered_message_id: "5" });
         // The PR from the first turn is still open, so the push lands there.
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "ciChecks"]);
         expect(events).toContain(`info:Pushed the changes to ${PR}`);
         expect(store.updates).not.toContainEqual({ pull_request_url: expect.anything() });
         expect(sandboxes.state.destroyed).toBe(false);
@@ -445,7 +571,7 @@ describe("executeRun", () => {
         expect(sandboxes.state.deletedCheckpoints).toEqual(["cp_9"]);
         expect(store.updates[0]).toMatchObject({ sandbox_id: "sbx_restored", sandbox_state: "running", sandbox_checkpoint_id: null });
         expect(events).toContain("info:No new changes this turn");
-        expect(github.map((c) => c[0])).toEqual(["installationToken"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "ciChecks"]);
         // No session to continue (the agent never ran here), so it gets the whole story.
         expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
         const task = sandboxes.state.files["/workspace/TASK.md"]!;
@@ -504,9 +630,9 @@ describe("executeRun", () => {
         expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
         const lines = firstLines(sandboxes.state.commands);
         // After the push (the last "set -eu"), before the PR.
-        expect(lines.slice(-3)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
-        expect(sandboxes.state.commands.at(-2)).toContain("\ndescribe-pr");
-        expect(sandboxes.state.envs.at(-2)).toEqual({
+        expect(lines.slice(-4, -1)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
+        expect(sandboxes.state.commands.at(-3)).toContain("\ndescribe-pr");
+        expect(sandboxes.state.envs.at(-3)).toEqual({
           FACTORY_MODEL: "",
           FACTORY_REASONING_EFFORT: "",
           FACTORY_CODEX_EFFORT: "",
@@ -561,7 +687,7 @@ describe("executeRun", () => {
 
         expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
         expect(sandboxes.state.files["/workspace/.factory/describe-prompt.md"]).toContain("already has a pull request");
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "updatePullRequest"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "updatePullRequest", "ciChecks"]);
         expect(github[2]).toEqual([
           "updatePullRequest",
           "ghs_repo_token",

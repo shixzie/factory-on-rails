@@ -1,4 +1,4 @@
-import { GitHubAppApi, GitHubError, Store, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type CiCheck, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
 import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
@@ -35,7 +35,7 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
  */
 export const fakeGitHub = (
   calls: unknown[][] = [],
-  { grantedPermissions, prOpen = false }: { grantedPermissions?: string[]; prOpen?: boolean } = {},
+  { grantedPermissions, prOpen = false, ciChecks }: { grantedPermissions?: string[]; prOpen?: boolean; ciChecks?: (sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError> } = {},
 ) =>
   Layer.succeed(GitHubAppApi, {
     installationToken: (...args) =>
@@ -60,6 +60,10 @@ export const fakeGitHub = (
             )
           : Effect.succeed({ number: 1, html_url: "https://github.com/shixzie/demo/pull/1" });
       }),
+    ciChecks: (_token, _repo, sha) => Effect.suspend(() => {
+      calls.push(["ciChecks", sha]);
+      return ciChecks ? ciChecks(sha) : Effect.succeed([{ name: "CI", state: "passed" as const, url: null }]);
+    }),
     updatePullRequest: (token, repo, number, pr) =>
       Effect.suspend(() => {
         calls.push(["updatePullRequest", Redacted.value(token), repo, number, pr]);
@@ -135,7 +139,7 @@ export const fakeSandboxes = (
         return Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (state.killed = true))));
       }
       const key = Object.keys(results).find((k) => command.includes(k));
-      const planned = key ? results[key]! : {};
+      const planned = key ? results[key]! : command.endsWith("\ngit rev-parse HEAD") ? { stdout: "a".repeat(40) } : {};
       const effect =
         typeof planned === "function"
           ? planned(options?.onOutput ?? (() => {}))

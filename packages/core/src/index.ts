@@ -12,3 +12,4 @@ export * from "./github/http.js";
 export * from "./github/manifest.js";
 export * from "./github/oauth.js";
 export * from "./github/schemas.js";
+export * from "./github/ci.js";

@@ -44,7 +44,7 @@ describe("agent tools", () => {
     writeFileSync(task, "- a task that starts with a dash");
     const invoke = async (extra: Record<string, string> = {}) => {
       const { stdout } = await run("sh", ["-c", DEFAULT_CODEX_COMMAND], {
-        env: { ...env, ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task },
+        env: { ...env, FACTORY_CONTINUE: "", ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task },
       });
       return JSON.parse(stdout) as { args: string[]; stdin: string };
     };

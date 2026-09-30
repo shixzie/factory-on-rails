@@ -307,7 +307,7 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 2. A runner replica claims it with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)`,
    so any number of runner replicas can share the queue without double-claiming.
 3. The runner mints an installation token scoped to that one repository
-   (contents and pull requests write), creates the sandbox, clones the base
+   (contents and pull requests write; checks, statuses and actions read), creates the sandbox, clones the base
    branch, and checks out `factory/run-<id>`.
 4. It runs the run's agent in the repo: `AGENT_SETUP_COMMAND` and
    `AGENT_COMMAND` for Claude Code, in headless mode
@@ -318,8 +318,12 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    shown as a log.
 5. It commits whatever the agent left uncommitted and pushes the branch if it
    moved. The same agent then writes the pull request (see "Pull request
-   text" below), and the runner opens it. The sandbox stays up for the next
-   turn.
+   text" below), and the runner opens it. The runner polls check runs, check
+   suites, workflows and commit statuses for the published SHA. Failures resume
+   the agent with diagnostics; its fixes are pushed and checked again before
+   the run can succeed. An unchanged follow-up still verifies CI. Missing CI
+   gets a 60-second discovery period; unreadable CI, a timeout or an agent
+   unable to produce a fix fails the run. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
    sees `cancelling` and interrupts the run, which kills the agent process.
    When a runner is stopped (redeploy, scale down), it interrupts its runs

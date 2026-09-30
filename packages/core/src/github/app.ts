@@ -4,6 +4,7 @@ import { createSign } from "node:crypto";
 import { InstanceSettings } from "../instance.js";
 import { appNotSetUp } from "./oauth.js";
 import { executeJson, GitHubError, githubRequest } from "./http.js";
+import { readCiChecks, type CiCheck } from "./ci.js";
 import { InstallationTokenResponse, PullRequest } from "./schemas.js";
 
 export interface GitHubAppCredentials {
@@ -45,6 +46,7 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
       repoFullName: string,
       pr: { title: string; body: string; head: string; base: string },
     ) => Effect.Effect<PullRequest, GitHubError>;
+    readonly ciChecks: (token: Redacted.Redacted<string>, repo: string, sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError>;
     /** Rewrites an open pull request's title and description. */
     readonly updatePullRequest: (
       token: Redacted.Redacted<string>,
@@ -81,6 +83,7 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
             ),
             Effect.map((res) => Redacted.make(res.token)),
           ),
+        ciChecks: (token, repo, sha) => readCiChecks(client, token, repo, sha),
         createPullRequest: (token, repoFullName, pr) =>
           githubRequest("POST", `/repos/${repoFullName}/pulls`).pipe(
             HttpClientRequest.bearerToken(Redacted.value(token)),
