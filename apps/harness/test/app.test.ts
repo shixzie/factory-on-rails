@@ -507,6 +507,27 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
   });
 
   describe("agents and snapshots", () => {
+    it("saves model and effort, returns them in run details, and rejects invalid options", async () => {
+      const { cookie } = await signIn("model-picker", 31);
+      github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-api03-" + "a".repeat(30) });
+      const body = { installationId: 1, repo: "shixzie/demo", task: "x" };
+      const created = await post("/api/runs", cookie, { ...body, model: "opus", reasoningEffort: "high" });
+      expect(created.status).toBe(201);
+      const selected = await json(created);
+      expect(selected).toMatchObject({ model: "opus", reasoningEffort: "high" });
+      const detail = await json(request(`/api/runs/${selected.id}`, { headers: { cookie } }));
+      expect(detail.run).toMatchObject({ model: "opus", reasoningEffort: "high" });
+      const defaults = await json(post("/api/runs", cookie, body));
+      expect(defaults).toMatchObject({ model: null, reasoningEffort: null });
+      for (const options of [
+        { reasoningEffort: "invalid" }, { reasoningEffort: "ultra" },
+        { model: "" }, { model: "--help" }, { model: "a\nb" }, { model: "a".repeat(201) },
+      ]) {
+        expect((await post("/api/runs", cookie, { ...body, ...options })).status).toBe(400);
+      }
+    });
+
     it("needs the chosen agent's own key", async () => {
       const { cookie } = await signIn("codexer", 11);
       github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];

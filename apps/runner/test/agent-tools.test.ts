@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { agentToolEnv, agentToolFiles, deliverMessageScript, SYSTEM_PROMPT } from "../src/agent-tools.js";
-import { DEFAULT_AGENT_DESCRIBE_COMMAND, DEFAULT_CODEX_COMMAND, DEFAULT_CODEX_DESCRIBE_COMMAND } from "../src/config.js";
+import { DEFAULT_AGENT_COMMAND, DEFAULT_AGENT_DESCRIBE_COMMAND, DEFAULT_CODEX_COMMAND, DEFAULT_CODEX_DESCRIBE_COMMAND } from "../src/config.js";
 
 /** Writes the agent tools into a temp dir, as the runner does in the sandbox. */
 function setup() {
@@ -69,6 +69,46 @@ describe("agent tools", () => {
 
     const later = await invoke({ FACTORY_CONTINUE: "1" });
     expect(later.args.slice(0, 4)).toEqual(["exec", "resume", "--last", "--json"]);
+  });
+
+  it.each([
+    ["claude", DEFAULT_AGENT_COMMAND],
+    ["codex", DEFAULT_CODEX_COMMAND],
+    ["claude", DEFAULT_AGENT_DESCRIBE_COMMAND],
+    ["codex", DEFAULT_CODEX_DESCRIBE_COMMAND],
+  ])("passes model and effort as single arguments to %s: %s", async (agent, command) => {
+    const { dir, env } = setup();
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const capture = join(dir, "args.json");
+    writeFileSync(join(bin, agent), `#!/usr/bin/env node
+const fs = require("node:fs");
+if (!process.argv.includes("--help")) fs.writeFileSync(process.env.CAPTURE, JSON.stringify(process.argv.slice(2)));
+if (process.argv.includes("-")) process.stdin.resume();
+`, { mode: 0o755 });
+    const task = join(dir, "task.md");
+    writeFileSync(task, "Task");
+    for (const continuing of ["", "1"]) {
+      for (const model of ["", "custom-model", 'custom $(echo injected) " model']) {
+        await run("sh", ["-c", command], { env: {
+          ...env, PATH: `${bin}:${process.env.PATH}`, CAPTURE: capture,
+          FACTORY_TASK_FILE: task, FACTORY_DESCRIBE_FILE: task, FACTORY_PR_FILE: join(dir, "pr.md"),
+          FACTORY_CONTINUE: continuing, FACTORY_MODEL: model,
+          FACTORY_REASONING_EFFORT: model ? "high" : "",
+          FACTORY_CODEX_EFFORT: model ? 'model_reasoning_effort="high"' : "",
+        } });
+        const args = JSON.parse(readFileSync(capture, "utf8")) as string[];
+        if (model) {
+          expect(args[args.indexOf("--model") + 1]).toBe(model);
+          if (agent === "claude") expect(args[args.indexOf("--effort") + 1]).toBe("high");
+          else expect(args.filter((_, i) => args[i - 1] === "-c")).toContain('model_reasoning_effort="high"');
+        } else {
+          expect(args).not.toContain("--model");
+          expect(args).not.toContain("--effort");
+          expect(args.some((a) => a.startsWith("model_reasoning_effort="))).toBe(false);
+        }
+      }
+    }
   });
 
   it("asks each agent for the pull request in its own session, without saving the exchange, and keeps the reply", async () => {
