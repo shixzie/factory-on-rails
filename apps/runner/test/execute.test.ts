@@ -1,6 +1,7 @@
-import { PREVIEW_AGENT_SCRIPT, verifyPreviewGrant, type RunRow } from "@factory/core";
+import { PREVIEW_AGENT_SCRIPT, verifyPreviewGrant, type RunExecution, type RunRow } from "@factory/core";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Option, Redacted } from "effect";
+import { ExecInterruptedError } from "railway";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
 import {
@@ -13,6 +14,7 @@ import {
   UP_TO_DATE_MARKER,
 } from "../src/plan.js";
 import { makeRunLog } from "../src/run-log.js";
+import { SandboxError } from "../src/sandbox.js";
 import { fakeGitHub, fakeSandboxes, recordingStore } from "./stubs.js";
 
 const run = {
@@ -77,6 +79,70 @@ const PREVIEW_KEY = "s".repeat(40);
 const preview = Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make(PREVIEW_KEY) });
 
 describe("executeRun", () => {
+  describe("deployment recovery", () => {
+    const done = (name: string, stdout = "") => ({ name, result: { exitCode: 0, stdout, timedOut: false } });
+    const prepared: RunExecution = {
+      checkout: "clone",
+      sessions: { network: done("network"), checkout: done("checkout"), prepare: done("prepare") },
+    };
+    const recovery = (execution: RunExecution) => ({ ...run, recovering: true, sandbox_state: "running" as const, sandbox_id: "sbx_live", execution });
+
+    it.effect("clones when a deploy interrupted setup before the first checkout", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = recovery({ checkout: "clone", sessions: { network: done("network") } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.commands.some((c) => c.includes("git clone"))).toBe(true);
+        expect(sandboxes.state.createdWith).toBeUndefined();
+      }),
+    );
+
+    it.effect("keeps the frozen follow-up prompt after its delivery marker was saved", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = { ...recovery({ ...prepared, prompt: { text: "Also add the license", commitMessage: "Add license", deliveredMessageId: "5" } }), turns: 2, delivered_message_id: "5" };
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Also add the license");
+      }),
+    );
+
+    it.effect("reattaches to the saved agent without overwriting its task or restarting previews", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: { name: "live-agent", startedAt: Date.now() } } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), { preview }, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.attachments).toEqual(["live-agent"]);
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBeUndefined();
+        expect(sandboxes.state.files[PREVIEW_AGENT_FILE]).toBeUndefined();
+        expect(sandboxes.state.commands.some((c) => c.includes("setup-agent"))).toBe(false);
+      }),
+    );
+
+    it.effect("continues publication after a deploy without running the agent or pushing twice", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: done("agent"), publish: done("publish") } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.commands.some((c) => c.includes("run-agent") || c.includes("git push"))).toBe(false);
+      }),
+    );
+
+    it.effect("fails clearly when Railway no longer retains the saved command", () =>
+      Effect.gen(function* () {
+        const cause = new ExecInterruptedError({ closeCode: 1008, reason: "Session not found", stdout: "", stderr: "" });
+        const sandboxes = fakeSandboxes({ "run-agent": Effect.fail(new SandboxError({ message: "Saved command session no longer exists", cause })) }, { alive: ["sbx_live"] });
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: { name: "lost-agent" } } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome).toEqual({ status: "failed", error: "Saved command session no longer exists" });
+        expect(sandboxes.state.destroyed).toBe(false);
+      }),
+    );
+  });
+
   it.effect("starts the sandbox's preview agent with this run's tunnel grant before the agent works", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
@@ -174,7 +240,7 @@ describe("executeRun", () => {
       });
       expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
       expect(sandboxes.state.files["/workspace/TASK.md"]).toBe(run.task);
-      expect(store.updates).toEqual([
+      expect(store.updates.map((patch) => { const { execution, ...rest } = patch as Record<string, unknown>; return rest; }).filter((patch) => Object.keys(patch).length > 0)).toEqual([
         {
           sandbox_id: "sbx_1",
           branch: "factory/run-0123abcd",
@@ -313,7 +379,7 @@ describe("executeRun", () => {
           "stdout:plain text\n",
         ]),
       );
-      expect(store.events.find((e) => e.kind === "tool_call")!.data).toEqual({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
+      expect(store.events.find((e) => e.kind === "tool_call")!.data).toMatchObject({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
       expect(store.diffs).toEqual([{ patch, truncated: false }]);
     }),
   );
@@ -425,7 +491,7 @@ describe("executeRun", () => {
         expect(sandboxes.state.files["/workspace/COMMIT_MSG"]).toMatch(/^Also add a license\n/);
         expect(store.updates).toContainEqual({ delivered_message_id: "5" });
         // The PR from the first turn is still open, so the push lands there.
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "findOpenPullRequest"]);
         expect(events).toContain(`info:Pushed the changes to ${PR}`);
         expect(store.updates).not.toContainEqual({ pull_request_url: expect.anything() });
         expect(sandboxes.state.destroyed).toBe(false);
@@ -561,8 +627,8 @@ describe("executeRun", () => {
 
         expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
         expect(sandboxes.state.files["/workspace/.factory/describe-prompt.md"]).toContain("already has a pull request");
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "updatePullRequest"]);
-        expect(github[2]).toEqual([
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "findOpenPullRequest", "updatePullRequest"]);
+        expect(github[3]).toEqual([
           "updatePullRequest",
           "ghs_repo_token",
           "shixzie/demo",

@@ -102,7 +102,7 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         yield* Fiber.interrupt(worker);
 
         expect(finished.pull_request_url).toBe("https://github.com/shixzie/demo/pull/1");
-        expect(finished.claimed_by).toBe("test-runner");
+        expect(finished.claimed_by).toBeNull();
         expect(sandboxes.state.createdWith?.ANTHROPIC_API_KEY).toBe(API_KEY);
         expect(finished).toMatchObject({ sandbox_state: "running", sandbox_id: "sbx_1", turns: 1 });
         expect(sandboxes.state.destroyed).toBe(false);
@@ -210,24 +210,50 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
       }),
     );
 
-    it.effect("fails in-flight runs and keeps their sandboxes when the runner stops", () =>
+    it.effect("detaches on deploy and reconnects the same run, sandbox and command", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
         const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
         const run = yield* queueRun;
-        yield* waitForRun(run.id, () => sandboxes.state.commands.some((c) => c.includes("run-agent")));
+        const active = yield* waitForRun(run.id, (r) => Boolean(r.execution?.sessions.agent));
 
         yield* Fiber.interrupt(worker);
-        const [row] = yield* Effect.flatMap(
-          SqlClient.SqlClient,
-          (sql) => sql<{ status: string; error: string }>`select status, error from runs where id = ${run.id}`,
-        );
-        expect(row).toEqual({
-          status: "failed",
-          error: "The runner stopped before this run finished. Send a message to pick it up again.",
-        });
-        expect(sandboxes.state.killed).toBe(true);
+        const store = yield* Store;
+        const released = Option.getOrThrow(yield* store.getRun(run.id));
+        expect(released).toMatchObject({ status: "queued", error: null, recovering: true, claimed_by: null, turns: 1 });
+        expect(sandboxes.state.detached).toBe(true);
+        expect(sandboxes.state.killed).toBe(false);
         expect(sandboxes.state.destroyed).toBe(false);
+
+        const replacement = fakeSandboxes({}, { alive: [active.sandbox_id!] });
+        const worker2 = yield* runner.pipe(Effect.provide(Layer.merge(replacement.layer, fakeGitHub())), Effect.fork);
+        const finished = yield* waitForRun(run.id, (r) => r.status === "succeeded");
+        yield* Fiber.interrupt(worker2);
+        expect(finished).toMatchObject({ turns: 1, sandbox_id: active.sandbox_id, recovering: false, execution: null });
+        expect(replacement.state.attachments).toContain(active.execution!.sessions.agent!.name);
+        expect(replacement.state.createdWith).toBeUndefined();
+        expect(replacement.state.files["/workspace/TASK.md"]).toBeUndefined();
+        expect(replacement.state.commands.some((c) => c.includes("setup-agent"))).toBe(false);
+      }),
+    );
+
+    it.effect("honors cancellation sent while a deployed runner is disconnected", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
+        const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+        const run = yield* queueRun;
+        const active = yield* waitForRun(run.id, (r) => Boolean(r.execution?.sessions.agent));
+        yield* Fiber.interrupt(worker);
+        yield* (yield* Store).requestCancel(run.id, run.user_id);
+
+        const replacement = fakeSandboxes({}, { alive: [active.sandbox_id!] });
+        const worker2 = yield* runner.pipe(Effect.provide(Layer.merge(replacement.layer, fakeGitHub())), Effect.fork);
+        const finished = yield* waitForRun(run.id, (r) => r.status === "cancelled");
+        yield* Fiber.interrupt(worker2);
+        expect(finished.turns).toBe(1);
+        expect(replacement.state.stoppedSessions).toContain(active.execution!.sessions.agent!.name);
+        expect(replacement.state.killed).toBe(true);
+        expect(replacement.state.destroyed).toBe(false);
       }),
     );
 

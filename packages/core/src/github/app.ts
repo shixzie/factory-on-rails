@@ -1,5 +1,5 @@
 import { HttpClient, HttpClientRequest } from "@effect/platform";
-import { Context, Effect, Layer, Option, Redacted } from "effect";
+import { Array as Arr, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
 import { createSign } from "node:crypto";
 import { InstanceSettings } from "../instance.js";
 import { appNotSetUp } from "./oauth.js";
@@ -45,6 +45,12 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
       repoFullName: string,
       pr: { title: string; body: string; head: string; base: string },
     ) => Effect.Effect<PullRequest, GitHubError>;
+    /** Finds an open PR for this repository's branch and base after a create was interrupted. */
+    readonly findOpenPullRequest: (
+      token: Redacted.Redacted<string>,
+      repoFullName: string,
+      refs: { head: string; base: string },
+    ) => Effect.Effect<Option.Option<PullRequest>, GitHubError>;
     /** Rewrites an open pull request's title and description. */
     readonly updatePullRequest: (
       token: Redacted.Redacted<string>,
@@ -92,6 +98,18 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
             HttpClientRequest.bearerToken(Redacted.value(token)),
             HttpClientRequest.bodyUnsafeJson(pr),
             executeJson(client, PullRequest),
+          ),
+        findOpenPullRequest: (token, repoFullName, refs) =>
+          githubRequest("GET", `/repos/${repoFullName}/pulls`).pipe(
+            HttpClientRequest.bearerToken(Redacted.value(token)),
+            HttpClientRequest.setUrlParams({
+              state: "open",
+              head: `${repoFullName.split("/")[0]}:${refs.head}`,
+              base: refs.base,
+              per_page: "1",
+            }),
+            executeJson(client, Schema.Array(PullRequest)),
+            Effect.map(Arr.head),
           ),
       };
     }),

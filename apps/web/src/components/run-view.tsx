@@ -35,9 +35,11 @@ import { openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
 import { ago, duration } from "@/lib/format";
+import { startPolling } from "@/lib/poll";
 import { cn } from "@/lib/utils";
 
 const POLL_MS = 2000;
+const POLL_TIMEOUT_MS = 15_000;
 /** While a finished run's sandbox is up, check now and then whether it has been stopped. */
 const SANDBOX_POLL_MS = 15_000;
 /** Sooner while the Preview tab is open, so servers the sandbox starts show up. */
@@ -272,6 +274,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const [focus, setFocus] = useState<{ path: string; n: number }>();
   const [cancelling, startCancel] = useTransition();
   const [sending, setSending] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const active = isActive(run.status);
   // A finished run's sandbox is stopped after a few idle minutes; keep the label honest.
   const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
@@ -288,11 +291,10 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     let after = events.at(-1)?.id ?? "0";
     let diffAt = diff?.updatedAt.getTime() ?? 0;
     let title = run.title;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
-      timer = undefined;
-      const result = await runInBrowser(api.runEvents(run.id, after));
-      if (stopped) return;
+      const result = await runInBrowser(api.runEvents(run.id, after), { timeoutMs: POLL_TIMEOUT_MS });
+      if (stopped) return false as const;
+      setReconnecting(result._tag === "Left");
       let delay = POLL_MS;
       if (result._tag === "Right") {
         const page = result.right;
@@ -307,8 +309,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           router.refresh();
         }
         if (page.diffUpdatedAt && page.diffUpdatedAt.getTime() !== diffAt) {
-          const fresh = await runInBrowser(api.runDiff(run.id));
-          if (stopped) return;
+          const fresh = await runInBrowser(api.runDiff(run.id), { timeoutMs: POLL_TIMEOUT_MS });
+          if (stopped) return false as const;
           if (fresh._tag === "Right") {
             diffAt = fresh.right.updatedAt.getTime();
             setDiff(fresh.right);
@@ -317,21 +319,24 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         if (page.hasMore) delay = 0;
         else if (!isActive(page.run.status)) {
           if (isActive(run.status)) router.refresh();
-          if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return;
+          if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return false as const;
           delay = previewing.current ? PREVIEW_POLL_MS : SANDBOX_POLL_MS;
         }
       }
-      timer = setTimeout(tick, delay);
+      return delay;
     };
-    pollNow.current = () => {
-      if (timer === undefined) return;
-      clearTimeout(timer);
-      void tick();
-    };
-    timer = setTimeout(tick, initial.hasMore ? 0 : active ? POLL_MS : SANDBOX_POLL_MS);
+    const poll = startPolling({
+      tick,
+      delay: initial.hasMore ? 0 : active ? POLL_MS : SANDBOX_POLL_MS,
+      retryDelay: POLL_MS,
+      onError: () => setReconnecting(true),
+    });
+    pollNow.current = poll.now;
+    window.addEventListener("online", poll.now);
     return () => {
       stopped = true;
-      clearTimeout(timer);
+      poll.stop();
+      window.removeEventListener("online", poll.now);
       pollNow.current = () => {};
     };
     // Restart only when the run, its liveness or its sandbox changes; cursors are tracked inside.
@@ -484,6 +489,16 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         <StatusLabel status={run.status} awaiting={run.awaitingInput} className="shrink-0" />
         <SandboxLabel state={run.sandboxState} className="hidden shrink-0 md:inline-flex" />
       </PageHeader>
+
+      {reconnecting ? (
+        <div role="status" className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+          <Spinner className="size-3.5" />
+          <span>Reconnecting to the factory. Activity will catch up automatically.</span>
+          <Button variant="ghost" size="sm" className="ml-auto" onClick={() => pollNow.current()}>
+            Retry now
+          </Button>
+        </div>
+      ) : null}
 
       <div className="flex flex-1">
         <div className="flex min-w-0 flex-1 flex-col">

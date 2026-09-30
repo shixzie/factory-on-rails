@@ -1,5 +1,6 @@
-import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type RunRow } from "@factory/core";
-import { Data, Duration, Effect, Option, Redacted, Schedule } from "effect";
+import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type RunExecution, type RunRow } from "@factory/core";
+import { Cause, Data, Duration, Effect, Exit, Option, Redacted, Schedule } from "effect";
+import { RailwayConnectionError, RailwayGraphQLError } from "railway";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
 import { makeCodexParser } from "./codex-stream.js";
@@ -37,17 +38,26 @@ import {
   withHome,
 } from "./plan.js";
 import type { RunLog } from "./run-log.js";
-import { Sandboxes, type ExecOptions, type SandboxHandle } from "./sandbox.js";
+import { SandboxError, Sandboxes, type ExecOptions } from "./sandbox.js";
 
 /** Where this turn's sandbox came from. */
 type SandboxOrigin = "kept" | "restored" | "new";
 
 export class StepFailed extends Data.TaggedError("StepFailed")<{ message: string }> {}
 class Cancelled extends Data.TaggedError("Cancelled") {}
+class LeaseLost extends Data.TaggedError("LeaseLost") {}
+
+const canRecover = (error: unknown): boolean =>
+  error instanceof SandboxError ? Boolean(error.sessionName) || canRecover(error.cause)
+    : error instanceof RailwayConnectionError ? error.closeCode !== 1008
+    : error instanceof RailwayGraphQLError ? error.status === 429 || error.status >= 500
+    : error instanceof GitHubError ? error.status === undefined || error.status === 429 || error.status >= 500
+    : typeof error === "object" && error !== null && "_tag" in error && error._tag === "SqlError";
 
 export type RunOutcome =
   | { status: "succeeded"; pullRequestUrl?: string }
   | { status: "failed"; error: string }
+  | { status: "recovering" }
   | { status: "cancelled" };
 
 export interface ExecuteOptions {
@@ -79,17 +89,17 @@ const acquireSandbox = (run: RunRow, env: Record<string, string>, snapshot: stri
     const sandboxes = yield* Sandboxes;
     if (run.sandbox_state === "running" && run.sandbox_id) {
       const id = run.sandbox_id;
-      const kept = yield* sandboxes.connect(id).pipe(
-        Effect.catchAll((err) =>
-          // It may still exist; don't pay for two.
-          Effect.zipRight(Effect.ignore(sandboxes.destroy(id)), Effect.as(log.info(err.message), Option.none<SandboxHandle>())),
-        ),
-      );
+      // A failed connection does not mean the VM is gone. Never destroy a
+      // running workspace just because Railway was temporarily unreachable.
+      const kept = yield* sandboxes.connect(id).pipe(Effect.retry(Schedule.recurs(3).pipe(Schedule.intersect(Schedule.spaced("2 seconds")))));
       if (Option.isSome(kept)) {
         yield* log.info(`Continuing in sandbox ${id}`);
         return { sandbox: kept.value, origin: "kept" as SandboxOrigin };
       }
       yield* log.info("The sandbox from the last turn is gone, so this turn starts a new one");
+      if (run.recovering && run.execution) {
+        return yield* new StepFailed({ message: "The sandbox for the interrupted run no longer exists." });
+      }
     }
     if (run.sandbox_state === "stopped" && run.sandbox_checkpoint_name) {
       yield* log.info("Resuming the stopped sandbox");
@@ -104,14 +114,12 @@ const acquireSandbox = (run: RunRow, env: Record<string, string>, snapshot: stri
 /** The title and description the agent wrote for the run's pull request. */
 type Written = { readonly title: string; readonly description: string };
 
-const pullRequestNumber = (url: string | null) => Number(/\/pull\/(\d+)/.exec(url ?? "")?.[1] ?? NaN);
-
 /**
  * Opens the run's pull request, or finds it already open from an earlier
  * turn. With a title and description from the agent, an open PR gets them
  * in place of its old ones.
  */
-const openPullRequest = (
+export const openPullRequest = (
   run: RunRow,
   token: Redacted.Redacted<string>,
   branch: string,
@@ -129,18 +137,22 @@ const openPullRequest = (
       description: written?.description,
     });
     const opened = yield* github.createPullRequest(token, run.repo_full_name, { title, body, head: branch, base: run.base_branch }).pipe(
-      Effect.map((pr) => Option.some(pr.html_url)),
+      Effect.map((pr) => ({ pr, opened: true })),
       // GitHub refuses a second PR for the branch while the first is open. A
       // merged or closed one doesn't count, so new work gets a new PR.
       Effect.catchIf(
-        (err: GitHubError) => err.status === 422 && run.pull_request_url !== null && /already exists/i.test(JSON.stringify(err.body ?? err.message)),
-        () => Effect.succeed(Option.none<string>()),
+        (err: GitHubError) => err.status === 422 && /already exists/i.test(JSON.stringify(err.body ?? err.message)),
+        (err) => github.findOpenPullRequest(token, run.repo_full_name, { head: branch, base: run.base_branch }).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.fail(err),
+            onSome: (pr) => Effect.succeed({ pr, opened: false }),
+          })),
+        ),
       ),
     );
-    if (Option.isSome(opened)) return { url: opened.value, opened: true, updated: false };
-    const url = run.pull_request_url!;
-    const number = pullRequestNumber(url);
-    if (!written || Number.isNaN(number)) return { url, opened: false, updated: false };
+    const { html_url: url, number } = opened.pr;
+    if (opened.opened) return { url, opened: true, updated: false };
+    if (!written) return { url, opened: false, updated: false };
     // The description is a nicety: the work is pushed either way.
     const updated = yield* github.updatePullRequest(token, run.repo_full_name, number, { title, body }).pipe(
       Effect.as(true),
@@ -158,11 +170,15 @@ const openPullRequest = (
 const work = (
   run: RunRow,
   { log, agent, snapshot, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds" }: ExecuteOptions,
+  cancelled: () => boolean,
 ) =>
   Effect.gen(function* () {
     const sandboxes = yield* Sandboxes;
     const github = yield* GitHubAppApi;
-    const store = yield* Store;
+    const baseStore = yield* Store;
+    const store = { ...baseStore, updateRun: (id: string, patch: Parameters<typeof baseStore.updateRun>[1]) => baseStore.updateRun(id, patch, run.claimed_by ?? undefined) };
+    const execution: RunExecution = structuredClone(run.execution ?? { sessions: {} });
+    const updateExecution = () => store.updateRun(run.id, { execution });
     const branch = branchName(run.id);
     const followUp = run.turns > 1;
     const modelEnv = {
@@ -171,7 +187,7 @@ const work = (
       FACTORY_CODEX_EFFORT: run.reasoning_effort ? `model_reasoning_effort=${JSON.stringify(run.reasoning_effort)}` : "",
     };
     // What the user said since the agent last heard from them: this turn's task.
-    const pending = followUp ? yield* store.listUserMessages(run.id, Number(run.delivered_message_id)) : [];
+    const pending = followUp && !execution.sessions.agent ? yield* store.listUserMessages(run.id, Number(run.delivered_message_id)) : [];
 
     const permissions = { contents: "write", pull_requests: "write", metadata: "read" } as const;
     const tokenFor = (extra: Record<string, "write"> = {}) =>
@@ -193,22 +209,29 @@ const work = (
     log.addSecret(Redacted.value(token));
 
     // Kept for the next turn once it holds the checkout; destroyed if it never gets that far.
-    let keep = false;
-    const { sandbox, origin } = yield* Effect.acquireRelease(acquireSandbox(run, { ...agent.env, IS_SANDBOX: "1" }, snapshot, log), ({ sandbox }) =>
-      keep
+    let keep = run.recovering === true;
+    const { sandbox, origin } = yield* Effect.acquireRelease(acquireSandbox(run, { ...agent.env, IS_SANDBOX: "1" }, snapshot, log), ({ sandbox }, exit) =>
+      keep || (Exit.isInterrupted(exit) && !cancelled() && Object.keys(execution.sessions).length > 0)
+        || (Exit.isFailure(exit) && Option.exists(Cause.failureOption(exit.cause), canRecover))
         ? Effect.void
-        : sandboxes.destroy(sandbox.id).pipe(
-            Effect.zipRight(store.updateRun(run.id, { sandbox_state: "deleted" })),
-            Effect.zipRight(log.info("Sandbox destroyed")),
+        : Effect.gen(function* () {
+            // Another runner may already have taken over after a lost lease.
+            if (run.claimed_by && Option.isNone(yield* store.heartbeat(run.id, run.claimed_by))) return;
+            yield* sandboxes.destroy(sandbox.id);
+            yield* store.updateRun(run.id, { sandbox_state: "deleted" });
+            yield* log.info("Sandbox destroyed");
+          }).pipe(
             Effect.catchAll((err) => log.error(err.message)),
           ),
     );
+    execution.checkout ??= origin === "new" ? "clone" : "resume";
     yield* store.updateRun(run.id, {
       sandbox_id: sandbox.id,
       branch,
       sandbox_state: "running",
       sandbox_checkpoint_id: null,
       sandbox_checkpoint_name: null,
+      execution,
     });
     if (origin !== "kept") yield* log.info(`Sandbox ${sandbox.id} is running`);
     if (run.sandbox_checkpoint_id) {
@@ -218,14 +241,27 @@ const work = (
       );
     }
 
-    const step = (label: string, command: string, opts: ExecOptions = {}) =>
+    const step = (key: string, label: string, command: string, opts: ExecOptions = {}) =>
       Effect.gen(function* () {
+        const saved = execution.sessions[key];
+        if (saved?.result) return saved.result;
+        if (run.claimed_by) {
+          const owned = yield* store.heartbeat(run.id, run.claimed_by);
+          if (Option.isNone(owned)) return yield* new LeaseLost();
+        }
         yield* log.info(label);
         let offline = false;
         let workflowsRefused = false;
         const onOutput = opts.onOutput ?? log.push;
         const result = yield* sandbox.exec(withHome(command), {
           ...opts,
+          sessionName: saved?.name,
+          timeoutSec: opts.timeoutSec === undefined ? undefined : Math.max(0, opts.timeoutSec - (saved?.startedAt ? (Date.now() - saved.startedAt) / 1000 : 0)),
+          detachOnInterrupt: () => !cancelled(),
+          onSession: (name) => Effect.gen(function* () {
+            execution.sessions[key] = { name, startedAt: saved?.startedAt ?? Date.now() };
+            yield* store.updateRun(run.id, { execution });
+          }).pipe(Effect.mapError((cause) => new SandboxError({ message: "Could not save the command's reconnect information", cause }))),
           onOutput: (stream, chunk) => {
             if (chunk.includes(RECOVERY_CONSOLE_BANNER)) offline = true;
             if (chunk.includes(WORKFLOWS_PERMISSION_REFUSAL)) workflowsRefused = true;
@@ -244,19 +280,25 @@ const work = (
         }
         if (result.timedOut) return yield* new StepFailed({ message: `${label}: timed out after ${opts.timeoutSec}s` });
         if (result.exitCode !== 0) return yield* new StepFailed({ message: `${label}: exited with code ${result.exitCode}` });
+        // Keep only output needed by later steps, never a second copy of the
+        // agent's transcript or credentials in the execution checkpoint.
+        execution.sessions[key] = { ...execution.sessions[key]!, result: { ...result, stdout: key === "checkout" || key === "publish" ? log.redact(result.stdout).slice(-64 * 1024) : "" } };
+        yield* log.flushDurable ?? log.flush;
+        yield* store.updateRun(run.id, { execution });
         return result;
       });
 
     yield* sandbox.writeFile(TOKEN_FILE, Redacted.value(token), 0o600);
-    yield* step("Checking the sandbox can reach GitHub", networkCheckScript({ repo: run.repo_full_name }));
+    yield* step("network", "Checking the sandbox can reach GitHub", networkCheckScript({ repo: run.repo_full_name }));
     let continuing = false;
-    if (origin === "new") {
+    if (execution.checkout === "clone") {
       yield* step(
+        "checkout",
         followUp ? `Cloning ${run.repo_full_name}@${branch}` : `Cloning ${run.repo_full_name}@${run.base_branch}`,
         cloneScript({ repo: run.repo_full_name, baseBranch: run.base_branch, branch, ...git }),
       );
     } else {
-      const resumed = yield* step("Picking up where the last turn left off", resumeScript({ repo: run.repo_full_name }));
+      const resumed = yield* step("checkout", "Picking up where the last turn left off", resumeScript({ repo: run.repo_full_name }));
       continuing = resumed.stdout.includes(HAS_SESSION_MARKER);
     }
     keep = true;
@@ -265,15 +307,21 @@ const work = (
     const prompt = followUp
       ? followUpPrompt({ task: run.task, messages: messages.length > 0 ? messages : ["Carry on."], continuing })
       : run.task;
-    yield* sandbox.writeFile(TASK_FILE, prompt);
-    yield* sandbox.writeFile(COMMIT_MSG_FILE, commitMessage(messages[0] ?? run.task, run.id));
-    for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
+    if (!execution.sessions.agent) {
+      if (!execution.prompt) {
+        execution.prompt = { text: prompt, commitMessage: commitMessage(messages[0] ?? run.task, run.id), deliveredMessageId: String(pending.at(-1)?.id ?? run.delivered_message_id) };
+        yield* updateExecution();
+      }
+      yield* sandbox.writeFile(TASK_FILE, execution.prompt.text);
+      yield* sandbox.writeFile(COMMIT_MSG_FILE, execution.prompt.commitMessage);
+      for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
+    }
 
-    yield* step("Preparing the agent", agent.id === "codex" ? `${CODEX_AUTH_SCRIPT}\n${agent.setupCommand}` : agent.setupCommand);
+    yield* step("prepare", "Preparing the agent", agent.id === "codex" ? `${CODEX_AUTH_SCRIPT}\n${agent.setupCommand}` : agent.setupCommand);
 
     // Lets the user open servers running in the sandbox (see packages/core/src/preview.ts).
     // Previews are a convenience: if this fails the turn carries on without them.
-    if (Option.isSome(preview)) {
+    if (Option.isSome(preview) && !execution.sessions.agent) {
       yield* Effect.gen(function* () {
         const grant = signPreviewGrant(Redacted.value(preview.value.signingKey), tunnelGrant(run.id));
         log.addSecret(grant);
@@ -288,6 +336,7 @@ const work = (
     // events, the questions it is waiting on, and whether files may have changed.
     const asking = new Set<string>();
     let filesMayHaveChanged = false;
+    let eventSequence = 0;
     const stream = makeAgentStream(
       {
         event: (e) => {
@@ -296,7 +345,7 @@ const work = (
             asking.delete(String(e.data?.toolUseId));
             filesMayHaveChanged = true;
           }
-          log.push(e.kind, e.message, e.data);
+          log.push(e.kind, e.message, { ...e.data, _replayKey: `${run.turns}:agent:${eventSequence++}` });
         },
         output: log.push,
       },
@@ -306,8 +355,8 @@ const work = (
 
     // Hands the user's messages to the agent (see agent-tools.ts) and keeps
     // `awaiting_input` in step with the agent's open questions.
-    let delivered = Number(pending.at(-1)?.id ?? run.delivered_message_id);
-    let awaiting = false;
+    let delivered = Math.max(Number(execution.prompt?.deliveredMessageId ?? 0), Number(run.delivered_message_id));
+    let awaiting = run.awaiting_input ?? false;
     const syncInbox = Effect.gen(function* () {
       for (const message of yield* store.listUserMessages(run.id, delivered)) {
         const result = yield* sandbox.exec(withHome(deliverMessageScript(message.id.padStart(16, "0"))), {
@@ -350,13 +399,13 @@ const work = (
     });
 
     // From here the agent has this turn's messages; later ones go through the inbox.
-    if (pending.length > 0) yield* store.updateRun(run.id, { delivered_message_id: String(delivered) });
+    if (delivered > Number(run.delivered_message_id)) yield* store.updateRun(run.id, { delivered_message_id: String(delivered) });
     yield* sandbox.writeFile(AGENT_RAN_FILE, run.id);
 
     yield* Effect.gen(function* () {
       yield* Effect.forkScoped(inboxLoop);
       yield* Effect.forkScoped(diffLoop);
-      yield* step(continuing ? "Continuing the agent's session" : "Running the agent", agent.command, {
+      yield* step("agent", execution.sessions.agent ? "Reconnecting to the agent" : continuing ? "Continuing the agent's session" : "Running the agent", agent.command, {
         cwd: REPO_DIR,
         env: {
           ...agentToolEnv(),
@@ -372,11 +421,11 @@ const work = (
     }).pipe(
       Effect.scoped,
       // Whatever happened, record where the files ended up.
-      Effect.ensuring(snapshotDiff),
-      Effect.ensuring(Effect.when(store.updateRun(run.id, { awaiting_input: false }).pipe(Effect.ignore), () => awaiting)),
+      Effect.onExit((exit) => !Exit.isInterrupted(exit) || cancelled() ? snapshotDiff : Effect.void),
+      Effect.onExit((exit) => (!Exit.isInterrupted(exit) || cancelled()) && awaiting ? store.updateRun(run.id, { awaiting_input: false }).pipe(Effect.ignore) : Effect.void),
     );
 
-    const published = yield* step("Committing and pushing", publishScript({ baseBranch: run.base_branch, branch }));
+    const published = yield* step("publish", "Committing and pushing", publishScript({ baseBranch: run.base_branch, branch }));
     const existing = run.pull_request_url ?? undefined;
     if (published.stdout.includes(NO_CHANGES_MARKER)) {
       yield* log.info("The agent made no changes, so there is nothing to open a PR for");
@@ -392,7 +441,7 @@ const work = (
     const written = agent.describeCommand
       ? yield* Effect.gen(function* () {
           yield* sandbox.writeFile(DESCRIBE_FILE, describePrompt({ baseBranch: run.base_branch, existing: existing !== undefined }));
-          yield* step("Writing the pull request description", `rm -f ${PR_FILE}\n${agent.describeCommand}`, {
+          yield* step("describe", "Writing the pull request description", `rm -f ${PR_FILE}\n${agent.describeCommand}`, {
             cwd: REPO_DIR,
             env: { ...modelEnv, FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
             timeoutSec: 600,
@@ -404,7 +453,7 @@ const work = (
           if (!pr) return yield* new StepFailed({ message: "the agent's reply had no title" });
           return pr;
         }).pipe(
-          Effect.catchAll((err) =>
+          Effect.catchIf((err) => !canRecover(err) && !(err instanceof LeaseLost), (err) =>
             log.info(`Could not write the pull request description (${err.message}), so the PR is titled after the task`).pipe(Effect.as(undefined)),
           ),
         )
@@ -419,15 +468,15 @@ const work = (
     return { status: "succeeded", pullRequestUrl: pr.url } as const;
   }).pipe(
     // Logged before the scope closes, so the log reads "error" then "Sandbox destroyed".
-    Effect.tapError((err) => log.error(err.message)),
+    Effect.tapError((err) => "message" in err ? log.error(err.message) : Effect.void),
     Effect.scoped,
   );
 
 /**
  * Drives one turn of a run end to end: sandbox up (or back), clone, agent,
- * push, PR. Never fails; every error becomes a `failed` outcome. A heartbeat
- * runs alongside the work, and when it sees the run was cancelled the work is
- * interrupted, which kills the command in the sandbox.
+ * push, PR. Connection failures return a recovery outcome; other failures end
+ * the turn. A heartbeat checks ownership and cancellation alongside the work.
+ * Shutdown detaches saved commands, while explicit cancellation stops them.
  */
 export const executeRun = (
   run: RunRow,
@@ -436,23 +485,44 @@ export const executeRun = (
   Effect.gen(function* () {
     const store = yield* Store;
     const { log } = options;
+    let cancelled = false;
 
-    const watchForCancel = store.heartbeat(run.id).pipe(
-      Effect.orElseSucceed(() => Option.none()),
-      Effect.repeat({
-        schedule: Schedule.spaced(options.heartbeatEvery ?? Duration.seconds(10)),
-        until: Option.contains("cancelling"),
-      }),
-      Effect.zipRight(log.info("Cancellation requested, stopping the agent")),
-      Effect.zipRight(Effect.fail(new Cancelled())),
-    );
+    const watchForCancel = Effect.forever(Effect.gen(function* () {
+      const status = yield* store.heartbeat(run.id, run.claimed_by ?? undefined).pipe(
+        // A temporary database outage is not a cancellation request.
+        Effect.orElseSucceed(() => Option.some("running" as const)),
+      );
+      if (Option.isNone(status)) return yield* new LeaseLost();
+      if (status.value === "cancelling") {
+        cancelled = true;
+        yield* log.info("Cancellation requested, stopping the agent");
+        return yield* new Cancelled();
+      }
+      yield* Effect.sleep(options.heartbeatEvery ?? Duration.seconds(10));
+    }));
 
-    return yield* work(run, options).pipe(
+    return yield* work(run, options, () => cancelled).pipe(
       Effect.raceFirst(watchForCancel),
       Effect.map((outcome): RunOutcome => outcome),
-      Effect.catchTag("Cancelled", () =>
-        log.info("Run cancelled").pipe(Effect.as<RunOutcome>({ status: "cancelled" })),
-      ),
-      Effect.catchAll((err) => Effect.succeed<RunOutcome>({ status: "failed", error: err.message })),
+      Effect.catchTag("Cancelled", () => Effect.gen(function* () {
+        // Cancellation can arrive while no runner is attached. The heartbeat
+        // may win before work reaches exec, so also stop saved active sessions.
+        const current = Option.getOrUndefined(yield* store.getRun(run.id));
+        if (run.claimed_by && current?.claimed_by !== run.claimed_by) return { status: "recovering" } as RunOutcome;
+        if (current?.sandbox_id && current.execution) {
+          const sandbox = yield* (yield* Sandboxes).connect(current.sandbox_id);
+          if (Option.isSome(sandbox)) {
+            for (const session of Object.values(current.execution.sessions)) {
+              if (!session.result) yield* sandbox.value.stopSession(session.name);
+            }
+          }
+        }
+        yield* log.info("Run cancelled");
+        return { status: "cancelled" } as RunOutcome;
+      }).pipe(Effect.catchAll(() => log.info("Waiting to reconnect and stop the command").pipe(Effect.as<RunOutcome>({ status: "recovering" }))))),
+      Effect.catchTag("LeaseLost", () => Effect.succeed<RunOutcome>({ status: "recovering" })),
+      Effect.catchAll((err) => canRecover(err)
+        ? log.info("Connection interrupted; reconnecting shortly").pipe(Effect.as<RunOutcome>({ status: "recovering" }))
+        : Effect.succeed<RunOutcome>({ status: "failed", error: err.message })),
     );
   });

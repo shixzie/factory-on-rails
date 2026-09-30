@@ -1,8 +1,13 @@
-import { Config, Context, Data, Duration, Effect, Layer, Option, Redacted, Schedule } from "effect";
+import { Cause, Config, Context, Data, Duration, Effect, Exit, Layer, Option, Redacted, Schedule } from "effect";
 import { InstanceSettings } from "@factory/core";
-import { ExecInterruptedError, Sandbox, SandboxNotFoundError } from "railway";
+import { ExecInterruptedError, RailwayConnectionError, RailwayGraphQLError, Sandbox, SandboxNotFoundError, type ExecOptions as RailwayExecOptions, type ExecTarget } from "railway";
 
-export class SandboxError extends Data.TaggedError("SandboxError")<{ message: string; cause?: unknown }> {}
+export class SandboxError extends Data.TaggedError("SandboxError")<{
+  message: string;
+  cause?: unknown;
+  /** A persisted command still exists and can be recovered after transport retries fail. */
+  sessionName?: string;
+}> {}
 
 export interface ExecResult {
   readonly exitCode: number | null;
@@ -16,12 +21,20 @@ export interface ExecOptions {
   readonly timeoutSec?: number;
   /** Called synchronously with each chunk of output as it streams. */
   readonly onOutput?: (stream: "stdout" | "stderr", chunk: string) => void;
+  /** Attach to this saved command instead of starting another one. */
+  readonly sessionName?: string;
+  /** Save a fresh command's session before accepting its result or detaching. */
+  readonly onSession?: (name: string) => Effect.Effect<void, SandboxError>;
+  /** Preserve a saved command during runner shutdown; cancellation should return false. */
+  readonly detachOnInterrupt?: () => boolean;
 }
 
-/** A running sandbox. Interrupting `exec` kills the command inside it. */
+/** A running sandbox. Interruption kills commands unless durable detachment was requested. */
 export interface SandboxHandle {
   readonly id: string;
   readonly exec: (command: string, options?: ExecOptions) => Effect.Effect<ExecResult, SandboxError>;
+  /** Cancel a saved command, including one this runner has not reattached to yet. */
+  readonly stopSession: (sessionName: string) => Effect.Effect<void, SandboxError>;
   /** `mode` defaults to 0644; secrets go in with 0600. */
   readonly writeFile: (path: string, content: string, mode?: number) => Effect.Effect<void, SandboxError>;
 }
@@ -187,30 +200,156 @@ const attempt = <A>(context: string, f: () => Promise<A>) =>
 /** The slice of the SDK's `Sandbox` that `wrapSandbox` uses. */
 export interface SandboxLike {
   readonly id: string;
-  exec(
-    command: string,
-    options: ExecOptions & { onStdout?: (chunk: string) => void; onStderr?: (chunk: string) => void },
-  ): PromiseLike<ExecResult> & { kill(signal?: "TERM" | "KILL"): Promise<unknown> };
+  exec(command: ExecTarget, options: RailwayExecOptions): SandboxExecHandle;
   readonly files: { write(path: string, content: string, options?: { mode?: number }): Promise<unknown> };
 }
 
-export const wrapSandbox = (sandbox: SandboxLike): SandboxHandle => ({
+interface SandboxExecHandle extends PromiseLike<ExecResult> {
+  readonly sessionName: Promise<string>;
+  kill(signal?: "TERM" | "KILL"): Promise<unknown>;
+  detach(): Promise<string>;
+}
+
+const RECONNECT_SCHEDULE = Schedule.exponential("250 millis").pipe(Schedule.intersect(Schedule.recurs(5)));
+const isLostConnection = (cause: unknown) =>
+  (cause instanceof RailwayConnectionError && cause.closeCode !== 1008) ||
+  (cause instanceof RailwayGraphQLError && (cause.status === 429 || cause.status >= 500));
+
+const isMissingSession = (cause: unknown) => {
+  if (!(cause instanceof ExecInterruptedError) || cause.closeCode !== 1008) return false;
+  // The SDK embeds the gateway's reason in its message. Match explicit missing
+  // session responses only: 1008 also covers permission and policy failures.
+  const reason = /\(code 1008: (.*?)\)\. The command/s.exec(cause.message)?.[1]?.trim();
+  return reason !== undefined && (
+    /^(?:durable(?: exec)? |exec )?session(?: ["'][^"']+["'])? (?:not found|does not exist|(?:has )?expired)(?:: .+)?[.!]?$/i.test(reason) ||
+    /^unknown (?:durable(?: exec)? |exec )?session(?:: .+)?[.!]?$/i.test(reason)
+  );
+};
+
+const stopSession = (sandbox: SandboxLike, sessionName: string) => Effect.acquireUseRelease(
+  Effect.try({
+    try: () => sandbox.exec({ sessionName }, {}),
+    catch: (cause) => new SandboxError({ message: `Could not attach to command ${sessionName} to cancel it`, cause }),
+  }),
+  (handle) => Effect.gen(function* () {
+    const result = Promise.resolve(handle).then(() => undefined, (cause: unknown) => { throw cause; });
+    // Signal may be queued until the connection opens; wait for its exit rather
+    // than detaching immediately and discarding the SDK's queued signal.
+    void result.catch(() => undefined);
+    const sent = yield* attempt(`Could not cancel command ${sessionName}`, () => handle.kill("TERM"));
+    if (sent === false) return yield* Effect.fail(new SandboxError({ message: `Could not signal command ${sessionName}`, sessionName }));
+    yield* attempt(`Could not confirm command ${sessionName} stopped`, () => result).pipe(
+      Effect.timeoutFail({ duration: "10 seconds", onTimeout: () => new SandboxError({ message: `Timed out stopping command ${sessionName}`, sessionName }) }),
+    );
+  }),
+  (handle) => Effect.promise(() => handle.detach().catch(() => undefined)),
+).pipe(Effect.catchIf((error) => isMissingSession(error.cause), () => Effect.void));
+
+export const wrapSandbox = (
+  sandbox: SandboxLike,
+  reconnectSchedule: Schedule.Schedule<unknown, SandboxError> = RECONNECT_SCHEDULE,
+): SandboxHandle => ({
   id: sandbox.id,
-  exec: (command, { onOutput, ...options } = {}) =>
-    Effect.async<ExecResult, SandboxError>((resume) => {
-      const handle = sandbox.exec(command, {
-        ...options,
-        onStdout: (chunk) => onOutput?.("stdout", chunk),
-        onStderr: (chunk) => onOutput?.("stderr", chunk),
+  exec: (command, { onOutput, onSession, sessionName, detachOnInterrupt, timeoutSec, cwd, env } = {}) =>
+    Effect.suspend(() => {
+      let current: SandboxExecHandle | undefined;
+      let knownSession = sessionName;
+      let persisted = sessionName !== undefined;
+      let disconnected = false;
+      let attempts = 0;
+      let priorStdout = "";
+      let streamedStdout = "";
+
+      const stop = (detach: boolean) => Effect.gen(function* () {
+        if (current === undefined) {
+          if (!detach && knownSession !== undefined) yield* stopSession(sandbox, knownSession);
+          return;
+        }
+        if (detach) {
+          yield* Effect.promise(() => current!.detach().catch(() => undefined));
+        } else {
+          if (disconnected && knownSession !== undefined) {
+            yield* stopSession(sandbox, knownSession);
+            return;
+          }
+          const killed = yield* Effect.promise(() => current!.kill("TERM").catch(() => false));
+          // A disconnected handle cannot send signals. Attach to the same command
+          // to cancel it; never launch the original command again.
+          if (killed === false && knownSession !== undefined) {
+            yield* stopSession(sandbox, knownSession);
+          }
+        }
       });
-      handle.then(
-        ({ exitCode, stdout, timedOut }) => resume(Effect.succeed({ exitCode, stdout, timedOut })),
-        (cause) =>
-          resume(Effect.fail(new SandboxError({ message: `Command failed to run: ${String(cause)}`, cause }))),
+
+      const run = Effect.gen(function* () {
+        const handle = yield* Effect.try({
+          try: () => sandbox.exec(knownSession === undefined ? command : { sessionName: knownSession }, {
+            ...(knownSession === undefined ? { cwd, env } : { resumeFromLastRead: attempts > 0 }),
+            onStdout: (chunk) => { streamedStdout += chunk; onOutput?.("stdout", chunk); },
+            onStderr: (chunk) => onOutput?.("stderr", chunk),
+          }),
+          catch: (cause) => new SandboxError({ message: `Command failed to run: ${String(cause)}`, cause }),
+        });
+        current = handle;
+        disconnected = false;
+        attempts++;
+        // Observe both promises immediately: a fast command can finish (or lose
+        // its connection) before the database finishes saving its session.
+        const outcome = Promise.resolve(handle).then(
+          (value) => ({ ok: true as const, value }),
+          (cause: unknown) => { disconnected = true; return { ok: false as const, cause }; },
+        );
+        if (knownSession === undefined) {
+          const name = yield* attempt("Could not identify command session", () => handle.sessionName).pipe(
+            Effect.catchIf(
+              (error) => onSession === undefined && error.cause instanceof Error &&
+                error.cause.message === "Server did not return a durable session for this exec.",
+              () => Effect.succeed(undefined),
+            ),
+          );
+          knownSession = name;
+          if (onSession !== undefined && name !== undefined) {
+            yield* onSession(name).pipe(
+              Effect.tap(() => Effect.sync(() => { persisted = true; })),
+              Effect.uninterruptible,
+            );
+          }
+        }
+        const result = yield* Effect.promise(() => outcome);
+        if (!result.ok) {
+          if (result.cause instanceof ExecInterruptedError) priorStdout += result.cause.stdout;
+          return yield* Effect.fail(new SandboxError({ message: `Command failed to run: ${String(result.cause)}`, cause: result.cause }));
+        }
+        return { ...result.value, stdout: priorStdout + result.value.stdout };
+      }).pipe(
+        Effect.retry({ schedule: reconnectSchedule, while: (error) => knownSession !== undefined && isLostConnection(error.cause) }),
+        Effect.mapError((error) => persisted && knownSession !== undefined && isLostConnection(error.cause)
+          ? new SandboxError({ message: error.message, cause: error.cause, sessionName: knownSession })
+          : error),
       );
-      // Interruption (a cancelled run, a stopping runner) kills the process group.
-      return Effect.promise(() => handle.kill("TERM").catch(() => undefined));
+
+      // The SDK's timeout closes its socket. Explicitly signal the durable
+      // process instead, using one deadline across every reconnect attempt.
+      const timed = timeoutSec === undefined ? run : timeoutSec <= 0
+        ? stop(false).pipe(Effect.as({ exitCode: null, stdout: "", timedOut: true }))
+        : run.pipe(
+        Effect.timeoutOption(Duration.seconds(timeoutSec)),
+        Effect.flatMap(Option.match({
+          onSome: Effect.succeed,
+          onNone: () => stop(false).pipe(Effect.as({ exitCode: null, stdout: streamedStdout, timedOut: true })),
+        })),
+      );
+      return timed.pipe(Effect.onExit((exit) => {
+        if (Exit.isSuccess(exit)) return Effect.void;
+        const error = Cause.failureOption(exit.cause);
+        const recoverable = Option.isSome(error) && error.value.sessionName !== undefined;
+        const shuttingDown = Cause.isInterrupted(exit.cause) && persisted && detachOnInterrupt?.() === true;
+        // A finalizer cannot fail the interrupted fiber. The cancellation path
+        // verifies saved sessions separately before marking the run cancelled.
+        return stop(recoverable || shuttingDown).pipe(Effect.catchAll((error) => Effect.logWarning(error.message)));
+      }));
     }),
+  stopSession: (sessionName) => stopSession(sandbox, sessionName),
   writeFile: (path, content, mode) =>
     attempt(`Could not write ${path}`, () => sandbox.files.write(path, content, mode === undefined ? undefined : { mode })).pipe(
       Effect.asVoid,

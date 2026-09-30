@@ -82,6 +82,16 @@ the maintainers' own deployment runs), follow [docs/setup.md](docs/setup.md).
 How the template itself is built is in
 [docs/railway-template.md](docs/railway-template.md).
 
+Runner deployments preserve running sandboxes and reconnect to their commands
+automatically. Apply migration `010_run_recovery.sql` before deploying the new
+runner (the harness runs migrations before it deploys). A forced runner exit is
+recovered once its heartbeat exceeds `STALE_RUN_SECONDS` (180 seconds by default).
+The first upgrade cannot preserve commands started by an older runner, whose
+shutdown still stops them; protection applies to runs started with this version.
+Recovery requires Railway to retain the sandbox and its command sessions;
+explicit cancellation still stops the work. See the
+[run lifecycle](docs/architecture.md#the-harness-and-the-run-lifecycle).
+
 ### Run model and reasoning effort
 
 The new-run composer lets you choose a model and reasoning/thinking effort beside the agent picker. Choose a preset or enter a custom model ID. Default model and Default effort leave the agent’s own configuration in control. Choices are saved with the run, displayed in its details, reused for follow-up turns and PR descriptions, and prefilled for your next run. Switching agents resets both choices.

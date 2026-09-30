@@ -74,9 +74,9 @@ All application code is written with Effect 3:
   components and in the browser. React stays plain React.
 - **Resources and cancellation.** A turn's sandbox is a scoped resource
   (`acquireRelease`): once it holds the checkout it is kept for the next turn,
-  and before that it is destroyed however the turn ends. Cancelling a run, or
-  stopping the runner, interrupts the fiber, which kills the command in the
-  sandbox.
+  and an interrupted turn keeps it while its saved commands await recovery.
+  Explicit cancellation kills the command. Runner shutdown detaches from saved
+  command sessions and releases the run so another runner can reconnect.
 - **Tests** use `@effect/vitest`.
 
 ## The web app
@@ -128,6 +128,10 @@ read on 2026-12-01, so this repo does not use it.
   web app reaches it at `harness.railway.internal:8080`.
 - The harness runs database migrations as its pre-deploy command, so a failed
   migration stops the deploy instead of shipping a broken schema.
+  Apply `010_run_recovery.sql` before starting the updated runner; independent
+  service deploys must preserve that ordering. The first upgrade cannot retrofit
+  recovery onto commands started by the old runner, which still kills its
+  commands on shutdown. Subsequent runner deploys preserve saved sessions.
 - `.github/workflows/railway-config.yml` uses `railwayapp/config@v1`: every PR
   that touches `.railway/` gets a plan comment, and merging applies exactly the
   reviewed plan. It skips itself until the `RAILWAY_TOKEN` secret exists.
@@ -151,7 +155,10 @@ Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"
    refuse with "status: CREATING" (close code 1008) just after the API reports RUNNING.
 2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
    agent, commit and push, with `onStdout` / `onStderr` streaming into
-   `run_events`. Every command starts with `export HOME="${HOME:-/root}"`,
+   `run_events`. The runner saves each main step's session name and result in
+   Postgres, then reattaches to that session after a disconnect or deployment.
+   Replayed structured agent events are deduplicated. Every command starts with
+   `export HOME="${HOME:-/root}"`,
    because exec can start a shell without HOME and git needs it, and exports
    the current GitHub token as `GH_TOKEN` (see below).
 3. `sandbox.files.write(...)` for the task text, commit message and token, so
@@ -292,8 +299,9 @@ flowchart LR
 ## The harness and the run lifecycle
 
 A **run** is one conversation against one repository in one sandbox. Each
-time the runner picks it up is a **turn**: the first does the task, and each
-later one answers the messages the user sent since.
+new task or follow-up starts a **turn**: the first does the task, and each
+later one answers the messages the user sent since. Reconnecting to an
+interrupted turn preserves its turn number and start time.
 
 ```
 queued ──▶ running ──▶ succeeded | failed ──(user sends a message)──▶ queued
@@ -322,10 +330,15 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
    sees `cancelling` and interrupts the run, which kills the agent process.
-   When a runner is stopped (redeploy, scale down), it interrupts its runs
-   the same way and marks them failed. If a runner dies without stopping
-   cleanly, another replica's reaper fails its runs. Either way the sandbox
-   is kept, so a message picks the run up again.
+   On graceful shutdown (redeploy, scale down), the runner detaches from its
+   saved command sessions and releases its claims. Another runner reconnects
+   in the same sandbox and continues the same turn automatically. A forced
+   exit waits until its heartbeat is older than `STALE_RUN_SECONDS` (180 by
+   default), then the reaper releases the claim. Ownership checks prevent the
+   old runner from updating or finishing a replacement's run. Pending
+   cancellation survives either handoff. Recovery depends on Railway's
+   retained command sessions; a lost sandbox or missing session cannot resume
+   its running process.
 7. A message to a finished run (`POST /api/runs/:id/messages`) queues it
    again. On that turn the agent continues its Claude Code session
    (`claude --continue`, signalled by `FACTORY_CONTINUE`) with the new
@@ -534,7 +547,7 @@ key under **Settings**, and it is used for their runs only.
 
 - `users`: GitHub identity plus encrypted user tokens.
 - `sessions`: hashed session tokens with expiry.
-- `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat).
+- `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat and owner).
 - `run_events`: append-only log per run: runner steps, command output, and the agent's messages, tool calls and results, plus messages from the user (`003_run_activity.sql`).
 - `run_diffs`: the latest diff of each run's branch against its base commit.
 - `runs` also tracks its sandbox between turns (`004_sandbox_lifecycle.sql`):
@@ -552,6 +565,10 @@ key under **Settings**, and it is used for their runs only.
 - `runs.preview_ports` and `runs.preview_seen_at` (`008_previews.sql`): the
   ports listening in the sandbox while its preview agent is connected, and
   when someone last used a preview.
+- `runs.execution` and `runs.recovering` (`010_run_recovery.sql`): saved command
+  sessions and turn context, and whether the next claim resumes an interrupted
+  turn. Structured events carry replay keys so reconnecting does not duplicate
+  the conversation.
 
 ## What this foundation does not do yet
 

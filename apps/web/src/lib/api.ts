@@ -95,5 +95,16 @@ export const clientLayer = (baseUrl: string, headers: Record<string, string> = {
 /** Runs an API call from the browser against this origin. */
 export const runInBrowser = <A>(
   effect: Effect.Effect<A, ApiRequestError, HttpClient.HttpClient>,
+  options?: { readonly timeoutMs: number },
 ): Promise<Either.Either<A, ApiRequestError>> =>
-  Effect.runPromise(effect.pipe(Effect.either, Effect.provide(clientLayer(window.location.origin))));
+  Effect.runPromise(
+    (options
+      ? effect.pipe(
+          Effect.timeoutFail({
+            duration: options.timeoutMs,
+            onTimeout: () => new ApiRequestError({ status: 0, code: "network", message: "The factory is taking too long to respond." }),
+          }),
+        )
+      : effect
+    ).pipe(Effect.either, Effect.provide(clientLayer(window.location.origin))),
+  );

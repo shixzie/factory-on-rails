@@ -124,6 +124,7 @@ beforeAll(async () => {
       FACTORY_PREVIEW_TOKEN_FILE: join(dir, "token"),
       FACTORY_PREVIEW_PID_FILE: join(dir, "pid"),
       FACTORY_PREVIEW_SCAN_MS: "200",
+      FACTORY_PREVIEW_REPORT_MS: "600",
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
@@ -158,6 +159,13 @@ describe("preview gateway", () => {
     expect(seen.headers.cookie).toBe("theirs=1");
     expect(seen.headers["x-forwarded-host"]).toBe(appHost());
     expect(touched).toContain(RUN);
+  });
+
+  it("repairs preview port metadata cleared by an older gateway after a deploy", async () => {
+    // No ports change here: the periodic report must republish the same list.
+    ports.push(null);
+    await until(() => ports.at(-1)?.some((p) => p.port === appPort) === true);
+    expect(gateway.tunnels.has(RUN)).toBe(true);
   });
 
   it("passes request bodies, redirects, streams and large responses through", async () => {
@@ -224,6 +232,30 @@ describe("preview gateway", () => {
     const other = await request(appHost(appPort, OTHER_RUN), "/", { cookie: stopped });
     expect(other.status).toBe(503);
     expect(other.body).toContain("stopped");
+    expect(other.body).not.toContain('http-equiv="refresh"');
+    expect(other.headers["retry-after"]).toBeUndefined();
+  });
+
+  it("retries a disconnected preview and resumes with the existing session when its tunnel reconnects", async () => {
+    const session = await signIn();
+    gateway.tunnels.get(RUN)!.close(1012, "gateway restarting");
+    await until(() => !gateway.tunnels.has(RUN));
+
+    const waiting = await request(appHost(), "/hello?x=1", { cookie: session });
+    expect(waiting.status).toBe(503);
+    expect(waiting.headers["retry-after"]).toBe("2");
+    expect(waiting.body).toContain('<meta http-equiv="refresh" content="2">');
+    expect(waiting.body).toContain("reconnecting");
+
+    const submitted = await request(appHost(), "/form", { cookie: session }, "do not replay");
+    expect(submitted.status).toBe(503);
+    expect(submitted.body).not.toContain('http-equiv="refresh"');
+    expect(submitted.headers["retry-after"]).toBeUndefined();
+
+    await until(() => gateway.tunnels.has(RUN));
+    const resumed = await request(appHost(), "/hello?x=1", { cookie: session });
+    expect(resumed.status).toBe(200);
+    expect(JSON.parse(resumed.body).url).toBe("/hello?x=1");
   });
 });
 
