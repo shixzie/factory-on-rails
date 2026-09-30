@@ -110,6 +110,24 @@ describe("executeRun", () => {
     }),
   );
 
+  it.effect("passes saved model and effort to the agent on initial and later turns", () =>
+    Effect.gen(function* () {
+      for (const turn of [
+        { ...run, model: "custom-model", reasoning_effort: "high" as const },
+        followUp({ model: "custom-model", reasoning_effort: "high" }),
+      ]) {
+        const sandboxes = fakeSandboxes();
+        yield* execute(sandboxes, withMessage(), {}, { turn });
+        const agentIndex = sandboxes.state.commands.findIndex((c) => c.includes("run-agent"));
+        expect(sandboxes.state.envs[agentIndex]).toMatchObject({
+          FACTORY_MODEL: "custom-model",
+          FACTORY_REASONING_EFFORT: "high",
+          FACTORY_CODEX_EFFORT: 'model_reasoning_effort="high"',
+        });
+      }
+    }),
+  );
+
   it.effect("runs the agent, pushes and opens a PR, and keeps the sandbox for the next turn", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
@@ -489,6 +507,9 @@ describe("executeRun", () => {
         expect(lines.slice(-3)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
         expect(sandboxes.state.commands.at(-2)).toContain("\ndescribe-pr");
         expect(sandboxes.state.envs.at(-2)).toEqual({
+          FACTORY_MODEL: "",
+          FACTORY_REASONING_EFFORT: "",
+          FACTORY_CODEX_EFFORT: "",
           FACTORY_DESCRIBE_FILE: "/workspace/.factory/describe-prompt.md",
           FACTORY_PR_FILE: "/workspace/.factory/pull-request.md",
         });

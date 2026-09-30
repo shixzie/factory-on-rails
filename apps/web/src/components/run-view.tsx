@@ -498,6 +498,10 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                   <span>·</span>
                   <span>{Api.AGENT_LABELS[run.agent]}</span>
                   <span>·</span>
+                  <span>{run.model ?? "Default model"}</span>
+                  <span>·</span>
+                  <span>{run.reasoningEffort ? `${Api.REASONING_EFFORT_LABELS[run.reasoningEffort]} effort` : "Default effort"}</span>
+                  <span>·</span>
                   <GitBranchIcon className="size-3" />
                   <span>{run.branch ? `${run.baseBranch} ← ${run.branch}` : run.baseBranch}</span>
                   <span>·</span>

@@ -1,3 +1,4 @@
+import type { ReasoningEffort } from "./api.js";
 import { SqlClient, type SqlError } from "@effect/sql";
 import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 
@@ -45,6 +46,8 @@ export interface RunRow {
   title_by_user: boolean;
   /** The coding agent: `claude` or `codex` (see AGENTS). */
   agent: string;
+  model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   status: RunStatus;
   branch: string | null;
   sandbox_id: string | null;
@@ -149,7 +152,12 @@ export interface StoreService {
   readonly deleteSession: (tokenHash: string) => Q<void>;
   // runs
   readonly enqueueRun: (
-    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & { installation_id: number; agent?: string },
+    r: Pick<RunRow, "user_id" | "repo_full_name" | "base_branch" | "task"> & {
+      installation_id: number;
+      agent?: string;
+      model?: string | null;
+      reasoning_effort?: ReasoningEffort | null;
+    },
   ) => Q<RunRow>;
   readonly listRuns: (userId: string, limit?: number) => Q<ReadonlyArray<RunRow>>;
   readonly getRun: (id: string) => Q<Option.Option<RunRow>>;
