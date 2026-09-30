@@ -7,6 +7,7 @@ import {
   CircleAlertIcon,
   CircleDotIcon,
   CircleSlashIcon,
+  ClockIcon,
   ExternalLinkIcon,
   FileDiffIcon,
   GitBranchIcon,
@@ -32,7 +33,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useFollow } from "@/hooks/use-follow";
-import { openQuestion, toBlocks } from "@/lib/activity";
+import { agentActivity, openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
 import { ago, duration } from "@/lib/format";
@@ -62,6 +63,7 @@ function useNow(on: boolean) {
 function MessageComposer({
   question,
   live,
+  working,
   hint,
   disabled,
   sending,
@@ -71,6 +73,7 @@ function MessageComposer({
 }: {
   question: boolean;
   live: boolean;
+  working: boolean;
   /** What happens when you send, once the run has finished. */
   hint?: string;
   disabled: boolean;
@@ -117,7 +120,7 @@ function MessageComposer({
         disabled={disabled}
         rows={2}
         placeholder={
-          question ? "Answer the agent's question…" : live ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
+          question ? "Answer the agent's question…" : working ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
         }
         aria-label="Message to the agent"
         className="field-sizing-content block max-h-60 min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
@@ -126,9 +129,11 @@ function MessageComposer({
         <span className="min-w-0 px-1.5 text-[11px] text-muted-foreground">
           {question
             ? "The agent is waiting for you."
-            : live
+            : working
               ? "It reads your message after its current step."
-              : (hint ?? "The agent picks up where it left off.")}
+              : live
+                ? "Your message will be picked up on the agent's next turn."
+                : (hint ?? "The agent picks up where it left off.")}
         </span>
         <span className="ml-auto hidden items-center gap-1 text-[11px] text-muted-foreground sm:inline-flex">
           <Kbd>↵</Kbd> send · <Kbd>Shift</Kbd><Kbd>↵</Kbd> new line
@@ -278,6 +283,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const [cancelling, startCancel] = useTransition();
   const [sending, setSending] = useState(false);
   const active = isActive(run.status);
+  const activity = useMemo(() => agentActivity(events, active), [events, active]);
+  const agentWorking = activity === "working";
   // A finished run's sandbox is stopped after a few idle minutes; keep the label honest.
   const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
   const now = useNow(active);
@@ -361,7 +368,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const blocks = useMemo(() => toBlocks(events), [events]);
   const files = useDiffFiles(diff);
   const totals = diffTotals(files);
-  const question = active ? openQuestion(blocks) : undefined;
+  const question = agentWorking ? openQuestion(blocks) : undefined;
 
   const openDiff = (path?: string) => {
     setPanel("diff");
@@ -416,7 +423,11 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         ? "Stopping the agent"
         : question
           ? "Waiting for your answer"
-          : `Working for ${elapsed}`;
+          : activity === "waiting_ci"
+            ? "Agent idle · waiting for CI"
+            : !agentWorking
+              ? "Agent idle"
+              : `Working for ${elapsed}`;
 
   return (
     <>
@@ -482,7 +493,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         <Badge variant="outline" className="hidden shrink-0 font-normal text-muted-foreground sm:inline-flex">
           {run.repo}
         </Badge>
-        <StatusLabel status={run.status} awaiting={run.awaitingInput} className="shrink-0" />
+        <StatusLabel status={run.status} awaiting={agentWorking && run.awaitingInput} idle={!agentWorking} className="shrink-0" />
         <SandboxLabel state={run.sandboxState} className="hidden shrink-0 md:inline-flex" />
       </PageHeader>
 
@@ -510,11 +521,11 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 </div>
               </div>
 
-              <RunActivity blocks={blocks} live={active} onAnswer={send} sending={sending} focusAgent={focusAgent} />
+              <RunActivity blocks={blocks} live={agentWorking} onAnswer={send} sending={sending} focusAgent={focusAgent} />
 
               {active ? (
                 <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
-                  {question ? <CircleDotIcon className="size-3.5 text-warning" /> : <Spinner className="size-3.5" />}
+                  {question ? <CircleDotIcon className="size-3.5 text-warning" /> : !agentWorking && run.status === "running" ? <ClockIcon className="size-3.5" /> : <Spinner className="size-3.5" />}
                   <span suppressHydrationWarning>{liveLabel}</span>
                 </div>
               ) : run.startedAt ? (
@@ -552,6 +563,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
             <MessageComposer
               question={!!question}
               live={active}
+              working={agentWorking}
               hint={sandboxHint(run.sandboxState)}
               disabled={run.status === "cancelling"}
               sending={sending}

@@ -38,7 +38,11 @@ read; they do not silently skip verification.
 
 After opening or updating a PR, the runner waits for checks and commit statuses
 on the pushed commit. Failed checks resume the agent to diagnose and fix them,
-then the runner pushes and verifies the new commit. Neutral/skipped checks are
+then the runner pushes and verifies the new commit. The agent is idle while
+the factory waits for CI and stays idle once checks pass or the PR is merged.
+If checks turn green or the PR is merged during an automatic repair, the
+factory stops that repair. A new message still starts a new turn, and idle
+sandboxes are saved and stopped as usual. Neutral/skipped checks are
 accepted as GitHub terminal non-failures. Repositories reporting no checks get a
 60-second discovery period. CI waiting and repair share an additional
 `AGENT_TIMEOUT_SECONDS` budget (one hour by default); a timeout or an agent that

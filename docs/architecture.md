@@ -321,7 +321,11 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    text" below), and the runner opens it. The runner polls check runs, check
    suites, workflows and commit statuses for the published SHA. Failures resume
    the agent with diagnostics; its fixes are pushed and checked again before
-   the run can succeed. An unchanged follow-up still verifies CI. Missing CI
+   the run can succeed. Passing CI or a merged PR immediately leaves the agent
+   idle, including interrupting an automatic repair if checks turn green or
+   the PR is merged while it works. PR description updates happen before the
+   next CI wait and are skipped or interrupted on success. A closed, unmerged PR
+   does not count as merged. An unchanged follow-up still verifies CI. Missing CI
    gets a 60-second discovery period; unreadable CI, a timeout or an agent
    unable to produce a fix fails the run. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat

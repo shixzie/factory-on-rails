@@ -34,13 +34,13 @@ export const isActive = (status: Api.RunStatus) => status === "queued" || status
 /** A live run whose agent asked a question and is waiting for the user. */
 const needsInput = (status: Api.RunStatus, awaiting?: boolean) => !!awaiting && status === "running";
 
-export function StatusDot({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+export function StatusDot({ status, awaiting, idle, className }: { status: Api.RunStatus; awaiting?: boolean; idle?: boolean; className?: string }) {
   return (
     <span
       aria-hidden
       className={cn(
         "inline-block size-1.5 shrink-0 rounded-full",
-        needsInput(status, awaiting) ? "bg-warning animate-pulse" : DOT[status],
+        needsInput(status, awaiting) ? "bg-warning animate-pulse" : idle && status === "running" ? "bg-muted-foreground/50" : DOT[status],
         className,
       )}
     />
@@ -48,18 +48,19 @@ export function StatusDot({ status, awaiting, className }: { status: Api.RunStat
 }
 
 /** A dot and a word on a chip tinted by state. */
-export function StatusLabel({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+export function StatusLabel({ status, awaiting, idle, className }: { status: Api.RunStatus; awaiting?: boolean; idle?: boolean; className?: string }) {
   const input = needsInput(status, awaiting);
+  const resting = idle && status === "running";
   return (
     <span
       className={cn(
         "inline-flex h-5 items-center gap-1.5 rounded-sm px-1.5 text-[11px] font-medium tracking-wide uppercase",
-        input ? "bg-warning/15 text-warning" : TONE[status],
+        input ? "bg-warning/15 text-warning" : resting ? "bg-muted text-muted-foreground" : TONE[status],
         className,
       )}
     >
-      <StatusDot status={status} awaiting={awaiting} />
-      {input ? "Needs input" : LABEL[status]}
+      <StatusDot status={status} awaiting={awaiting} idle={idle} />
+      {input ? "Needs input" : resting ? "Idle" : LABEL[status]}
     </span>
   );
 }

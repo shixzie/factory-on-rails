@@ -435,36 +435,61 @@ const work = (
       pr.opened ? `Opened ${pr.url}` : pr.updated ? `Pushed the changes to ${pr.url} and updated its description` : `Pushed the changes to ${pr.url}`,
     );
     // CI only starts after a push (and often only after opening the PR).
-    // Keep the run active until the exact published commit passes.
+    // The agent rests once the exact published commit passes or its PR merges.
+    // Only watch this turn's PR, so a new user message can still start work
+    // after an earlier PR was merged.
     yield* Effect.gen(function* () {
-      let repaired = false;
+      const number = pullRequestNumber(pr.url);
+      const inspectCi = (head: string) => Effect.gen(function* () {
+        yield* refreshToken;
+        const current = yield* github.pullRequest(token, run.repo_full_name, number);
+        if (current.merged) {
+          yield* log.info(`Pull request merged: ${pr.url}`);
+          return { complete: true, checks: [] } as const;
+        }
+        const checks = yield* github.ciChecks(token, run.repo_full_name, head);
+        if (current.head.sha === head && checks.length > 0 && checks.every((c) => c.state === "passed")) {
+          yield* log.info(`CI passed for ${head}`);
+          return { complete: true, checks } as const;
+        }
+        return { complete: false, checks } as const;
+      });
+      // A failed check can be rerun, and the PR can be merged, while the
+      // automated repair is still working. Interrupt it as soon as either
+      // completion is observed, including the command inside the sandbox.
+      const watchCompletion = (head: string) => Effect.gen(function* () {
+        for (;;) {
+          yield* Effect.sleep(ciPollEvery);
+          if ((yield* inspectCi(head)).complete) return true;
+        }
+      });
+      let updateDescription = false;
       for (;;) {
         const head = (yield* step("Reading the published commit", "git rev-parse HEAD", { cwd: REPO_DIR })).stdout.trim();
         if (!/^[a-f0-9]{40}$/.test(head)) return yield* new StepFailed({ message: "Could not determine the published commit for CI" });
+        if (updateDescription) {
+          if ((yield* inspectCi(head)).complete) return;
+          const completed = yield* Effect.gen(function* () {
+            const updated = yield* describe(true);
+            if ((yield* inspectCi(head)).complete) return true;
+            yield* openPullRequest({ ...run, pull_request_url: pr.url }, token, branch, harnessUrl, updated, log);
+            return false;
+          }).pipe(Effect.raceFirst(watchCompletion(head)));
+          if (completed) return;
+        }
         yield* log.info(`Waiting for CI on ${head}`);
         const started = yield* Clock.currentTimeMillis;
         let failures: ReadonlyArray<CiCheck> = [];
         for (;;) {
-          yield* refreshToken;
-          const checks = yield* github.ciChecks(token, run.repo_full_name, head);
+          const { complete, checks } = yield* inspectCi(head);
+          if (complete) return;
           failures = checks.filter((c) => c.state === "failed");
           if (failures.length > 0) break;
-          if (checks.length > 0 && checks.every((c) => c.state === "passed")) {
-            yield* log.info(`CI passed for ${head}`);
-            break;
-          }
           if (checks.length === 0 && (yield* Clock.currentTimeMillis) - started >= Duration.toMillis(ciDiscoveryGrace)) {
             yield* log.info(`No CI checks were reported for ${head} during the discovery period`);
-            break;
+            return;
           }
           yield* Effect.sleep(ciPollEvery);
-        }
-        if (failures.length === 0) {
-          if (repaired) {
-            const updated = yield* describe(true);
-            yield* openPullRequest({ ...run, pull_request_url: pr.url }, token, branch, harnessUrl, updated, log);
-          }
-          return;
         }
         yield* log.info(`CI failed: ${failures.map((c) => c.name).join(", ")}. Sending failures back to the agent`);
         yield* sandbox.writeFile(TASK_FILE, [
@@ -475,13 +500,28 @@ const work = (
           "Inspect the failing logs (GH_TOKEN is available for GitHub API requests), reproduce the failures, fix their causes and run the relevant checks locally. Fix failures even if they predate your changes. Do not disable, skip or weaken checks to get a passing result.",
           "Leave fixes in the working tree. The factory will commit, push and wait for CI again. If blocked by credentials, permissions or external infrastructure, explain the blocker; do not claim CI passed.",
         ].join("\n\n"));
-        yield* runAgent(true);
-        yield* refreshToken;
+        const deliveredBeforeRepair = delivered;
+        const requeueInterruptedMessages = Effect.gen(function* () {
+          if (delivered <= deliveredBeforeRepair) return;
+          // A completion signal can interrupt a repair after its inbox accepted
+          // user messages. Let finishRun queue those messages as a fresh turn.
+          delivered = deliveredBeforeRepair;
+          yield* store.updateRun(run.id, { delivered_message_id: String(delivered) });
+        });
+        if (yield* runAgent(true).pipe(Effect.as(false), Effect.raceFirst(watchCompletion(head)))) {
+          yield* requeueInterruptedMessages;
+          return;
+        }
+        // Recheck before publishing even when the repair finished between polls.
+        if ((yield* inspectCi(head)).complete) {
+          yield* requeueInterruptedMessages;
+          return;
+        }
         const pushed = yield* step("Committing and pushing CI fixes", publishScript({ baseBranch: run.base_branch, branch }));
         if (pushed.stdout.includes(NO_CHANGES_MARKER) || pushed.stdout.includes(UP_TO_DATE_MARKER)) {
           return yield* new StepFailed({ message: "CI is failing and the agent produced no fixes to push. See the agent's output for the blocker." });
         }
-        repaired = true;
+        updateDescription = true;
       }
     }).pipe(
       Effect.timeoutFail({ duration: Duration.seconds(agent.timeoutSec), onTimeout: () => new StepFailed({ message: "Timed out waiting for CI and fixing failures; CI has not been verified green." }) }),

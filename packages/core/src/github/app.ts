@@ -5,7 +5,7 @@ import { InstanceSettings } from "../instance.js";
 import { appNotSetUp } from "./oauth.js";
 import { executeJson, GitHubError, githubRequest } from "./http.js";
 import { readCiChecks, type CiCheck } from "./ci.js";
-import { InstallationTokenResponse, PullRequest } from "./schemas.js";
+import { InstallationTokenResponse, PullRequest, PullRequestState } from "./schemas.js";
 
 export interface GitHubAppCredentials {
   appId: string;
@@ -47,6 +47,8 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
       pr: { title: string; body: string; head: string; base: string },
     ) => Effect.Effect<PullRequest, GitHubError>;
     readonly ciChecks: (token: Redacted.Redacted<string>, repo: string, sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError>;
+    /** Reads merge state separately from CI, which may still be pending after a merge. */
+    readonly pullRequest: (token: Redacted.Redacted<string>, repo: string, number: number) => Effect.Effect<PullRequestState, GitHubError>;
     /** Rewrites an open pull request's title and description. */
     readonly updatePullRequest: (
       token: Redacted.Redacted<string>,
@@ -84,6 +86,11 @@ export class GitHubAppApi extends Context.Tag("@factory/GitHubAppApi")<
             Effect.map((res) => Redacted.make(res.token)),
           ),
         ciChecks: (token, repo, sha) => readCiChecks(client, token, repo, sha),
+        pullRequest: (token, repo, number) =>
+          githubRequest("GET", `/repos/${repo}/pulls/${number}`).pipe(
+            HttpClientRequest.bearerToken(Redacted.value(token)),
+            executeJson(client, PullRequestState),
+          ),
         createPullRequest: (token, repoFullName, pr) =>
           githubRequest("POST", `/repos/${repoFullName}/pulls`).pipe(
             HttpClientRequest.bearerToken(Redacted.value(token)),
