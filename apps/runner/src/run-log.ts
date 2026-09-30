@@ -1,4 +1,5 @@
 import { Store, type RunEvent } from "@factory/core";
+import type { SqlError } from "@effect/sql";
 import { Duration, Effect, Schedule, type Scope } from "effect";
 
 /** Replaces every occurrence of each secret with a marker. */
@@ -29,6 +30,8 @@ export interface RunLog {
   readonly info: (message: string) => Effect.Effect<void>;
   readonly error: (message: string) => Effect.Effect<void>;
   readonly flush: Effect.Effect<void>;
+  /** Flushes before a durable checkpoint; failure keeps the batch queued and must not be ignored. */
+  readonly flushDurable?: Effect.Effect<void, SqlError.SqlError>;
 }
 
 /**
@@ -70,13 +73,22 @@ export const makeRunLog = (
       pending.push(data ? { kind, message, data } : { kind, message });
     };
 
-    const flush = lock.withPermits(1)(
-      Effect.suspend(() => {
-        const batch = pending;
-        pending = [];
-        return batch.length === 0 ? Effect.void : store.appendEvents(runId, batch);
-      }),
-    ).pipe(Effect.catchAllCause((cause) => Effect.logError("Could not store run events", cause)));
+    const flushDurable = lock.withPermits(1)(
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const batch = pending;
+          pending = [];
+          return batch;
+        }),
+        (batch) => batch.length === 0 ? Effect.void : store.appendEvents(runId, batch),
+        (batch, exit) => Effect.sync(() => {
+          // Output can arrive while the insert is in flight. Restore the old
+          // batch before it, including when scope shutdown interrupted a flush.
+          if (exit._tag === "Failure") pending = [...batch, ...pending];
+        }),
+      ),
+    );
+    const flush = flushDurable.pipe(Effect.catchAllCause((cause) => Effect.logError("Could not store run events", cause)));
 
     yield* Effect.addFinalizer(() => flush);
     yield* flush.pipe(Effect.repeat(Schedule.spaced(flushEvery)), Effect.forkScoped);
@@ -90,5 +102,6 @@ export const makeRunLog = (
       info: (message) => Effect.sync(() => push("info", message)),
       error: (message) => Effect.sync(() => push("error", message)),
       flush,
+      flushDurable,
     };
   });

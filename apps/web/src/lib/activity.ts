@@ -65,6 +65,7 @@ export function agentActivityChange(event: ApiRunEvent): AgentActivity | undefin
   if (
     event.message === "Running the agent" ||
     event.message === "Continuing the agent's session" ||
+    event.message === "Reconnecting to the agent" ||
     event.message === "Writing the pull request description"
   ) return "working";
   if (event.message.startsWith("Waiting for CI on ")) return "waiting_ci";

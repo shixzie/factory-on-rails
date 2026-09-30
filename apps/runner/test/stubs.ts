@@ -1,4 +1,4 @@
-import { GitHubAppApi, GitHubError, Store, type CiCheck, type PullRequestState, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type CiCheck, type PullRequestState, type RunEvent, type RunEventRow, type RunRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
 import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
@@ -21,8 +21,9 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
   const userMessages: RunEventRow[] = [];
   const layer = stubStore({
     appendEvents: (_runId, batch) => Effect.sync(() => void events.push(...batch)),
-    updateRun: (_runId, patch) => Effect.sync(() => void updates.push(patch)),
+    updateRun: (_runId, patch) => Effect.sync(() => void updates.push(structuredClone(patch))),
     heartbeat: () => Effect.sync(() => Option.some(status())),
+    getRun: (id) => Effect.sync(() => Option.some(Object.assign({ id, status: status() }, ...updates) as RunRow)),
     listUserMessages: (_runId, afterId) => Effect.sync(() => userMessages.filter((m) => Number(m.id) > afterId)),
     saveDiff: (_runId, patch, truncated) => Effect.sync(() => void diffs.push({ patch, truncated })),
   });
@@ -80,10 +81,15 @@ export const fakeGitHub = (
         calls.push(["updatePullRequest", Redacted.value(token), repo, number, pr]);
         return Effect.succeed({ number, html_url: `https://github.com/shixzie/demo/pull/${number}` });
       }),
+    findOpenPullRequest: (token, repo, refs) =>
+      Effect.sync(() => {
+        calls.push(["findOpenPullRequest", Redacted.value(token), repo, refs]);
+        return prOpen ? Option.some({ number: 1, html_url: "https://github.com/shixzie/demo/pull/1" }) : Option.none();
+      }),
   });
 
 /** A command that streams output as it goes, e.g. an agent. */
-export type Scripted = (onOutput: NonNullable<ExecOptions["onOutput"]>) => Effect.Effect<Partial<ExecResult>>;
+export type Scripted = (onOutput: NonNullable<ExecOptions["onOutput"]>) => Effect.Effect<Partial<ExecResult>, SandboxError>;
 
 export interface FakeSandbox {
   commands: string[];
@@ -104,6 +110,9 @@ export interface FakeSandbox {
   deletedCheckpoints: string[];
   destroyed: boolean;
   killed: boolean;
+  detached: boolean;
+  attachments: string[];
+  stoppedSessions: string[];
 }
 
 /**
@@ -112,7 +121,7 @@ export interface FakeSandbox {
  * `create` makes sbx_1 (then sbx_2, ...), `restore` makes sbx_restored.
  */
 export const fakeSandboxes = (
-  results: Record<string, Partial<ExecResult> | Effect.Effect<Partial<ExecResult>> | Scripted> = {},
+  results: Record<string, Partial<ExecResult> | Effect.Effect<Partial<ExecResult>, SandboxError> | Scripted> = {},
   {
     hang,
     failCreate,
@@ -140,14 +149,28 @@ export const fakeSandboxes = (
     deletedCheckpoints: [],
     destroyed: false,
     killed: false,
+    detached: false,
+    attachments: [],
+    stoppedSessions: [],
   };
+  let nextSession = 0;
   const handle = (id: string): SandboxHandle => ({
     id,
+    stopSession: (name: string) => Effect.sync(() => {
+      state.stoppedSessions.push(name);
+      state.killed = true;
+    }),
     exec: (command, options) => {
       state.commands.push(command);
       state.envs.push(options?.env);
+      if (options?.sessionName) state.attachments.push(options.sessionName);
+      const session = options?.sessionName ?? `exec_${++nextSession}`;
+      const ready = options?.sessionName ? Effect.void : options?.onSession?.(session) ?? Effect.void;
       if (hang && command.includes(hang)) {
-        return Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void (state.killed = true))));
+        return Effect.zipRight(ready, Effect.never).pipe(Effect.onInterrupt(() => Effect.sync(() => {
+          if (options?.detachOnInterrupt?.()) state.detached = true;
+          else state.killed = true;
+        })));
       }
       const key = Object.keys(results).find((k) => command.includes(k));
       const planned = key ? results[key]! : command.endsWith("\ngit rev-parse HEAD") ? { stdout: "a".repeat(40) } : {};
@@ -157,7 +180,7 @@ export const fakeSandboxes = (
           : Effect.isEffect(planned)
             ? planned
             : Effect.succeed(planned);
-      return effect.pipe(
+      return Effect.zipRight(ready, effect).pipe(
         Effect.map((partial) => {
           const result = { exitCode: 0, stdout: "", timedOut: false, ...partial };
           if (result.stdout) options?.onOutput?.("stdout", result.stdout);

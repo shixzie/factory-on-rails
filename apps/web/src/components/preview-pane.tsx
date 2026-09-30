@@ -41,6 +41,7 @@ export function PreviewPane({ run, enabled }: { run: Api.ApiRun; enabled: boolea
   const [error, setError] = useState<string>();
   const [custom, setCustom] = useState("");
   const frameKey = useRef(0);
+  const loadedPort = useRef<number | undefined>(undefined);
 
   // Pick a port once the sandbox reports one.
   useEffect(() => {
@@ -64,13 +65,16 @@ export function PreviewPane({ run, enabled }: { run: Api.ApiRun; enabled: boolea
     setLoading(false);
     if (!url) return;
     frameKey.current += 1;
+    loadedPort.current = to;
     setSrc(url);
   };
 
   // Show the picked port as soon as there is one to show.
   useEffect(() => {
-    if (port !== undefined && sandboxUp && connected) void load(port, path);
-    else setSrc(undefined);
+    if (!sandboxUp || loadedPort.current !== port) setSrc(undefined);
+    // A gateway deploy briefly clears the port report. Keep an already open
+    // app mounted so its state survives and its own connections can recover.
+    if (port !== undefined && sandboxUp && connected && (!src || loadedPort.current !== port)) void load(port, path);
   }, [port, sandboxUp, connected]);
 
   const openTab = async () => {
@@ -179,14 +183,17 @@ export function PreviewPane({ run, enabled }: { run: Api.ApiRun; enabled: boolea
       ) : null}
 
       {error ? <p className="shrink-0 border-b bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p> : null}
+      {sandboxUp && !connected && src ? (
+        <p role="status" className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground">Reconnecting to the sandbox…</p>
+      ) : null}
 
       {!sandboxUp ? (
         <Empty title={run.sandboxState === "stopped" || run.sandboxState === "stopping" ? "The sandbox is stopped" : "No sandbox is running"}>
           Send the agent a message to start it again. Stopped sandboxes keep their files but not running processes, so ask it to start the server too.
         </Empty>
-      ) : !connected ? (
+      ) : !connected && !src ? (
         <Empty title="Connecting to the sandbox" spinner>
-          The sandbox connects for previews at the start of each turn.
+          The preview reconnects automatically when the connection is interrupted.
         </Empty>
       ) : port === undefined ? (
         <Empty title="Nothing is listening yet">

@@ -146,18 +146,106 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
-    it.effect("reaps runs that stopped heartbeating", () =>
+    it.effect("releases stale runs for recovery without losing their sandbox or turn", () =>
       Effect.gen(function* () {
         const store = yield* Store;
         const sql = yield* SqlClient.SqlClient;
         const { id } = yield* user;
         yield* sql`delete from runs`;
         const run = yield* enqueue(id, "stale");
-        yield* store.claimNextRun("w");
-        yield* store.updateRun(run.id, { sandbox_id: "sbx_9" });
+        const started = Option.getOrThrow(yield* store.claimNextRun("w"));
+        const execution = { sessions: { agent: { name: "agent-1", startedAt: Date.now() } } };
+        yield* store.updateRun(run.id, { sandbox_id: "sbx_9", execution });
         yield* sql`update runs set heartbeat_at = now() - interval '10 minutes' where id = ${run.id}`;
         expect(yield* store.reapStaleRuns(60)).toEqual([{ id: run.id, sandbox_id: "sbx_9" }]);
-        expect(Option.map(yield* store.getRun(run.id), (r) => r.status)).toEqual(Option.some("failed"));
+        expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({
+          status: "queued", recovering: true, execution, claimed_by: null, heartbeat_at: null, error: null, finished_at: null,
+        });
+        const recovered = Option.getOrThrow(yield* store.claimNextRun("replacement"));
+        expect(recovered).toMatchObject({
+          id: run.id, status: "running", sandbox_id: "sbx_9", turns: started.turns, started_at: started.started_at, execution,
+        });
+        expect(yield* store.reapStaleRuns(60)).toEqual([]);
+      }),
+    );
+
+    it.effect("hands a released turn to one replacement and fences writes from its former owner", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        const run = yield* enqueue(id, "redeploy");
+        expect(run).toMatchObject({ execution: null, recovering: false });
+        const started = Option.getOrThrow(yield* store.claimNextRun("old"));
+        const execution = {
+          checkout: "clone" as const,
+          prompt: { text: "original task", commitMessage: "Implement task", deliveredMessageId: "0" },
+          sessions: {
+            setup: { name: "setup-1", result: { exitCode: 0, stdout: "ready", timedOut: false } },
+            agent: { name: "agent-1" },
+          },
+        };
+        const firstPr = "https://github.com/o/r/pull/11";
+        const recoveredPr = "https://github.com/o/r/pull/12";
+        yield* store.updateRun(run.id, { execution, branch: "factory/keep", sandbox_id: "sbx", pull_request_url: firstPr }, "old");
+        yield* store.releaseRun(run.id, "old");
+        const claims = yield* Effect.all(["new-a", "new-b"].map((worker) => store.claimNextRun(worker)), { concurrency: "unbounded" });
+        const claimed = claims.flatMap(Option.toArray);
+        expect(claimed).toHaveLength(1);
+        const replacement = claimed[0]!;
+        expect(replacement).toMatchObject({
+          id: run.id, turns: started.turns, started_at: started.started_at, execution, recovering: true,
+          pull_request_url: firstPr, pull_request_urls: [firstPr],
+        });
+
+        expect(yield* store.heartbeat(run.id, "old")).toEqual(Option.none());
+        const staleWrite = yield* Effect.flip(store.updateRun(run.id, {
+          execution: null, branch: "factory/stale", sandbox_id: null, pull_request_url: "https://github.com/o/r/pull/99",
+        }, "old"));
+        expect(staleWrite._tag).toBe("SqlError");
+        yield* store.finishRun(run.id, "failed", "stale failure", "old");
+        yield* store.releaseRun(run.id, "old");
+        expect(Option.getOrThrow(yield* store.getRun(run.id))).toEqual(replacement);
+
+        expect(yield* store.heartbeat(run.id, replacement.claimed_by!)).toEqual(Option.some("running"));
+        yield* store.updateRun(run.id, { pull_request_url: recoveredPr }, replacement.claimed_by!);
+        yield* store.finishRun(run.id, "succeeded", undefined, replacement.claimed_by!);
+        expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({
+          status: "succeeded", execution: null, recovering: false, claimed_by: null, heartbeat_at: null,
+          pull_request_url: recoveredPr, pull_request_urls: [firstPr, recoveredPr],
+        });
+        yield* store.releaseRun(run.id, replacement.claimed_by!);
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).status).toBe("succeeded");
+      }),
+    );
+
+    it.effect("preserves cancellation through shutdown, a crash, and cancellation while awaiting recovery", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        yield* sql`delete from runs`;
+        for (const mode of ["shutdown", "crash", "between"] as const) {
+          const run = yield* enqueue(id, mode);
+          yield* store.claimNextRun("old");
+          if (mode !== "between") yield* store.requestCancel(run.id, id);
+          if (mode === "crash") {
+            yield* sql`update runs set heartbeat_at = now() - interval '10 minutes' where id = ${run.id}`;
+            yield* store.reapStaleRuns(60);
+          } else {
+            yield* store.releaseRun(run.id, "old");
+          }
+          if (mode === "between") expect(yield* store.requestCancel(run.id, id)).toBe(true);
+          expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({
+            status: "cancelling", recovering: true, claimed_by: null,
+          });
+          const replacement = Option.getOrThrow(yield* store.claimNextRun("new"));
+          expect(replacement).toMatchObject({ id: run.id, status: "cancelling", turns: 1 });
+          expect(Option.isNone(yield* store.claimNextRun("other"))).toBe(true);
+          yield* store.finishRun(run.id, "cancelled", undefined, "new");
+          expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({ status: "cancelled", recovering: false });
+        }
       }),
     );
 
@@ -191,6 +279,20 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
         expect(all.map((e) => e.data)).toEqual([null, { id: "toolu_1", name: "Bash", input: { command: "ls" } }, null]);
         const messages = yield* store.listUserMessages(run.id, Number(all[0]!.id));
         expect(messages.map((e) => e.message)).toEqual(["and add tests"]);
+      }),
+    );
+
+    it.effect("deduplicates replayed agent events without dropping ordinary events or later turns", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "replay");
+        const replayed = { kind: "message" as const, message: "working", data: { _replayKey: "1:agent:0" } };
+        yield* store.appendEvents(run.id, [replayed, { kind: "info", message: "connected" }]);
+        yield* store.appendEvents(run.id, [replayed, { kind: "info", message: "connected" }]);
+        yield* store.appendEvents(run.id, [{ ...replayed, data: { _replayKey: "2:agent:0" } }]);
+        const events = yield* store.listEvents(run.id);
+        expect(events.map((event) => event.message)).toEqual(["working", "connected", "connected", "working"]);
       }),
     );
 
@@ -230,6 +332,7 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
 
         const queued = Option.getOrThrow(yield* store.continueRun(run.id, "try again"));
         expect(queued.status).toBe("queued");
+        expect(queued).toMatchObject({ execution: null, recovering: false, claimed_by: null, heartbeat_at: null });
         expect((yield* store.listUserMessages(run.id, 0)).map((e) => e.message)).toEqual(["try again"]);
         const claimed = Option.getOrThrow(yield* store.claimNextRun("w"));
         expect(claimed).toMatchObject({ id: run.id, turns: 2, error: null, finished_at: null });
@@ -246,7 +349,9 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
         yield* store.claimNextRun("w");
         yield* store.addUserMessage(run.id, "one more thing");
         yield* store.finishRun(run.id, "succeeded");
-        expect(Option.getOrThrow(yield* store.getRun(run.id)).status).toBe("queued");
+        expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({
+          status: "queued", execution: null, recovering: false, claimed_by: null, heartbeat_at: null,
+        });
 
         yield* store.claimNextRun("w");
         const [message] = yield* store.listUserMessages(run.id, 0);

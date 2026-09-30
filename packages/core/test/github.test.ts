@@ -72,6 +72,31 @@ const memorySettings = (rows = new Map<string, unknown>()) =>
     } as unknown as StoreService),
   );
 
+describe("GitHub pull request reconciliation", () => {
+  it.effect("limits lookup to the repository owner, source branch, target branch and open state", () => {
+    const client = HttpClient.make((req, url) => Effect.sync(() => {
+      expect(req.method).toBe("GET");
+      expect(url.pathname).toBe("/repos/acme/demo/pulls");
+      expect(url.searchParams.get("state")).toBe("open");
+      expect(url.searchParams.get("head")).toBe("acme:factory/run-1");
+      expect(url.searchParams.get("base")).toBe("release/next");
+      expect(req.headers.authorization).toBe("Bearer repo-token");
+      return HttpClientResponse.fromWeb(req, Response.json([{ number: 9, html_url: "https://github.com/acme/demo/pull/9" }]));
+    }));
+    const layer = GitHubAppApi.Live.pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+      Layer.provide(InstanceSettings.Live),
+      Layer.provide(memorySettings()),
+      Layer.provide(Layer.setConfigProvider(ConfigProvider.fromJson({}))),
+    );
+    return Effect.gen(function* () {
+      const github = yield* GitHubAppApi;
+      const found = yield* github.findOpenPullRequest(Redacted.make("repo-token"), "acme/demo", { head: "factory/run-1", base: "release/next" });
+      expect(found).toEqual(Option.some({ number: 9, html_url: "https://github.com/acme/demo/pull/9" }));
+    }).pipe(Effect.provide(layer));
+  });
+});
+
 describe("GitHubAppApi pull requests", () => {
   const api = (response: Response, requests: Request[] = []) => GitHubAppApi.Live.pipe(
     Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make((req) => Effect.sync(() => {

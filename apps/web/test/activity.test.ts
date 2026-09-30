@@ -38,6 +38,15 @@ describe("agentActivity", () => {
     expect(agentActivity(events, true)).toBe("working");
   });
 
+  it("shows a recovered CI repair as working before it produces fresh output", () => {
+    const events = [
+      ev("agent_result", "Done."),
+      ev("info", "Waiting for CI on abc"),
+      ev("info", "Reconnecting to the agent"),
+    ];
+    expect(agentActivity(events, true)).toBe("working");
+  });
+
   it("handles missing final output and lets finished run status override stale tool calls", () => {
     const events = [ev("tool_call", "Bash"), ev("info", "Waiting for CI on abc")];
     expect(agentActivity(events, true)).toBe("waiting_ci");
