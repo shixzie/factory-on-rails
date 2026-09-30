@@ -484,6 +484,28 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect(await runTitle(second.id)).toBeNull();
     });
 
+    it("links multiple PRs without replacing the runner's PR, and restricts access to the owner", async () => {
+      const owner = await signIn("pr-owner", 123);
+      const other = await signIn("pr-other", 124);
+      const created = await run(Effect.flatMap(Store, (store) =>
+        store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "x" }),
+      ));
+      const path = `/api/runs/${created.id}/pull-requests`;
+      const first = "https://github.com/o/r/pull/1";
+      const second = "https://github.com/o/r/pull/2";
+      await run(Effect.flatMap(Store, (store) => store.updateRun(created.id, { pull_request_url: first })));
+      expect((await post(path, other.cookie, { url: second })).status).toBe(404);
+      for (const url of ["javascript:alert(1)", "https://github.com.evil/o/r/pull/2", "https://github.com/o/r/issues/2", "https://github.com/o/r/pull/0"]) {
+        expect((await post(path, owner.cookie, { url })).status).toBe(400);
+      }
+      const linked = await post(path, owner.cookie, { url: "  https://github.com/O/R/pull/2/  " });
+      expect(linked.status).toBe(200);
+      expect(await json(linked)).toMatchObject({ pullRequestUrl: first, pullRequestUrls: [first, second] });
+      expect(await json(await post(path, owner.cookie, { url: second }))).toMatchObject({ pullRequestUrls: [first, second] });
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run.pullRequestUrls).toEqual([first, second]);
+    });
+
     it("lets the owner rename a run, and keeps that name", async () => {
       const owner = await signIn("namer", 23);
       const other = await signIn("not-namer", 24);

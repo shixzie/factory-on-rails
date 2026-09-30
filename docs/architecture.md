@@ -335,6 +335,20 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    if that pull request was merged or closed, a new one is opened. A run that
    finishes while a message is still unread goes straight back to the queue.
 
+### Thread pull requests
+
+A thread retains every associated PR in `runs.pull_request_urls`, exposed as
+`pullRequestUrls` in the API. Publishing a new PR appends its URL atomically;
+repeat publications keep one link per PR. Migration 009 preserves existing
+links. The singular `pull_request_url` remains the runner's current PR for
+follow-up work and is still returned as `pullRequestUrl` for older clients.
+
+The thread header's PRs menu lists all links and lets the owner associate an
+existing GitHub PR using `POST /api/runs/:id/pull-requests` with `{ "url": "…" }`.
+Manual associations do not change the runner's branch or current PR. Links
+are validated as GitHub PR URLs, normalized, and deduplicated; linking does
+not check the PR's existence or change it on GitHub.
+
 ### Pull request text
 
 After a turn that pushed new commits, the runner asks the run's agent, with

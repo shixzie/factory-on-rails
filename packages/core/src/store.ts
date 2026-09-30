@@ -48,7 +48,10 @@ export interface RunRow {
   status: RunStatus;
   branch: string | null;
   sandbox_id: string | null;
+  /** Latest PR, used by the runner when continuing work on its branch. */
   pull_request_url: string | null;
+  /** Every PR associated with the thread, in association order. */
+  pull_request_urls: ReadonlyArray<string>;
   error: string | null;
   claimed_by: string | null;
   heartbeat_at: Date | null;
@@ -160,6 +163,8 @@ export interface StoreService {
   readonly claimNextRun: (workerId: string) => Q<Option.Option<RunRow>>;
   /** Records liveness and returns the run's current status (how the runner notices cancellation). */
   readonly heartbeat: (runId: string) => Q<Option.Option<RunStatus>>;
+  /** Associates an existing PR without changing the runner's current PR. */
+  readonly linkPullRequest: (runId: string, url: string) => Q<void>;
   readonly updateRun: (runId: string, patch: RunPatch) => Q<void>;
   /** Stores a generated title, unless the user has named the run. Returns whether it was stored. */
   readonly setGeneratedTitle: (runId: string, title: string) => Q<boolean>;
@@ -296,12 +301,19 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.status)),
       ),
 
+    linkPullRequest: (runId, url) =>
+      sql`update runs set pull_request_urls = array_append(pull_request_urls, lower(${url}))
+          where id = ${runId} and not (lower(${url}) = any(pull_request_urls))`.pipe(Effect.asVoid),
+
     updateRun: (runId, patch) =>
       Object.keys(patch).length === 0
         ? Effect.void
         : sql`
             update runs set ${sql.update(patch)}
               ${patch.sandbox_state ? sql`, sandbox_state_at = now()` : sql``}
+              ${patch.pull_request_url ? sql`, pull_request_urls = case
+                when lower(${patch.pull_request_url}) = any(pull_request_urls) then pull_request_urls
+                else array_append(pull_request_urls, lower(${patch.pull_request_url})) end` : sql``}
             where id = ${runId}`.pipe(Effect.asVoid),
 
     setGeneratedTitle: (runId, title) =>

@@ -81,7 +81,9 @@ export const ApiRun = Schema.Struct({
   agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
+  /** Latest PR; retained for clients that only display one. */
   pullRequestUrl: Schema.NullOr(Schema.String),
+  pullRequestUrls: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
   error: Schema.NullOr(Schema.String),
   createdAt: Schema.Date,
   startedAt: Schema.NullOr(Schema.Date),
@@ -190,6 +192,9 @@ export type CreateRunBody = typeof CreateRunBody.Type;
 
 /** The longest name a run can have. */
 export const RUN_TITLE_MAX_CHARS = 80;
+
+/** Associates an existing GitHub pull request with a run. */
+export const LinkPullRequestBody = Schema.Struct({ url: Schema.String });
 
 /** Renames a run. Generated titles never replace a name the user gave it. */
 export const RenameRunBody = Schema.Struct({ title: Schema.String });

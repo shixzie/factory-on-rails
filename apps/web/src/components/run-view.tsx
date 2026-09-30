@@ -23,6 +23,7 @@ import { PageHeader } from "@/components/page-header";
 import { PreviewPane } from "@/components/preview-pane";
 import { RunActivity } from "@/components/run-activity";
 import { RunFlow } from "@/components/run-flow";
+import { RunPullRequests, pullRequests } from "@/components/run-pull-requests";
 import { RunTitle } from "@/components/run-title";
 import { isActive, SandboxLabel, sandboxHint, StatusLabel } from "@/components/run-status";
 import { Badge } from "@/components/ui/badge";
@@ -162,19 +163,24 @@ function MessageComposer({
 }
 
 function Outcome({ run }: { run: Api.ApiRun }) {
-  if (run.status === "succeeded" && run.pullRequestUrl) {
+  const urls = pullRequests(run);
+  if (run.status === "succeeded" && urls.length > 0) {
     return (
-      <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
-        <span className="flex size-8 items-center justify-center rounded-lg bg-success/15 text-success">
-          <GitPullRequestIcon className="size-4" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium">Pull request opened</div>
-          <div className="truncate text-xs text-muted-foreground">{run.pullRequestUrl.replace("https://github.com/", "")}</div>
-        </div>
-        <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
-          Review <ExternalLinkIcon />
-        </Button>
+      <div className="space-y-2">
+        {urls.map((url) => (
+          <div key={url} className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
+            <span className="flex size-8 items-center justify-center rounded-lg bg-success/15 text-success">
+              <GitPullRequestIcon className="size-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium">Pull request</div>
+              <div className="truncate text-xs text-muted-foreground">{url.replace("https://github.com/", "")}</div>
+            </div>
+            <Button variant="outline" size="sm" nativeButton={false} render={<a href={url} target="_blank" rel="noreferrer" />}>
+              Review <ExternalLinkIcon />
+            </Button>
+          </div>
+        ))}
       </div>
     );
   }
@@ -458,11 +464,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 ) : null}
               </Button>
             ) : null}
-            {run.pullRequestUrl ? (
-              <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
-                <GitPullRequestIcon /> <span className="hidden sm:inline">Pull request</span>
-              </Button>
-            ) : null}
+            <RunPullRequests run={run} onLinked={setRun} />
             {active ? (
               <Button variant="ghost" size="sm" onClick={cancel} disabled={cancelling || run.status === "cancelling"}>
                 {cancelling ? <Spinner /> : <SquareIcon className="fill-current" />} Stop
