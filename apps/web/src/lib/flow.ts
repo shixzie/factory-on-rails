@@ -7,7 +7,7 @@
  * again.
  */
 import type { ApiRunEvent } from "@factory/core/api";
-import { ASK_USER_TOOL, isSubagentTool, repoPath, type SubagentStats } from "./activity";
+import { agentActivity, agentActivityChange, ASK_USER_TOOL, isSubagentTool, repoPath, type SubagentStats } from "./activity";
 
 export type FlowNode = "user" | "main" | "workspace" | "web" | "pr" | `sub:${string}`;
 
@@ -37,7 +37,7 @@ export interface FlowAgent {
 
 export interface FlowModel {
   agents: FlowAgent[];
-  main: { toolCount: number; current?: string; lastAt?: Date };
+  main: { toolCount: number; active: boolean; current?: string; lastAt?: Date };
   /** How many packets crossed each edge, keyed `from>to`. */
   edges: Record<string, number>;
   usesWeb: boolean;
@@ -166,7 +166,7 @@ export function flowModel(events: ReadonlyArray<ApiRunEvent>, live: boolean): Fl
   const agents = new Map<string, FlowAgent>();
   const calls: FlowContext = new Map();
   const edges: Record<string, number> = {};
-  const main: FlowModel["main"] = { toolCount: 0 };
+  const main: FlowModel["main"] = { toolCount: 0, active: agentActivity(events, live) === "working" };
   let usesWeb = false;
   let published = false;
 
@@ -217,14 +217,30 @@ export function flowModel(events: ReadonlyArray<ApiRunEvent>, live: boolean): Fl
           };
         }
       }
-    } else if (e.kind === "agent_result") {
+    }
+    const activity = agentActivityChange(e);
+    if (activity === "idle" || activity === "waiting_ci") {
       main.current = undefined;
+      for (const agent of agents.values()) {
+        if (agent.status !== "running") continue;
+        agent.status = "stopped";
+        agent.current = undefined;
+        agent.doneAt = e.at;
+      }
     }
   }
 
-  // A subagent still "running" when the run is over was cut off.
+  // Neither the agent nor unfinished subagents are working while the factory is idle.
   const list = [...agents.values()];
-  if (!live) for (const a of list) if (a.status === "running") a.status = "stopped";
+  if (!main.active) {
+    main.current = undefined;
+    for (const a of list) {
+      if (a.status !== "running") continue;
+      a.status = "stopped";
+      a.current = undefined;
+      a.doneAt = events.at(-1)?.at;
+    }
+  }
   // While its subagents work, the agent is waiting on them.
   const working = list.filter((a) => a.status === "running").length;
   if (working && main.current?.startsWith("Delegating")) main.current = `Waiting on ${working} ${working === 1 ? "subagent" : "subagents"}`;

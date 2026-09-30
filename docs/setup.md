@@ -22,7 +22,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Expire user authorization tokens | On (default) |
 | Request user authorization (OAuth) during installation | Optional |
 | Webhook | Off for now |
-| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Workflows: **Read and write** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
+| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Workflows: **Read and write** · Checks: **Read** · Commit statuses: **Read** · Actions: **Read** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
 | Where can this App be installed | Only on this account |
 
 Then:
@@ -30,6 +30,23 @@ Then:
 - Note the **App ID**, **Client ID** and the app's **slug** (the last part of its public URL).
 - Generate a **client secret** and a **private key** (`.pem`).
 - **Install** the App on your account, for all repositories or the ones the factory should work on.
+
+CI verification requires **Checks**, **Commit statuses**, and **Actions** read access.
+For an existing GitHub App, add these repository permissions in the App settings
+and accept the permission update on each installation. Runs fail if CI cannot be
+read; they do not silently skip verification.
+
+After opening or updating a PR, the runner waits for checks and commit statuses
+on the pushed commit. Failed checks resume the agent to diagnose and fix them,
+then the runner pushes and verifies the new commit. The agent is idle while
+the factory waits for CI and stays idle once checks pass or the PR is merged.
+If checks turn green or the PR is merged during an automatic repair, the
+factory stops that repair. A new message still starts a new turn, and idle
+sandboxes are saved and stopped as usual. Neutral/skipped checks are
+accepted as GitHub terminal non-failures. Repositories reporting no checks get a
+60-second discovery period. CI waiting and repair share an additional
+`AGENT_TIMEOUT_SECONDS` budget (one hour by default); a timeout or an agent that
+cannot produce a fix leaves the run failed with the PR available for inspection.
 
 Workflows lets agents change files in `.github/workflows`. Without it, GitHub
 rejects any push that touches them, and the run fails with a message saying so.

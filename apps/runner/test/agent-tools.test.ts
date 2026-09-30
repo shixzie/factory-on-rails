@@ -13,7 +13,10 @@ function setup() {
   for (const [path, content] of agentToolFiles(dir)) writeFileSync(path, content);
   mkdirSync(join(dir, "inbox"));
   const send = (name: string, text: string) => writeFileSync(join(dir, "inbox", `${name}.json`), JSON.stringify({ text }));
-  return { dir, send, env: { ...process.env, ...agentToolEnv(dir) } };
+  return { dir, send, env: {
+    ...process.env, ...agentToolEnv(dir),
+    FACTORY_MODEL: "", FACTORY_REASONING_EFFORT: "", FACTORY_CODEX_EFFORT: "",
+  } };
 }
 
 const run = promisify(execFile);
@@ -44,7 +47,7 @@ describe("agent tools", () => {
     writeFileSync(task, "- a task that starts with a dash");
     const invoke = async (extra: Record<string, string> = {}) => {
       const { stdout } = await run("sh", ["-c", DEFAULT_CODEX_COMMAND], {
-        env: { ...env, ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task },
+        env: { ...env, FACTORY_CONTINUE: "", ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task },
       });
       return JSON.parse(stdout) as { args: string[]; stdin: string };
     };
@@ -131,7 +134,10 @@ if (process.argv.includes("-")) process.stdin.resume();
     writeFileSync(prompt, "Write the PR");
     const pr = join(dir, "pull-request.md");
     const describe = async (command: string) => {
-      await run("sh", ["-c", command], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FACTORY_DESCRIBE_FILE: prompt, FACTORY_PR_FILE: pr } });
+      await run("sh", ["-c", command], { env: {
+        ...process.env, PATH: `${bin}:${process.env.PATH}`, FACTORY_DESCRIBE_FILE: prompt, FACTORY_PR_FILE: pr,
+        FACTORY_MODEL: "", FACTORY_REASONING_EFFORT: "", FACTORY_CODEX_EFFORT: "",
+      } });
       return JSON.parse(readFileSync(pr, "utf8")) as { args: string[]; stdin?: string };
     };
 

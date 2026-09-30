@@ -128,7 +128,7 @@ read on 2026-12-01, so this repo does not use it.
   web app reaches it at `harness.railway.internal:8080`.
 - The harness runs database migrations as its pre-deploy command, so a failed
   migration stops the deploy instead of shipping a broken schema.
-  Apply `010_run_recovery.sql` before starting the updated runner; independent
+  Apply `011_run_recovery.sql` before starting the updated runner; independent
   service deploys must preserve that ordering. The first upgrade cannot retrofit
   recovery onto commands started by the old runner, which still kills its
   commands on shutdown. Subsequent runner deploys preserve saved sessions.
@@ -315,7 +315,7 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 2. A runner replica claims it with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)`,
    so any number of runner replicas can share the queue without double-claiming.
 3. The runner mints an installation token scoped to that one repository
-   (contents and pull requests write), creates the sandbox, clones the base
+   (contents and pull requests write; checks, statuses and actions read), creates the sandbox, clones the base
    branch, and checks out `factory/run-<id>`.
 4. It runs the run's agent in the repo: `AGENT_SETUP_COMMAND` and
    `AGENT_COMMAND` for Claude Code, in headless mode
@@ -326,8 +326,16 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    shown as a log.
 5. It commits whatever the agent left uncommitted and pushes the branch if it
    moved. The same agent then writes the pull request (see "Pull request
-   text" below), and the runner opens it. The sandbox stays up for the next
-   turn.
+   text" below), and the runner opens it. The runner polls check runs, check
+   suites, workflows and commit statuses for the published SHA. Failures resume
+   the agent with diagnostics; its fixes are pushed and checked again before
+   the run can succeed. Passing CI or a merged PR immediately leaves the agent
+   idle, including interrupting an automatic repair if checks turn green or
+   the PR is merged while it works. PR description updates happen before the
+   next CI wait and are skipped or interrupted on success. A closed, unmerged PR
+   does not count as merged. An unchanged follow-up still verifies CI. Missing CI
+   gets a 60-second discovery period; unreadable CI, a timeout or an agent
+   unable to produce a fix fails the run. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
    sees `cancelling` and interrupts the run, which kills the agent process.
    On graceful shutdown (redeploy, scale down), the runner detaches from its
@@ -347,6 +355,20 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    title and description the agent writes again to cover the whole branch;
    if that pull request was merged or closed, a new one is opened. A run that
    finishes while a message is still unread goes straight back to the queue.
+
+### Thread pull requests
+
+A thread retains every associated PR in `runs.pull_request_urls`, exposed as
+`pullRequestUrls` in the API. Publishing a new PR appends its URL atomically;
+repeat publications keep one link per PR. Migration 010 preserves existing
+links. The singular `pull_request_url` remains the runner's current PR for
+follow-up work and is still returned as `pullRequestUrl` for older clients.
+
+The thread header's PRs menu lists all links and lets the owner associate an
+existing GitHub PR using `POST /api/runs/:id/pull-requests` with `{ "url": "…" }`.
+Manual associations do not change the runner's branch or current PR. Links
+are validated as GitHub PR URLs, normalized, and deduplicated; linking does
+not check the PR's existence or change it on GitHub.
 
 ### Pull request text
 
@@ -565,7 +587,7 @@ key under **Settings**, and it is used for their runs only.
 - `runs.preview_ports` and `runs.preview_seen_at` (`008_previews.sql`): the
   ports listening in the sandbox while its preview agent is connected, and
   when someone last used a preview.
-- `runs.execution` and `runs.recovering` (`010_run_recovery.sql`): saved command
+- `runs.execution` and `runs.recovering` (`011_run_recovery.sql`): saved command
   sessions and turn context, and whether the next claim resumes an interrupted
   turn. Structured events carry replay keys so reconnecting does not duplicate
   the conversation.

@@ -37,6 +37,8 @@ export type UserTokenColumns = Pick<
 export interface RunExecution {
   checkout?: "clone" | "resume";
   prompt?: { text: string; commitMessage: string; deliveredMessageId: string };
+  /** CI repair progress shares the turn's durable command sessions. */
+  ci?: { cycle: number; startedAt: number; pullRequestUrl: string; deliveredMessageId?: string };
   sessions: Record<string, {
     name: string;
     startedAt?: number;
@@ -62,7 +64,10 @@ export interface RunRow {
   status: RunStatus;
   branch: string | null;
   sandbox_id: string | null;
+  /** Latest PR, used by the runner when continuing work on its branch. */
   pull_request_url: string | null;
+  /** Every PR associated with the thread, in association order. */
+  pull_request_urls: ReadonlyArray<string>;
   error: string | null;
   claimed_by: string | null;
   heartbeat_at: Date | null;
@@ -183,6 +188,8 @@ export interface StoreService {
   readonly claimNextRun: (workerId: string) => Q<Option.Option<RunRow>>;
   /** Records liveness and returns the run's current status (how the runner notices cancellation). */
   readonly heartbeat: (runId: string, workerId?: string) => Q<Option.Option<RunStatus>>;
+  /** Associates an existing PR without changing the runner's current PR. */
+  readonly linkPullRequest: (runId: string, url: string) => Q<void>;
   /** A guarded write fails if the worker no longer owns the run. */
   readonly updateRun: (runId: string, patch: RunPatch, workerId?: string) => Q<void>;
   /** Hands an interrupted turn back to the queue, preserving its sandbox, sessions and cancellation. */
@@ -327,6 +334,10 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.status)),
       ),
 
+    linkPullRequest: (runId, url) =>
+      sql`update runs set pull_request_urls = array_append(pull_request_urls, lower(${url}))
+          where id = ${runId} and not (lower(${url}) = any(pull_request_urls))`.pipe(Effect.asVoid),
+
     updateRun: (runId, patch, workerId) =>
       Object.keys(patch).length === 0
         ? Effect.void
@@ -336,6 +347,9 @@ const make = Effect.gen(function* () {
               ...(patch.execution === undefined ? {} : { execution: patch.execution === null ? null : JSON.stringify(patch.execution) }),
             })}
               ${patch.sandbox_state ? sql`, sandbox_state_at = now()` : sql``}
+              ${patch.pull_request_url ? sql`, pull_request_urls = case
+                when lower(${patch.pull_request_url}) = any(pull_request_urls) then pull_request_urls
+                else array_append(pull_request_urls, lower(${patch.pull_request_url})) end` : sql``}
             where id = ${runId}
               ${workerId === undefined ? sql`` : sql`and claimed_by = ${workerId} and status in ('running', 'cancelling')`}
             returning id`.pipe(Effect.flatMap((rows) => workerId !== undefined && rows.length === 0

@@ -97,6 +97,43 @@ describe("GitHub pull request reconciliation", () => {
   });
 });
 
+describe("GitHubAppApi pull requests", () => {
+  const api = (response: Response, requests: Request[] = []) => GitHubAppApi.Live.pipe(
+    Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make((req) => Effect.sync(() => {
+      requests.push(new Request(req.url, { method: req.method, headers: req.headers }));
+      return HttpClientResponse.fromWeb(req, response.clone());
+    })))),
+    Layer.provide(InstanceSettings.Live),
+    Layer.provide(memorySettings()),
+    Layer.provide(Layer.setConfigProvider(ConfigProvider.fromJson({}))),
+  );
+
+  it.effect("reads the PR merge flag and head with the installation token", () =>
+    Effect.gen(function* () {
+      for (const merged of [false, true]) {
+        const requests: Request[] = [];
+        const pr = { number: 7, html_url: "https://github.com/o/r/pull/7", state: "closed", merged, head: { sha: "a".repeat(40) } };
+        const result = yield* Effect.flatMap(GitHubAppApi, (github) => github.pullRequest(Redacted.make("repo-token"), "o/r", 7)).pipe(
+          Effect.provide(api(Response.json({ ...pr, extra: "ignored" }), requests)),
+        );
+        expect(result).toEqual(pr);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]!.method).toBe("GET");
+        expect(requests[0]!.url).toBe("https://api.github.com/repos/o/r/pulls/7");
+        expect(requests[0]!.headers.get("authorization")).toBe("Bearer repo-token");
+      }
+    }),
+  );
+
+  it.effect("propagates unreadable PR state instead of treating it as merged", () =>
+    Effect.gen(function* () {
+      const github = yield* GitHubAppApi;
+      const result = yield* Effect.either(github.pullRequest(Redacted.make("repo-token"), "o/r", 7));
+      expect(result).toMatchObject({ _tag: "Left", left: { status: 403 } });
+    }).pipe(Effect.provide(api(Response.json({ message: "Forbidden" }, { status: 403 })))),
+  );
+});
+
 describe("GitHub App manifest", () => {
   it("points GitHub back at the factory and asks for what runs need", () => {
     const manifest = appManifest("https://f.example", "Factory on Rails 0a1b2c");
@@ -109,7 +146,7 @@ describe("GitHub App manifest", () => {
       hook_attributes: { active: false },
     });
     expect(Object.keys(manifest.default_permissions).sort()).toEqual(
-      ["administration", "contents", "metadata", "pull_requests", "workflows"],
+      ["actions", "administration", "checks", "contents", "metadata", "pull_requests", "statuses", "workflows"],
     );
   });
 

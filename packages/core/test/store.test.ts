@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, layer } from "@effect/vitest";
 import { SqlClient } from "@effect/sql";
 import { Effect, Layer, Option } from "effect";
@@ -30,6 +31,45 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
     it.effect("migrations are idempotent", () =>
       Effect.gen(function* () {
         expect(yield* migrate.pipe(Effect.provide(NodeContext.layer))).toEqual([]);
+      }),
+    );
+
+    it.effect("backfills existing PR links when upgrading the database", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql.withTransaction(Effect.gen(function* () {
+          // A temporary table shadows runs only within this transaction.
+          yield* sql`create temporary table runs (pull_request_url text) on commit drop`;
+          yield* sql`insert into runs (pull_request_url) values ('https://github.com/O/R/pull/1'), (null)`;
+          yield* sql.unsafe(readFileSync(new URL("../migrations/010_run_pull_requests.sql", import.meta.url), "utf8"));
+          const rows = yield* sql<{ pull_request_urls: string[] }>`select pull_request_urls from runs order by pull_request_url nulls last`;
+          expect(rows.map((r) => r.pull_request_urls)).toEqual([["https://github.com/o/r/pull/1"], []]);
+        }));
+      }),
+    );
+
+    it.effect("retains every PR across turns and deduplicates concurrent associations", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "multiple PRs");
+        const first = "https://github.com/o/r/pull/1";
+        const second = "https://github.com/o/r/pull/2";
+        const linked = "https://github.com/o/other/pull/3";
+        expect(run.pull_request_urls).toEqual([]);
+        yield* store.updateRun(run.id, { pull_request_url: first });
+        yield* Effect.all([
+          store.updateRun(run.id, { pull_request_url: second }),
+          store.linkPullRequest(run.id, linked),
+          store.linkPullRequest(run.id, linked.toUpperCase()),
+        ], { concurrency: "unbounded" });
+        yield* store.updateRun(run.id, { pull_request_url: second });
+        const updated = Option.getOrThrow(yield* store.getRun(run.id));
+        expect(updated.pull_request_url).toBe(second);
+        expect(updated.pull_request_urls).toHaveLength(3);
+        expect(updated.pull_request_urls).toEqual(expect.arrayContaining([first, second, linked]));
+        yield* store.updateRun(run.id, { pull_request_url: null });
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).pull_request_urls).toEqual(updated.pull_request_urls);
       }),
     );
 
@@ -146,7 +186,9 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
             agent: { name: "agent-1" },
           },
         };
-        yield* store.updateRun(run.id, { execution, branch: "factory/keep", sandbox_id: "sbx" }, "old");
+        const firstPr = "https://github.com/o/r/pull/11";
+        const recoveredPr = "https://github.com/o/r/pull/12";
+        yield* store.updateRun(run.id, { execution, branch: "factory/keep", sandbox_id: "sbx", pull_request_url: firstPr }, "old");
         yield* store.releaseRun(run.id, "old");
         const claims = yield* Effect.all(["new-a", "new-b"].map((worker) => store.claimNextRun(worker)), { concurrency: "unbounded" });
         const claimed = claims.flatMap(Option.toArray);
@@ -154,19 +196,24 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
         const replacement = claimed[0]!;
         expect(replacement).toMatchObject({
           id: run.id, turns: started.turns, started_at: started.started_at, execution, recovering: true,
+          pull_request_url: firstPr, pull_request_urls: [firstPr],
         });
 
         expect(yield* store.heartbeat(run.id, "old")).toEqual(Option.none());
-        const staleWrite = yield* Effect.flip(store.updateRun(run.id, { execution: null, branch: "factory/stale", sandbox_id: null }, "old"));
+        const staleWrite = yield* Effect.flip(store.updateRun(run.id, {
+          execution: null, branch: "factory/stale", sandbox_id: null, pull_request_url: "https://github.com/o/r/pull/99",
+        }, "old"));
         expect(staleWrite._tag).toBe("SqlError");
         yield* store.finishRun(run.id, "failed", "stale failure", "old");
         yield* store.releaseRun(run.id, "old");
         expect(Option.getOrThrow(yield* store.getRun(run.id))).toEqual(replacement);
 
         expect(yield* store.heartbeat(run.id, replacement.claimed_by!)).toEqual(Option.some("running"));
+        yield* store.updateRun(run.id, { pull_request_url: recoveredPr }, replacement.claimed_by!);
         yield* store.finishRun(run.id, "succeeded", undefined, replacement.claimed_by!);
         expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({
           status: "succeeded", execution: null, recovering: false, claimed_by: null, heartbeat_at: null,
+          pull_request_url: recoveredPr, pull_request_urls: [firstPr, recoveredPr],
         });
         yield* store.releaseRun(run.id, replacement.claimed_by!);
         expect(Option.getOrThrow(yield* store.getRun(run.id)).status).toBe("succeeded");

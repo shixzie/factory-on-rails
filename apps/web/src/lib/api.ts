@@ -61,6 +61,8 @@ export const api = {
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
   openPreview: (id: string, body: Api.OpenPreviewBody) =>
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/previews`, body), Api.PreviewLink),
+  linkPullRequest: (id: string, url: string) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/pull-requests`, { url }), Api.ApiRun),
   renameRun: (id: string, title: string) =>
     call(json("PATCH", `/api/runs/${encodeURIComponent(id)}`, { title }), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),

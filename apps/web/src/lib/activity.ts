@@ -34,6 +34,8 @@ export interface ToolCall {
   /** When the call was made and when its result came back. */
   at: Date;
   doneAt?: Date;
+  /** The agent stopped before this call returned. It stays stopped in later turns. */
+  stoppedAt?: Date;
 }
 
 export type WorkItem =
@@ -52,6 +54,38 @@ export type Block =
 
 const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+
+export type AgentActivity = "working" | "idle" | "waiting_ci";
+
+/** An event that starts or ends agent work; other events leave it unchanged. */
+export function agentActivityChange(event: ApiRunEvent): AgentActivity | undefined {
+  if (event.kind === "agent_result") return "idle";
+  if (event.kind === "message" || event.kind === "thinking" || event.kind === "tool_call") return "working";
+  if (event.kind !== "info") return undefined;
+  if (
+    event.message === "Running the agent" ||
+    event.message === "Continuing the agent's session" ||
+    event.message === "Reconnecting to the agent" ||
+    event.message === "Writing the pull request description"
+  ) return "working";
+  if (event.message.startsWith("Waiting for CI on ")) return "waiting_ci";
+  if (
+    event.message.startsWith("CI passed for ") ||
+    event.message.startsWith("No CI checks were reported for ") ||
+    event.message.startsWith("Pull request merged: ") ||
+    event.message === "Committing and pushing" ||
+    event.message === "Committing and pushing CI fixes"
+  ) return "idle";
+  return undefined;
+}
+
+/** The agent can be idle while the factory is publishing its work or waiting for CI. */
+export function agentActivity(events: ReadonlyArray<ApiRunEvent>, live: boolean): AgentActivity {
+  if (!live) return "idle";
+  let activity: AgentActivity = "working";
+  for (const event of events) activity = agentActivityChange(event) ?? activity;
+  return activity;
+}
 
 export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
   const blocks: Block[] = [];
@@ -73,6 +107,10 @@ export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
   for (const e of events) {
     const data = e.data ?? {};
     const parentId = str(data.parentToolUseId);
+    const activity = agentActivityChange(e);
+    if (activity === "idle" || activity === "waiting_ci") {
+      for (const call of calls.values()) if (!call.result && !call.stoppedAt) call.stoppedAt = e.at;
+    }
     switch (e.kind) {
       case "info":
       case "error":
@@ -137,7 +175,7 @@ export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
 export function openQuestion(blocks: ReadonlyArray<Block>): ToolCall | undefined {
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i]!;
-    if (b.type === "question" && !b.call.result) return b.call;
+    if (b.type === "question" && !b.call.result && !b.call.stoppedAt) return b.call;
   }
   return undefined;
 }

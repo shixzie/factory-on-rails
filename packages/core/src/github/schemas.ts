@@ -27,6 +27,15 @@ export type GitHubInstallation = typeof GitHubInstallation.Type;
 export const PullRequest = Schema.Struct({ number: Schema.Number, html_url: Schema.String });
 export type PullRequest = typeof PullRequest.Type;
 
+/** The current PR state; closed alone does not mean merged. */
+export const PullRequestState = Schema.Struct({
+  ...PullRequest.fields,
+  state: Schema.Literal("open", "closed"),
+  merged: Schema.Boolean,
+  head: Schema.Struct({ sha: Schema.String }),
+});
+export type PullRequestState = typeof PullRequestState.Type;
+
 export const InstallationTokenResponse = Schema.Struct({ token: Schema.String, expires_at: Schema.String });
 
 /** GitHub answers the OAuth token endpoint with 200 even on errors, so every field is optional. */

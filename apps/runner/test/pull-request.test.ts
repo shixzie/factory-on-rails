@@ -12,6 +12,8 @@ const current = { number: 9, html_url: "https://github.com/owner/repo/pull/9" };
 
 const github = (calls: unknown[][], { found = true, error = duplicate }: { found?: boolean; error?: GitHubError } = {}) => ({
   installationToken: () => Effect.succeed(token),
+  ciChecks: () => Effect.die("PR publication should not read CI checks"),
+  pullRequest: () => Effect.die("PR publication should not read CI completion state"),
   createPullRequest: () => Effect.fail(error),
   findOpenPullRequest: (_token: Redacted.Redacted<string>, repo: string, refs: { head: string; base: string }) =>
     Effect.sync(() => {

@@ -83,7 +83,7 @@ How the template itself is built is in
 [docs/railway-template.md](docs/railway-template.md).
 
 Runner deployments preserve running sandboxes and reconnect to their commands
-automatically. Apply migration `010_run_recovery.sql` before deploying the new
+automatically. Apply migration `011_run_recovery.sql` before deploying the new
 runner (the harness runs migrations before it deploys). A forced runner exit is
 recovered once its heartbeat exceeds `STALE_RUN_SECONDS` (180 seconds by default).
 The first upgrade cannot preserve commands started by an older runner, whose
