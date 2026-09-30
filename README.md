@@ -81,3 +81,11 @@ variables and the infrastructure in `.railway/railway.ts` applied by CI (how
 the maintainers' own deployment runs), follow [docs/setup.md](docs/setup.md).
 How the template itself is built is in
 [docs/railway-template.md](docs/railway-template.md).
+
+### Run model and reasoning effort
+
+The new-run composer lets you choose a model and reasoning/thinking effort beside the agent picker. Choose a preset or enter a custom model ID. Default model and Default effort leave the agent’s own configuration in control. Choices are saved with the run, displayed in its details, reused for follow-up turns and PR descriptions, and prefilled for your next run. Switching agents resets both choices.
+
+Availability depends on your account, installed CLI, and selected model; a preset does not grant access. Higher effort can increase latency and token usage. Claude Code receives `--model` and `--effort`; Codex receives `--model` and `-c model_reasoning_effort=…`. See the [Claude Code model configuration](https://code.claude.com/docs/en/model-config) and [Codex configuration reference](https://developers.openai.com/codex/config-reference).
+
+Custom `AGENT_COMMAND`, `CODEX_COMMAND`, and describe-command overrides must consume `FACTORY_MODEL` and `FACTORY_REASONING_EFFORT` (empty means default). `FACTORY_CODEX_EFFORT` contains the complete quoted TOML assignment for a Codex `-c` argument, or an empty string. Always quote these values when using them as shell arguments. Apply migration `009_run_model_effort.sql` before deploying the updated harness and runner.

@@ -168,6 +168,11 @@ const work = (
     const store = yield* Store;
     const branch = branchName(run.id);
     const followUp = run.turns > 1;
+    const modelEnv = {
+      FACTORY_MODEL: run.model ?? "",
+      FACTORY_REASONING_EFFORT: run.reasoning_effort ?? "",
+      FACTORY_CODEX_EFFORT: run.reasoning_effort ? `model_reasoning_effort=${JSON.stringify(run.reasoning_effort)}` : "",
+    };
     // What the user said since the agent last heard from them: this turn's task.
     const pending = followUp ? yield* store.listUserMessages(run.id, Number(run.delivered_message_id)) : [];
 
@@ -373,6 +378,7 @@ const work = (
         cwd: REPO_DIR,
         env: {
           ...agentToolEnv(),
+          ...modelEnv,
           FACTORY_TASK_FILE: TASK_FILE,
           FACTORY_RUN_ID: run.id,
           // The default AGENT_COMMAND passes --continue when this is set.
@@ -405,7 +411,7 @@ const work = (
           yield* sandbox.writeFile(DESCRIBE_FILE, describePrompt({ baseBranch: run.base_branch, existing: hasPullRequest }));
           yield* step("Writing the pull request description", `rm -f ${PR_FILE}\n${agent.describeCommand}`, {
             cwd: REPO_DIR,
-            env: { FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
+            env: { ...modelEnv, FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
             timeoutSec: 600,
             // Its reply is the PR text, not activity for the run page.
             onOutput: () => {},

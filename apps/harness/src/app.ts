@@ -56,6 +56,8 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   title: r.title,
   titleByUser: r.title_by_user,
   agent: r.agent === "codex" ? "codex" : "claude",
+  model: r.model ?? null,
+  reasoningEffort: r.reasoning_effort ?? null,
   status: r.status,
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
@@ -341,6 +343,9 @@ const routes = HttpRouter.empty.pipe(
       const task = body.task.trim();
       if (!body.repo || !task) return yield* fail(400, "bad_request", "Pick a repository and describe the task.");
       const agent = body.agent ?? DEFAULT_AGENT;
+      if (body.reasoningEffort && !Api.AGENT_EFFORTS[agent].includes(body.reasoningEffort)) {
+        return yield* fail(400, "bad_request", "That reasoning effort is not supported by the selected agent.");
+      }
       if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
       if (!(yield* (yield* InstanceSettings).sandboxesReady).ready) {
         return yield* fail(400, "setup_required", "Sandboxes aren't set up yet. Finish setup at /setup first.");
@@ -359,6 +364,8 @@ const routes = HttpRouter.empty.pipe(
         base_branch: body.baseBranch?.trim() || repo.defaultBranch,
         task,
         agent,
+        model: body.model ?? null,
+        reasoning_effort: body.reasoningEffort ?? null,
       });
       // Named in the background: the run starts without waiting, and a failed title never fails it.
       yield* Effect.forkDaemon(generateRunTitle(run));
