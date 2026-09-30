@@ -156,7 +156,7 @@ export function Composer({
           value={task}
           onChange={(e) => setTask(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
               e.preventDefault();
               submit();
             }
@@ -255,8 +255,7 @@ export function Composer({
           </label>
           <div className="ml-auto flex items-center gap-2">
             <span className="hidden items-center gap-1 text-[11px] text-muted-foreground sm:inline-flex">
-              <Kbd>⌘</Kbd>
-              <Kbd>↵</Kbd>
+              <Kbd>↵</Kbd> send · <Kbd>Shift</Kbd><Kbd>↵</Kbd> new line
             </span>
             <Tooltip>
               <TooltipTrigger
