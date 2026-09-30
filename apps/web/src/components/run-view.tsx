@@ -344,8 +344,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     else router.refresh();
   }, [awaiting]);
 
-  // Follow the run as it works; scrolling up pauses that until you come back down.
-  const follow = useFollow(events.length, active);
+  // Follow new activity and loaded history; scrolling up pauses until you come back down.
+  const follow = useFollow(events.length);
 
   // A live run opens with its flow map beside it, where there is room.
   useEffect(() => {

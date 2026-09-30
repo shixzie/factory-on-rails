@@ -8,15 +8,15 @@ const THRESHOLD = 96;
 const distanceFromBottom = () => document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
 
 /**
- * Keeps the page pinned to the newest activity while a run is live, the way a
- * chat or a terminal does: whenever `version` moves on (new events), it
+ * Opens a thread at the bottom and keeps it pinned to the newest activity,
+ * the way a chat or a terminal does: whenever `version` moves on (new events), it
  * scrolls to the end. Scrolling up (wheel, touch, keys or the scrollbar)
  * pauses following; coming back to the bottom, or `jump()`, resumes it.
  * `unseen` says whether activity arrived while paused, for a "jump to latest"
  * button. Expanding a block doesn't count as activity, so opening something
  * near the bottom never yanks the page away from it.
  */
-export function useFollow(version: number, enabled: boolean) {
+export function useFollow(version: number) {
   const [following, setFollowing] = useState(true);
   const [unseen, setUnseen] = useState(false);
   const followingRef = useRef(true);
@@ -76,15 +76,24 @@ export function useFollow(version: number, enabled: boolean) {
   useLayoutEffect(() => {
     if (version === seen.current) return;
     seen.current = version;
-    if (!enabled) return;
-    if (followingRef.current) requestAnimationFrame(() => scrollToEnd(true));
-    else setUnseen(true);
-  }, [version, enabled, scrollToEnd]);
+    if (followingRef.current) {
+      const frame = requestAnimationFrame(() => {
+        if (followingRef.current) scrollToEnd(true);
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+    setUnseen(true);
+  }, [version, scrollToEnd]);
 
-  // Open a live run at its newest activity.
+  // RunView is keyed by run id. Open every thread at its newest activity,
+  // after navigation and the initial layout (including the side panel) settle.
   useEffect(() => {
-    if (enabled) scrollToEnd(false);
-  }, [enabled, scrollToEnd]);
+    const frame = requestAnimationFrame(() => {
+      set(true);
+      scrollToEnd(false);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [set, scrollToEnd]);
 
   const jump = useCallback(() => {
     set(true);
