@@ -84,7 +84,7 @@ describe("GitHub App manifest", () => {
       hook_attributes: { active: false },
     });
     expect(Object.keys(manifest.default_permissions).sort()).toEqual(
-      ["administration", "contents", "metadata", "pull_requests", "workflows"],
+      ["actions", "administration", "checks", "contents", "metadata", "pull_requests", "statuses", "workflows"],
     );
   });
 
