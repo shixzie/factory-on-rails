@@ -1,12 +1,14 @@
 "use client";
 
 import {
+  ArchiveIcon,
   ChevronRightIcon,
   FolderGit2Icon,
   FolderPlusIcon,
   LogOutIcon,
   MonitorIcon,
   MoonIcon,
+  PlusIcon,
   SettingsIcon,
   SquarePenIcon,
   SunIcon,
@@ -14,8 +16,10 @@ import {
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Logo } from "@/components/logo";
+import { NewThreadLink } from "@/components/new-thread-link";
+import { ThreadPullRequestStatus } from "@/components/pull-request-status";
 import { StatusDot } from "@/components/run-status";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -40,6 +44,7 @@ import {
   SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -47,37 +52,107 @@ import {
   SidebarMenuSubItem,
   SidebarRail,
 } from "@/components/ui/sidebar";
-import type { Api } from "@/lib/api";
+import { api, runInBrowser, type Api } from "@/lib/api";
 import { runTitle, shortAge } from "@/lib/format";
+import { sidebarThreads, threadActivityLabel, visibleRecentThreads, type RepoThreads } from "@/lib/threads";
+import { cn } from "@/lib/utils";
 
 const RUNS_PER_REPO = 6;
 
-interface RepoGroup {
-  repo: string;
-  runs: Api.ApiRun[];
+/** Refresh across every page, including when a PR merges after its run has finished. */
+function useSidebarRuns(initial: readonly Api.ApiRun[]) {
+  const [runs, setRuns] = useState(initial);
+  useEffect(() => {
+    setRuns(initial);
+    let stopped = false;
+    let pending = false;
+    const refresh = async () => {
+      if (document.visibilityState === "hidden" || pending) return;
+      pending = true;
+      try {
+        const result = await runInBrowser(api.runs);
+        if (!stopped && result._tag === "Right") setRuns(result.right);
+      } finally {
+        pending = false;
+      }
+    };
+    const timer = setInterval(() => void refresh(), 15_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [initial]);
+  return runs;
 }
 
-/** Runs grouped by repository, most recently active repository first (t3code's projects and threads). */
-function groupByRepo(runs: ReadonlyArray<Api.ApiRun>): RepoGroup[] {
-  const groups = new Map<string, Api.ApiRun[]>();
-  for (const run of runs) {
-    const list = groups.get(run.repo) ?? [];
-    list.push(run);
-    groups.set(run.repo, list);
-  }
-  return [...groups].map(([repo, runs]) => ({ repo, runs }));
+function RecentThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string | null }) {
+  return (
+    <SidebarMenuSubItem>
+      <SidebarMenuSubButton
+        isActive={run.id === selectedId}
+        render={<Link href={`/runs/${run.id}`} aria-current={run.id === selectedId ? "page" : undefined} />}
+        className="h-auto min-h-11 flex-col items-stretch gap-1 py-1.5 pr-1.5"
+        title={runTitle(run, 200)}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <StatusDot status={run.status} awaiting={run.awaitingInput} />
+          <span className="truncate">{runTitle(run, 60)}</span>
+          <span className="sr-only">{threadActivityLabel(run)}</span>
+        </span>
+        <span className="flex items-center gap-2 pl-3.5">
+          <ThreadPullRequestStatus run={run} />
+          <span className="ml-auto shrink-0 text-[11px] text-muted-foreground tabular-nums" suppressHydrationWarning>
+            {shortAge(run.lastActivityAt ?? run.createdAt)}
+          </span>
+        </span>
+      </SidebarMenuSubButton>
+    </SidebarMenuSubItem>
+  );
 }
 
-function RepoRuns({ group, activeRunId }: { group: RepoGroup; activeRunId: string | null }) {
+function ActiveThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string | null }) {
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton
+        isActive={run.id === selectedId}
+        render={<Link href={`/runs/${run.id}`} aria-current={run.id === selectedId ? "page" : undefined} />}
+        title={runTitle(run, 200)}
+        className={cn(
+          "h-auto min-h-20 flex-col items-stretch gap-1.5 border border-info/15 bg-info/5 py-2.5",
+          run.awaitingInput && "border-warning/25 bg-warning/5",
+        )}
+      >
+        <span className="flex min-w-0 items-center gap-2 font-medium">
+          <StatusDot status={run.status} awaiting={run.awaitingInput} />
+          <span className="truncate">{runTitle(run, 60)}</span>
+        </span>
+        <span className="flex min-w-0 items-center gap-2 text-[11px]">
+          <span className="truncate text-muted-foreground">{run.repo}</span>
+          <span className={cn("ml-auto shrink-0 font-medium text-info", run.awaitingInput && "text-warning")}>
+            {threadActivityLabel(run)}
+          </span>
+        </span>
+        <ThreadPullRequestStatus run={run} />
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  );
+}
+
+function RepoRuns({ group, activeRunId }: { group: RepoThreads; activeRunId: string | null }) {
   const [expanded, setExpanded] = useState(false);
   const [owner, name] = group.repo.split("/");
-  const shown = expanded ? group.runs : group.runs.slice(0, RUNS_PER_REPO);
-  const hasActive = group.runs.some((r) => r.id === activeRunId);
+  const shown = visibleRecentThreads(group.recent, expanded, activeRunId, RUNS_PER_REPO);
+  const hiddenCount = group.recent.length - shown.length;
+  const hasSelected = group.recent.some((r) => r.id === activeRunId);
   return (
     <Collapsible defaultOpen render={<SidebarMenuItem />} className="group/collapsible">
       <CollapsibleTrigger
         render={<SidebarMenuButton className="text-sidebar-foreground/80" />}
-        data-active={hasActive || undefined}
+        data-active={hasSelected || undefined}
       >
         <ChevronRightIcon className="size-3.5! text-muted-foreground transition-transform group-data-open/collapsible:rotate-90" />
         <span className="truncate">
@@ -85,32 +160,46 @@ function RepoRuns({ group, activeRunId }: { group: RepoGroup; activeRunId: strin
           <span className="ml-1.5 text-xs text-muted-foreground">{owner}</span>
         </span>
       </CollapsibleTrigger>
+      <SidebarMenuAction
+        showOnHover
+        render={<NewThreadLink repo={group.repo} />}
+        title={`New thread in ${group.repo}`}
+        aria-label={`New thread in ${group.repo}`}
+        className="[@media(hover:none)]:opacity-100"
+      >
+        <PlusIcon />
+      </SidebarMenuAction>
       <CollapsibleContent>
         <SidebarMenuSub className="mr-0 pr-0">
-          {shown.map((run) => (
-            <SidebarMenuSubItem key={run.id}>
-              <SidebarMenuSubButton
-                isActive={run.id === activeRunId}
-                render={<Link href={`/runs/${run.id}`} />}
-                className="h-8 gap-2 pr-1.5"
-              >
-                <StatusDot status={run.status} awaiting={run.awaitingInput} />
-                <span className="min-w-0 flex-1 truncate">{runTitle(run, 60)}</span>
-                <span className="ml-auto text-[11px] text-muted-foreground tabular-nums" suppressHydrationWarning>
-                  {shortAge(run.createdAt)}
-                </span>
-              </SidebarMenuSubButton>
-            </SidebarMenuSubItem>
-          ))}
-          {group.runs.length > RUNS_PER_REPO ? (
+          {shown.map((run) => <RecentThread key={run.id} run={run} selectedId={activeRunId} />)}
+          {hiddenCount > 0 || expanded ? (
             <SidebarMenuSubItem>
               <SidebarMenuSubButton
-                render={<button type="button" onClick={() => setExpanded((v) => !v)} />}
+                render={<button type="button" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded} />}
                 className="h-7 text-xs text-muted-foreground"
               >
-                {expanded ? "Show less" : `Show ${group.runs.length - RUNS_PER_REPO} more`}
+                {expanded ? "Show less" : `Show ${hiddenCount} more`}
               </SidebarMenuSubButton>
             </SidebarMenuSubItem>
+          ) : null}
+          {!group.recent.length && group.activeCount > 0 ? (
+            <SidebarMenuSubItem className="px-2 py-1 text-xs text-muted-foreground">
+              {group.activeCount} active {group.activeCount === 1 ? "thread" : "threads"} above
+            </SidebarMenuSubItem>
+          ) : null}
+          {group.settled.length > 0 ? (
+            <Collapsible render={<SidebarMenuSubItem />} className="group/settled">
+              <CollapsibleTrigger render={<SidebarMenuSubButton render={<button type="button" />} className="h-7 w-full text-xs text-muted-foreground" />}>
+                <ArchiveIcon className="size-3!" />
+                <span>Settled ({group.settled.length})</span>
+                <ChevronRightIcon className="ml-auto size-3! transition-transform group-data-open/settled:rotate-90" />
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <SidebarMenuSub className="mx-0 border-0 px-0">
+                  {group.settled.map((run) => <RecentThread key={run.id} run={run} selectedId={activeRunId} />)}
+                </SidebarMenuSub>
+              </CollapsibleContent>
+            </Collapsible>
           ) : null}
         </SidebarMenuSub>
       </CollapsibleContent>
@@ -165,7 +254,8 @@ function UserMenu({ me }: { me: Api.Me }) {
 export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.ApiRun> }) {
   const pathname = usePathname();
   const activeRunId = pathname.startsWith("/runs/") ? (pathname.split("/")[2] ?? null) : null;
-  const groups = useMemo(() => groupByRepo(runs), [runs]);
+  const currentRuns = useSidebarRuns(runs);
+  const { active, repos: groups } = useMemo(() => sidebarThreads(currentRuns, activeRunId), [currentRuns, activeRunId]);
 
   return (
     <Sidebar collapsible="offcanvas" variant="inset">
@@ -179,17 +269,30 @@ export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.A
             <SidebarMenuButton
               variant="outline"
               isActive={pathname === "/"}
-              render={<Link href="/" />}
+              render={<NewThreadLink />}
               className="bg-sidebar-accent/40"
             >
               <SquarePenIcon />
-              <span>New run</span>
+              <span>New thread</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
 
       <SidebarContent>
+        {active.length > 0 ? (
+          <SidebarGroup>
+            <SidebarGroupLabel className="text-foreground">
+              Active
+              <span className="ml-2 rounded bg-info/10 px-1.5 text-[10px] font-semibold text-info">{active.length}</span>
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {active.map((run) => <ActiveThread key={run.id} run={run} selectedId={activeRunId} />)}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
         <SidebarGroup>
           <SidebarGroupLabel>Repositories</SidebarGroupLabel>
           <SidebarGroupAction render={<Link href="/repos/new" />} title="Create a repository">

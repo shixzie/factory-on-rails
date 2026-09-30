@@ -92,6 +92,29 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
+    it.effect("keeps old active threads ahead of the list limit and orders idle threads by recent activity", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* store.upsertUser({
+          github_id: 900, github_login: "sidebar", name: null, avatar_url: null,
+          access_token_enc: "enc", access_token_expires_at: null, refresh_token_enc: null, refresh_token_expires_at: null,
+        });
+        const active = yield* enqueue(id, "old active thread");
+        const waiting = yield* enqueue(id, "old thread awaiting input");
+        const recent = yield* enqueue(id, "recent idle thread");
+        const continued = yield* enqueue(id, "older thread with recent activity");
+        yield* sql`update runs set status = 'succeeded',
+          created_at = now() - interval '2 days', last_activity_at = now() - interval '2 days' where user_id = ${id}`;
+        yield* sql`update runs set status = 'running' where id = ${active.id}`;
+        yield* sql`update runs set awaiting_input = true, last_activity_at = now() - interval '1 day' where id = ${waiting.id}`;
+        yield* sql`update runs set created_at = now(), last_activity_at = now() - interval '1 minute' where id = ${recent.id}`;
+        yield* sql`update runs set last_activity_at = now() where id = ${continued.id}`;
+        expect((yield* store.listRuns(id, 2)).map((r) => r.id)).toEqual([waiting.id, active.id]);
+        expect((yield* store.listRuns(id)).map((r) => r.id)).toEqual([waiting.id, active.id, continued.id, recent.id]);
+      }),
+    );
+
     it.effect("resolves live sessions only", () =>
       Effect.gen(function* () {
         const store = yield* Store;

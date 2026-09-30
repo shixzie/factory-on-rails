@@ -262,6 +262,22 @@ describe("GitHubUserApi", () => {
     ),
   );
 
+  it.effect("reads draft and merge state with the signed-in user's token", () =>
+    Effect.gen(function* () {
+      const gh = yield* GitHubUserApi;
+      expect(yield* gh.pullRequest("ghu_pr_reader", "o/r", 8)).toEqual({
+        number: 8, html_url: "https://github.com/o/r/pull/8", state: "open", merged: false, draft: true, head: { sha: "abc" },
+      });
+      expect(requests.at(-1)?.url).toBe("https://api.github.com/repos/o/r/pulls/8");
+      expect(requests.at(-1)?.headers.get("authorization")).toBe("Bearer ghu_pr_reader");
+      expect(yield* Effect.flip(gh.pullRequest("ghu_pr_reader", "o/private", 9))).toMatchObject({ status: 404 });
+    }).pipe(Effect.provide(api({
+      "GET /repos/o/r/pulls/8": Response.json({
+        number: 8, html_url: "https://github.com/o/r/pull/8", state: "open", merged: false, draft: true, head: { sha: "abc" },
+      }),
+    }))),
+  );
+
   it.effect("exchanges the OAuth code and fails on GitHub's 200-with-error answers", () =>
     Effect.gen(function* () {
       const gh = yield* GitHubUserApi;

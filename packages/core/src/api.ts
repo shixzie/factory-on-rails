@@ -81,6 +81,13 @@ export const PreviewPort = Schema.Struct({
 });
 export type PreviewPort = typeof PreviewPort.Type;
 
+/** GitHub's current state, or unknown when the user cannot read the PR. */
+export const ApiPullRequest = Schema.Struct({
+  url: Schema.String,
+  state: Schema.Literal("open", "draft", "closed", "merged", "unknown"),
+});
+export type ApiPullRequest = typeof ApiPullRequest.Type;
+
 export const ApiRun = Schema.Struct({
   id: Schema.String,
   repo: Schema.String,
@@ -98,6 +105,7 @@ export const ApiRun = Schema.Struct({
   /** Latest PR; retained for clients that only display one. */
   pullRequestUrl: Schema.NullOr(Schema.String),
   pullRequestUrls: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  pullRequests: Schema.optionalWith(Schema.Array(ApiPullRequest), { default: () => [] }),
   error: Schema.NullOr(Schema.String),
   createdAt: Schema.Date,
   startedAt: Schema.NullOr(Schema.Date),

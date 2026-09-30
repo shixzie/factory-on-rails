@@ -29,7 +29,7 @@ export function NewRepoForm({ installUrl }: { installUrl: string }) {
           . If it doesn&apos;t show up in the run composer, grant the app access to it.
         </p>
         <div className="flex gap-2">
-          <Button render={<Link href="/" />}>Start a run</Button>
+          <Button render={<Link href={`/?repo=${encodeURIComponent(created.fullName)}`} />}>Start a run</Button>
           <Button variant="outline" render={<a href={installUrl} target="_blank" rel="noreferrer" />}>
             Manage access <ExternalLinkIcon />
           </Button>

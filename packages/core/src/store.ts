@@ -285,7 +285,10 @@ const make = Effect.gen(function* () {
       }),
 
     listRuns: (userId, limit = 50) =>
-      sql<RunRow>`select * from runs where user_id = ${userId} order by created_at desc limit ${limit}`,
+      sql<RunRow>`select * from runs where user_id = ${userId}
+        order by (status in ('queued', 'running', 'cancelling') or awaiting_input) desc,
+          last_activity_at desc, created_at desc, id desc
+        limit ${limit}`,
 
     getRun: (id) => sql<RunRow>`select * from runs where id = ${id}`.pipe(Effect.map(Arr.head)),
 
