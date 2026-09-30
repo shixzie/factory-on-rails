@@ -61,6 +61,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   status: r.status,
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
+  pullRequestUrls: r.pull_request_urls,
   error: r.error,
   createdAt: r.created_at,
   startedAt: r.started_at,
@@ -386,6 +387,22 @@ const routes = HttpRouter.empty.pipe(
         diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
         previewsEnabled: Option.isSome(preview),
       });
+    }),
+  ),
+
+  HttpRouter.post(
+    "/api/runs/:id/pull-requests",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const input = (yield* HttpServerRequest.schemaBodyJson(Api.LinkPullRequestBody)).url.trim();
+      const match = /^https:\/\/github\.com\/([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)\/pull\/([1-9]\d*)\/?$/.exec(input);
+      if (!match) return yield* fail(400, "bad_request", "Enter a GitHub pull request URL, such as https://github.com/owner/repo/pull/123.");
+      const url = `https://github.com/${match[1]!.toLowerCase()}/pull/${match[2]}`;
+      const store = yield* Store;
+      yield* store.linkPullRequest(run.id, url);
+      const updated = yield* store.getRun(run.id);
+      if (Option.isNone(updated)) return yield* fail(404, "not_found", "Run not found.");
+      return yield* json(Api.ApiRun)(toApiRun(updated.value));
     }),
   ),
 
