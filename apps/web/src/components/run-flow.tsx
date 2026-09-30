@@ -549,16 +549,16 @@ export function RunFlow({
         />
       );
     } else if (id === "main") {
-      const working = (live || replaying) && !(awaiting && !replaying);
+      const working = model.main.active && !(awaiting && !replaying);
       card = (
         <NodeCard
           icon={<BotIcon />}
           title="Agent"
-          subtitle={model.main.current ?? (live || replaying ? "Thinking…" : "Finished")}
+          subtitle={model.main.current ?? (model.main.active ? "Thinking…" : "Idle")}
           accent="var(--primary)"
           live={working}
           ping={ping}
-          label={`Agent: ${model.main.current ?? "idle"}`}
+          label={`Agent: ${model.main.current ?? (model.main.active ? "thinking" : "idle")}`}
         />
       );
     } else if (id === "workspace") {

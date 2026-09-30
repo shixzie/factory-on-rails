@@ -1,4 +1,4 @@
-import { GitHubAppApi, GitHubError, Store, type CiCheck, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type CiCheck, type PullRequestState, type RunEvent, type RunEventRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
 import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
@@ -35,7 +35,12 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
  */
 export const fakeGitHub = (
   calls: unknown[][] = [],
-  { grantedPermissions, prOpen = false, ciChecks }: { grantedPermissions?: string[]; prOpen?: boolean; ciChecks?: (sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError> } = {},
+  { grantedPermissions, prOpen = false, ciChecks, pullRequest }: {
+    grantedPermissions?: string[];
+    prOpen?: boolean;
+    ciChecks?: (sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError>;
+    pullRequest?: (number: number) => Effect.Effect<PullRequestState, GitHubError>;
+  } = {},
 ) =>
   Layer.succeed(GitHubAppApi, {
     installationToken: (...args) =>
@@ -63,6 +68,12 @@ export const fakeGitHub = (
     ciChecks: (_token, _repo, sha) => Effect.suspend(() => {
       calls.push(["ciChecks", sha]);
       return ciChecks ? ciChecks(sha) : Effect.succeed([{ name: "CI", state: "passed" as const, url: null }]);
+    }),
+    pullRequest: (_token, _repo, number) => Effect.suspend(() => {
+      calls.push(["pullRequest", number]);
+      return pullRequest ? pullRequest(number) : Effect.succeed({
+        number, html_url: `https://github.com/shixzie/demo/pull/${number}`, state: "open" as const, merged: false, head: { sha: "a".repeat(40) },
+      });
     }),
     updatePullRequest: (token, repo, number, pr) =>
       Effect.suspend(() => {
