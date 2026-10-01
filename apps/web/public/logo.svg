@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
+  <title>Factory on Rails</title>
+  <rect width="64" height="64" rx="16" fill="#853bce" />
+  <path d="M22 14H50L47 23H28L26 29H41L38 38H23L19 50H10L22 14Z" fill="#fff" />
+  <path d="M47 29H56L49 50H40L47 29Z" fill="#e9d5ff" />
+</svg>

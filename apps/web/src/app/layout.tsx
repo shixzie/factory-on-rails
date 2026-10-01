@@ -8,6 +8,10 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: { default: "Factory on Rails", template: "%s · Factory on Rails" },
   description: "Queue coding tasks against your GitHub repos. Each runs in its own Railway sandbox and comes back as a pull request.",
+  icons: {
+    icon: { url: "/logo.svg", type: "image/svg+xml", sizes: "any" },
+    apple: { url: "/apple-icon.png", type: "image/png", sizes: "180x180" },
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
