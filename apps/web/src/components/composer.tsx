@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Api, api, runInBrowser } from "@/lib/api";
+import { initialComposerRepo } from "@/lib/composer-repo";
 import { cn } from "@/lib/utils";
 
 const modelOptions: Record<Api.AgentId, { value: string; label: string }[]> = {
@@ -45,6 +46,7 @@ export function Composer({
   me,
   repos,
   reposError,
+  requestedRepo,
   defaultRepo,
   defaultBaseBranch,
   defaultAgent,
@@ -57,6 +59,8 @@ export function Composer({
   repos: ReadonlyArray<Api.ApiRepo>;
   /** Why the repository list could not be loaded, if it couldn't. */
   reposError?: string | null;
+  /** An explicit project selection; inaccessible repositories require the user to choose again. */
+  requestedRepo?: string;
   defaultRepo?: string;
   defaultBaseBranch?: string;
   /** The agent to start on (the one used last); otherwise the first one the user can run. */
@@ -67,7 +71,7 @@ export function Composer({
   autoFocus?: boolean;
 }) {
   const router = useRouter();
-  const initial = repos.find((r) => r.fullName === defaultRepo) ?? repos[0];
+  const initial = initialComposerRepo(repos, { requestedRepo, defaultRepo });
   const [repo, setRepo] = useState(initial ? repoKey(initial) : "");
   const [baseBranch, setBaseBranch] = useState(defaultBaseBranch ?? "");
   const [agent, setAgent] = useState<Api.AgentId>(
@@ -139,6 +143,11 @@ export function Composer({
             Install it
           </a>{" "}
           on the repos the factory should work on, then reload.
+        </Notice>
+      ) : requestedRepo !== undefined && !selected ? (
+        <Notice icon={<PlugIcon />}>
+          The requested repository{requestedRepo ? ` “${requestedRepo}”` : ""} isn&apos;t available. Choose a repository below or{" "}
+          <a href={me.installUrl} className="font-medium text-foreground underline underline-offset-4">manage GitHub App access</a>.
         </Notice>
       ) : null}
 
@@ -225,7 +234,12 @@ export function Composer({
               {efforts.map((item) => <SelectItem key={item.value} value={item.value} className="text-xs">{item.label}</SelectItem>)}
             </SelectContent>
           </Select>
-          <Select items={items} value={repo} onValueChange={(v) => setRepo(String(v ?? ""))} disabled={blocked || pending}>
+          <Select items={items} value={repo} onValueChange={(v) => {
+            const nextRepo = String(v ?? "");
+            if (nextRepo === repo) return;
+            setRepo(nextRepo);
+            setBaseBranch("");
+          }} disabled={blocked || pending}>
             <SelectTrigger
               size="sm"
               aria-label="Repository"

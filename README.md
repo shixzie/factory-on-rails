@@ -10,6 +10,12 @@ TypeScript with [Effect](https://effect.website).
 While a run works you can follow it live, answer the agent's questions, and
 watch its subagents and the flow of work between them on the Flow map.
 
+The sidebar keeps active threads at the top, with unanswered questions first
+and each thread's pull request status visible. Once every linked PR has merged
+and no work or question remains, the thread moves into its repository's
+collapsed **Settled** list. Sending a follow-up brings it back to **Active**.
+Hover or focus a repository to use **+** and start a new thread in that repo.
+
 Our own instance runs at [factory.shixzie.com](https://factory.shixzie.com), and
 its Railway infrastructure is public: you can look around the project behind it
 at

@@ -8,13 +8,31 @@ import { getMe, getRepos, getRuns } from "@/lib/server";
 
 export const metadata: Metadata = { title: "New run" };
 
-async function NewRunComposer() {
-  const [me, { repos, error }, runs] = await Promise.all([getMe(), getRepos(), getRuns()]);
-  // Runs come newest first, so start on the repository and agent used last.
-  return <Composer me={me} repos={repos} reposError={error} defaultRepo={runs[0]?.repo} defaultAgent={runs[0]?.agent} defaultModel={runs[0]?.model} defaultReasoningEffort={runs[0]?.reasoningEffort} autoFocus />;
+type Props = { searchParams: Promise<{ repo?: string | string[]; draft?: string | string[] }> };
+
+async function NewRunComposer({ searchParams }: Props) {
+  const [me, { repos, error }, runs, params] = await Promise.all([getMe(), getRepos(), getRuns(), searchParams]);
+  const requestedRepo = Array.isArray(params.repo) ? params.repo[0] : params.repo;
+  const draft = Array.isArray(params.draft) ? params.draft[0] : params.draft;
+  const recent = runs.toSorted((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+  // A project link starts a fresh draft, while agent preferences still use the most recent run.
+  return (
+    <Composer
+      key={JSON.stringify([requestedRepo, draft])}
+      me={me}
+      repos={repos}
+      reposError={error}
+      requestedRepo={requestedRepo}
+      defaultRepo={recent?.repo}
+      defaultAgent={recent?.agent}
+      defaultModel={recent?.model}
+      defaultReasoningEffort={recent?.reasoningEffort}
+      autoFocus
+    />
+  );
 }
 
-export default function NewRunPage() {
+export default function NewRunPage({ searchParams }: Props) {
   return (
     <>
       <PageHeader>
@@ -29,7 +47,7 @@ export default function NewRunPage() {
           </p>
         </div>
         <Suspense fallback={<ComposerSkeleton />}>
-          <NewRunComposer />
+          <NewRunComposer searchParams={searchParams} />
         </Suspense>
       </div>
     </>

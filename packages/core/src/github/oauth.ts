@@ -2,7 +2,7 @@ import { HttpClient, HttpClientRequest } from "@effect/platform";
 import { Context, Effect, Either, Layer, Option, Redacted, Schema } from "effect";
 import { InstanceSettings, type CreatedGitHubApp } from "../instance.js";
 import { executeJson, GitHubError, githubRequest } from "./http.js";
-import { GitHubInstallation, GitHubRepo, GitHubUser, ManifestConversion, OAuthTokenResponse } from "./schemas.js";
+import { GitHubInstallation, GitHubRepo, GitHubUser, ManifestConversion, OAuthTokenResponse, PullRequestState } from "./schemas.js";
 
 export interface UserTokens {
   readonly accessToken: string;
@@ -56,6 +56,8 @@ export class GitHubUserApi extends Context.Tag("@factory/GitHubUserApi")<
     readonly installations: (token: string) => Effect.Effect<ReadonlyArray<GitHubInstallation>, GitHubError>;
     /** Repos the user can see *and* the app is installed on, for one installation. */
     readonly installationRepos: (token: string, installationId: number) => Effect.Effect<ReadonlyArray<GitHubRepo>, GitHubError>;
+    /** Reads linked PRs using the viewer's access, including PRs from other repositories. */
+    readonly pullRequest: (token: string, repo: string, number: number) => Effect.Effect<PullRequestState, GitHubError>;
     /** Needs the app's "Repository creation" (or "Administration") write permission. */
     readonly createRepo: (
       token: string,
@@ -108,6 +110,8 @@ export class GitHubUserApi extends Context.Tag("@factory/GitHubUserApi")<
             executeJson(client, Schema.Struct({ repositories: Schema.Array(GitHubRepo) })),
             Effect.map((r) => r.repositories),
           ),
+        pullRequest: (token, repo, number) =>
+          authed("GET", `/repos/${repo}/pulls/${number}`, token).pipe(executeJson(client, PullRequestState)),
         createRepo: (token, input) =>
           authed("POST", "/user/repos", token).pipe(
             HttpClientRequest.bodyUnsafeJson({ ...input, auto_init: true }),

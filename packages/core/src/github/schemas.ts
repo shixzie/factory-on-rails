@@ -32,6 +32,7 @@ export const PullRequestState = Schema.Struct({
   ...PullRequest.fields,
   state: Schema.Literal("open", "closed"),
   merged: Schema.Boolean,
+  draft: Schema.optional(Schema.Boolean),
   head: Schema.Struct({ sha: Schema.String }),
 });
 export type PullRequestState = typeof PullRequestState.Type;

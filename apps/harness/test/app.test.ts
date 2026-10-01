@@ -18,6 +18,7 @@ import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { app, originCheck } from "../src/app.js";
 import { HarnessConfig } from "../src/config.js";
 import { RailwayApi, RailwayError } from "../src/railway.js";
+import { PullRequestStatuses } from "../src/pull-requests.js";
 import { TitleError, TitleModel, type TitleProvider } from "../src/titles.js";
 
 const ORIGIN = "https://factory.example";
@@ -29,7 +30,11 @@ const PREVIEW_KEY = "p".repeat(40);
  * `envApp` stands for a GitHub App configured with environment variables; with
  * it off, the App is whatever the setup page stored (read through InstanceSettings).
  */
-const github = { login: "shixzie", repos: [] as GitHubRepo[], envApp: true, manifestOwner: "shixzie" };
+const github = {
+  login: "shixzie", repos: [] as GitHubRepo[], envApp: true, manifestOwner: "shixzie",
+  prs: new Map<string, { state: "open" | "closed"; merged: boolean; draft?: boolean }>(),
+  prCalls: [] as Array<{ token: string; repo: string; number: number }>,
+};
 const GitHubTest = Layer.effect(
   GitHubUserApi,
   Effect.map(InstanceSettings, (settings) => ({
@@ -46,6 +51,13 @@ const GitHubTest = Layer.effect(
     viewer: () => Effect.succeed({ id: 99, login: github.login, name: null, avatar_url: "" }),
     installations: () => Effect.succeed([{ id: 1, account: { login: "shixzie" } }]),
     installationRepos: () => Effect.succeed(github.repos),
+    pullRequest: (token: string, repo: string, number: number) => Effect.suspend(() => {
+      github.prCalls.push({ token, repo, number });
+      const pr = github.prs.get(`${repo}/${number}`);
+      return pr
+        ? Effect.succeed({ ...pr, number, html_url: `https://github.com/${repo}/pull/${number}`, head: { sha: "abc" } })
+        : Effect.fail(new GitHubError({ status: 404, message: "Not found" }));
+    }),
     createRepo: () => Effect.fail(new GitHubError({ status: 422, message: "name already exists" })),
     convertManifest: (code: string) =>
       code === "manifest-code"
@@ -87,7 +99,7 @@ const TitleTest = Layer.succeed(TitleModel, {
     }),
 });
 
-const TestLayer = Layer.mergeAll(
+const TestLayer = PullRequestStatuses.Live.pipe(Layer.provideMerge(Layer.mergeAll(
   GitHubTest,
   RailwayTest,
   TitleTest,
@@ -102,7 +114,7 @@ const TestLayer = Layer.mergeAll(
       { name: "node-base", logins: ["*"] },
     ],
   }),
-).pipe(
+)),
   Layer.provideMerge(InstanceSettings.Live),
   Layer.provideMerge(Layer.mergeAll(Store.Live, Layer.succeed(TokenCipher, TokenCipher.fromKey(key)))),
   Layer.provideMerge(TestDbLive),
@@ -504,6 +516,38 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect(await json(await post(path, owner.cookie, { url: second }))).toMatchObject({ pullRequestUrls: [first, second] });
       const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
       expect(detail.run.pullRequestUrls).toEqual([first, second]);
+    });
+
+    it("returns cached PR states consistently in the sidebar, conversation, and event updates", async () => {
+      const owner = await signIn("pr-states-owner", 125);
+      const created = await run(Effect.gen(function* () {
+        const store = yield* Store;
+        const created = yield* store.enqueueRun({
+          user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "PR states",
+        });
+        for (const number of [201, 202, 203, 204, 205]) {
+          yield* store.linkPullRequest(created.id, `https://github.com/o/linked/pull/${number}`);
+        }
+        return created;
+      }));
+      github.prs.set("o/linked/201", { state: "open", merged: false });
+      github.prs.set("o/linked/202", { state: "open", merged: false, draft: true });
+      github.prs.set("o/linked/203", { state: "closed", merged: false });
+      github.prs.set("o/linked/204", { state: "closed", merged: true });
+      const before = github.prCalls.length;
+      const expected = ["open", "draft", "closed", "merged", "unknown"].map((state, i) => ({
+        url: `https://github.com/o/linked/pull/${201 + i}`, state,
+      }));
+      const listed = await json(request("/api/runs", { headers: { cookie: owner.cookie } }));
+      expect(listed[0].pullRequests).toEqual(expected);
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run.pullRequests).toEqual(expected);
+      const events = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(events.run.pullRequests).toEqual(expected);
+      expect((await json(post(`/api/runs/${created.id}/cancel`, owner.cookie))).pullRequests).toEqual(expected);
+      expect(github.prCalls.slice(before)).toEqual([201, 202, 203, 204, 205].map((number) => ({
+        token: "ghu_t", repo: "o/linked", number,
+      })));
     });
 
     it("lets the owner rename a run, and keeps that name", async () => {

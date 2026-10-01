@@ -28,6 +28,7 @@ import { Effect, Option, Redacted, Schema } from "effect";
 import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from "./auth.js";
 import { HarnessConfig } from "./config.js";
 import { fail } from "./errors.js";
+import { PullRequestStatuses } from "./pull-requests.js";
 import { appInstallUrl, setupRoutes } from "./setup.js";
 import { generateRunTitle } from "./titles.js";
 
@@ -62,6 +63,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
   pullRequestUrls: r.pull_request_urls,
+  pullRequests: [],
   error: r.error,
   createdAt: r.created_at,
   startedAt: r.started_at,
@@ -70,6 +72,11 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   sandboxState: r.sandbox_state,
   lastActivityAt: r.last_activity_at,
   previewPorts: r.preview_ports ?? null,
+});
+
+const runWithPullRequests = (run: RunRow) => Effect.gen(function* () {
+  const pullRequests = yield* (yield* PullRequestStatuses).forRun(run);
+  return { ...toApiRun(run), pullRequests };
 });
 
 const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({
@@ -331,7 +338,7 @@ const routes = HttpRouter.empty.pipe(
     Effect.gen(function* () {
       const user = yield* requireUser;
       const runs = yield* (yield* Store).listRuns(user.id, 100);
-      return yield* json(Schema.Array(Api.ApiRun))(runs.map(toApiRun));
+      return yield* json(Schema.Array(Api.ApiRun))(yield* Effect.forEach(runs, runWithPullRequests, { concurrency: "unbounded" }));
     }),
   ),
 
@@ -382,7 +389,7 @@ const routes = HttpRouter.empty.pipe(
       const diff = yield* (yield* Store).getDiff(run.id);
       const { preview } = yield* HarnessConfig;
       return yield* json(Api.RunDetail)({
-        run: toApiRun(run),
+        run: yield* runWithPullRequests(run),
         ...page,
         diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
         previewsEnabled: Option.isSome(preview),
@@ -402,7 +409,7 @@ const routes = HttpRouter.empty.pipe(
       yield* store.linkPullRequest(run.id, url);
       const updated = yield* store.getRun(run.id);
       if (Option.isNone(updated)) return yield* fail(404, "not_found", "Run not found.");
-      return yield* json(Api.ApiRun)(toApiRun(updated.value));
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated.value));
     }),
   ),
 
@@ -416,7 +423,7 @@ const routes = HttpRouter.empty.pipe(
         return yield* fail(400, "bad_request", `Keep the name to ${Api.RUN_TITLE_MAX_CHARS} characters or fewer.`);
       }
       const renamed = yield* (yield* Store).renameRun(run.id, user.id, title);
-      return yield* json(Api.ApiRun)(toApiRun(Option.getOrElse(renamed, () => run)));
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(Option.getOrElse(renamed, () => run)));
     }),
   ),
 
@@ -452,7 +459,7 @@ const routes = HttpRouter.empty.pipe(
         yield* store.continueRun(run.id, text);
       }
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
-      return yield* json(Api.ApiRun)(toApiRun(updated), 201);
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated), 201);
     }),
   ),
 
@@ -463,7 +470,7 @@ const routes = HttpRouter.empty.pipe(
       const store = yield* Store;
       yield* store.requestCancel(run.id, user.id);
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
-      return yield* json(Api.ApiRun)(toApiRun(updated));
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated));
     }),
   ),
 
@@ -479,7 +486,7 @@ const routes = HttpRouter.empty.pipe(
       );
       const page = yield* eventsPage(run.id, after);
       const diffUpdatedAt = yield* (yield* Store).diffUpdatedAt(run.id);
-      return yield* json(Api.RunEventsPage)({ run: toApiRun(run), ...page, diffUpdatedAt: Option.getOrNull(diffUpdatedAt) });
+      return yield* json(Api.RunEventsPage)({ run: yield* runWithPullRequests(run), ...page, diffUpdatedAt: Option.getOrNull(diffUpdatedAt) });
     }),
   ),
 );
