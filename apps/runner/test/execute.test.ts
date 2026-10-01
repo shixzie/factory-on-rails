@@ -1,4 +1,5 @@
-import { GitHubError, PREVIEW_AGENT_SCRIPT, type CiCheck, type PullRequestState, verifyPreviewGrant, type RunExecution, type RunRow } from "@factory/core";
+import { GitHubError, PREVIEW_AGENT_SCRIPT, readCiChecks, type CiCheck, type PullRequestState, verifyPreviewGrant, type RunExecution, type RunRow } from "@factory/core";
+import { HttpClient, HttpClientResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
 import { Duration, Effect, Fiber, Layer, TestClock, Option, Redacted } from "effect";
 import { ExecInterruptedError } from "railway";
@@ -324,6 +325,40 @@ describe("executeRun", () => {
       const { outcome, github } = yield* Fiber.join(fiber);
       expect(outcome.status).toBe("succeeded");
       expect(github.filter((c) => c[0] === "ciChecks")).toEqual([["ciChecks", "a".repeat(40)], ["ciChecks", "a".repeat(40)]]);
+    }),
+  );
+
+  it.effect("finishes when real CI passes even if unused app suites stay queued", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const client = HttpClient.make((req) => Effect.sync(() => {
+        const path = new URL(req.url).pathname;
+        let body: unknown;
+        if (path.endsWith("check-runs")) {
+          polls++;
+          body = { check_runs: [{ name: "Tests", status: polls === 1 ? "in_progress" : "completed", conclusion: polls === 1 ? null : "success", html_url: null }] };
+        } else if (path.endsWith("check-suites")) {
+          body = { check_suites: [{ id: 7, status: "queued", conclusion: null, latest_check_runs_count: 0 }] };
+        } else if (path.endsWith("actions/runs")) {
+          body = { workflow_runs: [] };
+        } else {
+          body = { statuses: [] };
+        }
+        return HttpClientResponse.fromWeb(req, Response.json(body));
+      }));
+      const sandboxes = fakeSandboxes();
+      const fiber = yield* Effect.fork(execute(sandboxes, recordingStore(), {}, {
+        ciChecks: (sha) => readCiChecks(client, Redacted.make("token"), run.repo_full_name, sha),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(polls).toBe(1);
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("46 seconds");
+      const { outcome, events } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(polls).toBe(2);
+      expect(events).toContain(`info:CI passed for ${"a".repeat(40)}`);
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(1);
     }),
   );
 

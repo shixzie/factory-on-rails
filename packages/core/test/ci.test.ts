@@ -60,4 +60,56 @@ describe("GitHub CI", () => {
       expect(result).toMatchObject({ _tag: "Left", left: { status: 403 } });
     }),
   );
+
+  it.effect("ignores automatically queued empty suites when real checks have passed", () =>
+    Effect.gen(function* () {
+      const client = clientFor((url) => {
+        if (url.pathname.endsWith("check-runs")) return Response.json({ check_runs: [check] });
+        if (url.pathname.endsWith("check-suites")) return Response.json({ check_suites: [
+          ...[1, 2, 3, 4].map((id) => ({ id, status: "queued", conclusion: null, latest_check_runs_count: 0 })),
+          { id: 5, status: "completed", conclusion: "success", latest_check_runs_count: 1 },
+        ] });
+        if (url.pathname.endsWith("actions/runs")) return Response.json({ workflow_runs: [
+          { id: 1, name: "CI", status: "completed", conclusion: "success", html_url: check.html_url },
+        ] });
+        return Response.json({ statuses: [] });
+      });
+      const checks = yield* readCiChecks(client, Redacted.make("token"), "o/r", sha);
+      expect(checks).toEqual([
+        { name: "Tests", state: "passed", url: check.html_url },
+        { name: "CI", state: "passed", url: check.html_url },
+      ]);
+    }),
+  );
+
+  it.effect("preserves active suites, failures and queued workflows before jobs exist", () =>
+    Effect.gen(function* () {
+      const client = clientFor((url) => {
+        if (url.pathname.endsWith("check-runs")) return Response.json({ check_runs: [] });
+        if (url.pathname.endsWith("check-suites")) return Response.json({ check_suites: [
+          { id: 1, status: "queued", conclusion: null, latest_check_runs_count: 0 },
+          { id: 2, status: "queued", conclusion: null, latest_check_runs_count: 1 },
+          { id: 3, status: "in_progress", conclusion: null, latest_check_runs_count: 0 },
+          { id: 4, status: "completed", conclusion: "startup_failure", latest_check_runs_count: 0 },
+          { id: 5, status: "queued", conclusion: null },
+          { id: 6, status: "waiting", conclusion: null, latest_check_runs_count: 0 },
+          { id: 7, status: "requested", conclusion: null, latest_check_runs_count: 0 },
+        ] });
+        if (url.pathname.endsWith("actions/runs")) return Response.json({ workflow_runs: [
+          { id: 1, name: "CI", status: "queued", conclusion: null, html_url: check.html_url },
+        ] });
+        return Response.json({ statuses: [] });
+      });
+      const checks = yield* readCiChecks(client, Redacted.make("token"), "o/r", sha);
+      expect(checks).toEqual([
+        { name: "Check suite 2", state: "pending", url: null },
+        { name: "Check suite 3", state: "pending", url: null },
+        { name: "Check suite 4", state: "failed", url: null },
+        { name: "Check suite 5", state: "pending", url: null },
+        { name: "Check suite 6", state: "pending", url: null },
+        { name: "Check suite 7", state: "pending", url: null },
+        { name: "CI", state: "pending", url: check.html_url },
+      ]);
+    }),
+  );
 });
