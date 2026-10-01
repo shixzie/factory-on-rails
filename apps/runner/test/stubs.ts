@@ -1,4 +1,4 @@
-import { GitHubAppApi, GitHubError, Store, type CiCheck, type PullRequestState, type RunEvent, type RunEventRow, type RunRow, type RunStatus, type StoreService } from "@factory/core";
+import { GitHubAppApi, GitHubError, Store, type CiCheck, type ImageRow, type PullRequestState, type RunEvent, type RunEventRow, type RunRow, type RunStatus, type StoreService } from "@factory/core";
 import { Effect, Layer, Option, Redacted } from "effect";
 import { SandboxError, Sandboxes, type ExecOptions, type ExecResult, type SandboxHandle } from "../src/sandbox.js";
 
@@ -19,15 +19,17 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
   const diffs: { patch: string; truncated: boolean }[] = [];
   /** Messages the user "sent"; the runner reads them with listUserMessages. */
   const userMessages: RunEventRow[] = [];
+  const images: ImageRow[] = [];
   const layer = stubStore({
     appendEvents: (_runId, batch) => Effect.sync(() => void events.push(...batch)),
     updateRun: (_runId, patch) => Effect.sync(() => void updates.push(structuredClone(patch))),
     heartbeat: () => Effect.sync(() => Option.some(status())),
     getRun: (id) => Effect.sync(() => Option.some(Object.assign({ id, status: status() }, ...updates) as RunRow)),
     listUserMessages: (_runId, afterId) => Effect.sync(() => userMessages.filter((m) => Number(m.id) > afterId)),
+    listRunImages: () => Effect.sync(() => images),
     saveDiff: (_runId, patch, truncated) => Effect.sync(() => void diffs.push({ patch, truncated })),
   });
-  return { events, updates, diffs, userMessages, layer };
+  return { events, updates, diffs, userMessages, images, layer };
 };
 
 /**
@@ -96,6 +98,7 @@ export interface FakeSandbox {
   /** The env each command ran with, in the same order as `commands`. */
   envs: (Record<string, string> | undefined)[];
   files: Record<string, string>;
+  binaryFiles: Record<string, Uint8Array>;
   modes: Record<string, number | undefined>;
   createdWith?: Record<string, string>;
   /** The snapshot a new sandbox was created from, if any. */
@@ -127,6 +130,7 @@ export const fakeSandboxes = (
     failCreate,
     failRestore,
     failCheckpoint,
+    failWrite,
     alive = [],
     checkpoints = {},
   }: {
@@ -134,6 +138,7 @@ export const fakeSandboxes = (
     failCreate?: string;
     failRestore?: string;
     failCheckpoint?: string;
+    failWrite?: string;
     alive?: string[];
     checkpoints?: Record<string, string>;
   } = {},
@@ -142,6 +147,7 @@ export const fakeSandboxes = (
     commands: [],
     envs: [],
     files: {},
+    binaryFiles: {},
     modes: {},
     alive: new Set(alive),
     checkpoints: new Map(Object.entries(checkpoints)),
@@ -189,8 +195,10 @@ export const fakeSandboxes = (
       );
     },
     writeFile: (path, content, mode) =>
+      failWrite && path.includes(failWrite) ? Effect.fail(new SandboxError({ message: "Could not upload image" })) :
       Effect.sync(() => {
-        state.files[path] = content;
+        if (typeof content === "string") state.files[path] = content;
+        else state.binaryFiles[path] = content;
         state.modes[path] = mode;
       }),
   });

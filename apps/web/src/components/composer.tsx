@@ -6,6 +6,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 import { toast } from "sonner";
+import { ImageDrafts, ImagePicker } from "@/components/composer-images";
+import { useComposerImages } from "@/hooks/use-composer-images";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -89,8 +91,9 @@ export function Composer({
   const selected = repos.find((r) => repoKey(r) === repo);
   const agentReady = me.agents.find((a) => a.id === agent)?.ready ?? false;
   const blocked = !me.hasApiKey || repos.length === 0;
+  const images = useComposerImages(blocked || pending);
   const modelValid = !customModel || Schema.is(Api.ModelId)(model.trim());
-  const canSend = !blocked && agentReady && !!selected && task.trim().length > 0 && !pending && modelValid;
+  const canSend = !blocked && agentReady && !!selected && (task.trim().length > 0 || images.images.length > 0) && !pending && !images.reading && modelValid;
 
   const submit = () => {
     if (!canSend || !selected) return;
@@ -100,6 +103,7 @@ export function Composer({
           installationId: selected.installationId,
           repo: selected.fullName,
           task,
+          images: images.uploads,
           baseBranch: baseBranch.trim() || undefined,
           agent,
           model: model.trim() || null,
@@ -112,6 +116,7 @@ export function Composer({
         return;
       }
       setTask("");
+      images.clear();
       router.push(`/runs/${result.right.id}`);
       router.refresh();
     });
@@ -152,6 +157,7 @@ export function Composer({
       ) : null}
 
       <form
+        {...images.dragHandlers}
         onSubmit={(e) => {
           e.preventDefault();
           submit();
@@ -159,9 +165,12 @@ export function Composer({
         className={cn(
           "rounded-lg border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
           blocked && "opacity-60",
+          images.dragging && "border-primary bg-accent/40 ring-2 ring-primary/20",
         )}
       >
+        <ImageDrafts images={images} disabled={pending || blocked} />
         <textarea
+          onPaste={images.onPaste}
           value={task}
           onChange={(e) => setTask(e.target.value)}
           onKeyDown={(e) => {
@@ -178,6 +187,7 @@ export function Composer({
           className="field-sizing-content block max-h-80 min-h-20 w-full resize-none bg-transparent px-4 pt-3.5 pb-2 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
         />
         <div className="flex flex-wrap items-center gap-1.5 px-2.5 pb-2.5">
+          <ImagePicker images={images} disabled={pending || blocked} />
           <Select items={agentItems} value={agent} onValueChange={(v) => {
             if (!v || v === agent) return;
             setAgent(v as Api.AgentId);
@@ -284,9 +294,6 @@ export function Composer({
           </div>
         </div>
       </form>
-      <p className="mt-2 px-3 text-xs text-muted-foreground">
-        Defaults use the agent’s settings. Model and effort availability depend on your account and model. Higher effort can take longer and use more tokens.
-      </p>
     </div>
   );
 }

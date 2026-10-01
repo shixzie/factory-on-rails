@@ -1,4 +1,5 @@
-import type { ReasoningEffort } from "./api.js";
+import type { ImageAttachment, ImageMediaType, ImageUpload, ReasoningEffort } from "./api.js";
+import { randomUUID } from "node:crypto";
 import { SqlClient, SqlError } from "@effect/sql";
 import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 
@@ -53,6 +54,7 @@ export interface RunRow {
   installation_id: string;
   base_branch: string;
   task: string;
+  images?: ReadonlyArray<ImageAttachment>;
   /** A short name for the run: written by a small model from the task, or by the user. Null until one exists. */
   title: string | null;
   /** The user named the run, so a generated title never replaces it. */
@@ -132,6 +134,15 @@ export interface RunEventRow {
   data: Record<string, unknown> | null;
 }
 
+export interface ImageRow {
+  id: string;
+  run_id: string;
+  name: string;
+  media_type: ImageMediaType;
+  /** Canonical base64, loaded only for image downloads or delivery to the agent. */
+  data: string;
+}
+
 export type RunEvent = Pick<RunEventRow, "kind" | "message"> & { data?: Record<string, unknown> | null };
 
 export interface RunDiffRow {
@@ -179,6 +190,7 @@ export interface StoreService {
       agent?: string;
       model?: string | null;
       reasoning_effort?: ReasoningEffort | null;
+      images?: ReadonlyArray<ImageUpload>;
     },
   ) => Q<RunRow>;
   readonly listRuns: (userId: string, limit?: number) => Q<ReadonlyArray<RunRow>>;
@@ -212,12 +224,14 @@ export interface StoreService {
   /** Releases runs whose runner stopped heartbeating (crash, redeploy) so another runner can reconnect. */
   readonly reapStaleRuns: (staleAfterSeconds: number) => Q<ReadonlyArray<Pick<RunRow, "id" | "sandbox_id">>>;
   /** A user message to a queued or running run: stored for the runner to hand to the agent. */
-  readonly addUserMessage: (runId: string, text: string) => Q<void>;
+  readonly addUserMessage: (runId: string, text: string, images?: ReadonlyArray<ImageUpload>) => Q<void>;
   /**
    * A user message to a finished run: stored, and the run is queued again so
    * the agent picks the conversation up. None if the run is not finished.
    */
-  readonly continueRun: (runId: string, text: string) => Q<Option.Option<RunRow>>;
+  readonly continueRun: (runId: string, text: string, images?: ReadonlyArray<ImageUpload>) => Q<Option.Option<RunRow>>;
+  readonly listRunImages: (runId: string) => Q<ReadonlyArray<ImageRow>>;
+  readonly getRunImage: (runId: string, imageId: string) => Q<Option.Option<ImageRow>>;
   /**
    * Claims runs whose sandbox has been idle (no turn in progress, no activity)
    * for `idleSeconds`, marking them `stopping`. Also takes back `stopping`
@@ -266,6 +280,18 @@ const make = Effect.gen(function* () {
   /** Wakes the runners (see worker.ts); polling is their fallback. */
   const notifyQueued = (runId: string) => sql`select pg_notify('runs_queued', ${runId})`.pipe(Effect.asVoid);
 
+  const saveImages = (runId: string, images: ReadonlyArray<ImageUpload>) => Effect.gen(function* () {
+    if (images.length === 0) return [];
+    const rows = images.map((image) => ({ id: randomUUID(), run_id: runId, name: image.name, media_type: image.mediaType, data: image.data }));
+    yield* sql`insert into run_images ${sql.insert(rows)}`;
+    return rows.map(({ id, name, media_type }): ImageAttachment => ({ id, name, mediaType: media_type }));
+  });
+  const saveMessage = (runId: string, text: string, images: ReadonlyArray<ImageUpload>) => Effect.gen(function* () {
+    const attachments = yield* saveImages(runId, images);
+    yield* sql`insert into run_events (run_id, kind, message, data)
+      values (${runId}, 'user_message', ${text}, ${attachments.length ? JSON.stringify({ images: attachments }) : null})`;
+  });
+
   const service: StoreService = {
     upsertUser: (u) =>
       sql<UserRow>`
@@ -302,11 +328,16 @@ const make = Effect.gen(function* () {
     deleteSession: (tokenHash) => sql`delete from sessions where token_hash = ${tokenHash}`.pipe(Effect.asVoid),
 
     enqueueRun: (r) =>
-      Effect.gen(function* () {
-        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert({ ...r, agent: r.agent ?? "claude" })} returning *`;
+      sql.withTransaction(Effect.gen(function* () {
+        const { images = [], ...input } = r;
+        const [row] = yield* sql<RunRow>`insert into runs ${sql.insert({ ...input, agent: r.agent ?? "claude" })} returning *`;
+        const attachments = yield* saveImages(row!.id, images);
+        if (attachments.length) {
+          yield* sql`update runs set images = ${JSON.stringify(attachments)}::jsonb where id = ${row!.id}`;
+        }
         yield* notifyQueued(row!.id);
-        return row!;
-      }),
+        return { ...row!, images: attachments };
+      })),
 
     listRuns: (userId, limit = 50) =>
       sql<RunRow>`select * from runs where user_id = ${userId}
@@ -432,15 +463,15 @@ const make = Effect.gen(function* () {
         return rows;
       }),
 
-    addUserMessage: (runId, text) =>
+    addUserMessage: (runId, text, images = []) =>
       sql.withTransaction(
         Effect.zipRight(
-          sql`insert into run_events (run_id, kind, message) values (${runId}, 'user_message', ${text})`,
+          saveMessage(runId, text, images),
           sql`update runs set last_activity_at = now(), awaiting_input = false where id = ${runId}`,
         ),
       ).pipe(Effect.asVoid),
 
-    continueRun: (runId, text) =>
+    continueRun: (runId, text, images = []) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
@@ -450,11 +481,17 @@ const make = Effect.gen(function* () {
               where id = ${runId} and status in ${sql.in(TERMINAL_STATUSES)}
               returning *`;
             if (rows.length === 0) return Option.none<RunRow>();
-            yield* sql`insert into run_events (run_id, kind, message) values (${runId}, 'user_message', ${text})`;
+            yield* saveMessage(runId, text, images);
             return Option.some(rows[0]!);
           }),
         )
         .pipe(Effect.tap((row) => (Option.isSome(row) ? notifyQueued(runId) : Effect.void))),
+
+    listRunImages: (runId) =>
+      sql<ImageRow>`select id, run_id, name, media_type, data from run_images where run_id = ${runId} order by created_at, id`,
+
+    getRunImage: (runId, imageId) =>
+      sql<ImageRow>`select id, run_id, name, media_type, data from run_images where run_id = ${runId} and id = ${imageId}`.pipe(Effect.map(Arr.head)),
 
     claimIdleSandboxes: (idleSeconds, staleSeconds, limit) =>
       sql<RunSandbox>`
