@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import type { ResolvedMcpServer } from "@factory/core";
 import { agentToolEnv, agentToolFiles, deliverMessageScript, SYSTEM_PROMPT } from "../src/agent-tools.js";
 import { DEFAULT_AGENT_COMMAND, DEFAULT_AGENT_DESCRIBE_COMMAND, DEFAULT_CODEX_COMMAND, DEFAULT_CODEX_DESCRIBE_COMMAND } from "../src/config.js";
 
 /** Writes the agent tools into a temp dir, as the runner does in the sandbox. */
-function setup() {
+function setup(servers: ReadonlyArray<ResolvedMcpServer> = []) {
   const dir = mkdtempSync(join(tmpdir(), "factory-"));
-  for (const [path, content] of agentToolFiles(dir)) writeFileSync(path, content);
+  for (const [path, content] of agentToolFiles(dir, servers)) writeFileSync(path, content);
   mkdirSync(join(dir, "inbox"));
   const send = (name: string, text: string) => writeFileSync(join(dir, "inbox", `${name}.json`), JSON.stringify({ text }));
   return { dir, send, env: {
@@ -33,6 +34,32 @@ const hook = (dir: string, env: NodeJS.ProcessEnv, event: string) =>
   });
 
 describe("agent tools", () => {
+  it("passes saved HTTP and stdio MCP servers to both agents without evaluating their values", async () => {
+    const token = 'secret-"value"\\path\n$(touch /tmp/factory-mcp-injected)';
+    const servers: ReadonlyArray<ResolvedMcpServer> = [
+      { name: "docs-api", transport: "http", url: "https://mcp.example.com/tools", headers: { Authorization: `Bearer ${token}`, "X-Region": "us-east" } },
+      { name: "local_tools", transport: "stdio", command: "npx", args: ["-y", "example-mcp", "--path", "a path $(echo bad)"], env: { API_KEY: token } },
+      { name: "factory", transport: "http", url: "https://invalid.example.com", headers: {} },
+    ];
+    const { dir, env } = setup(servers);
+    const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
+    expect(mcp.mcpServers["docs-api"]).toEqual({ type: "http", url: servers[0]!.transport === "http" ? servers[0]!.url : "", headers: { Authorization: `Bearer ${token}`, "X-Region": "us-east" } });
+    expect(mcp.mcpServers.local_tools).toEqual({ type: "stdio", command: "npx", args: ["-y", "example-mcp", "--path", "a path $(echo bad)"], env: { API_KEY: token } });
+    expect(mcp.mcpServers.factory).toEqual({ type: "stdio", command: "node", args: [join(dir, "ask-server.mjs")] });
+
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "codex"), '#!/usr/bin/env node\nprocess.stdin.resume(); console.log(JSON.stringify(process.argv.slice(2)));\n', { mode: 0o755 });
+    const task = join(dir, "task.md");
+    writeFileSync(task, "Use saved MCP tools");
+    const { stdout } = await run("sh", ["-c", DEFAULT_CODEX_COMMAND], { env: { ...env, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task } });
+    const args = JSON.parse(stdout) as string[];
+    const overrides = args.filter((_, index) => args[index - 1] === "-c");
+    expect(overrides).toContain(`mcp_servers.docs-api={url="https://mcp.example.com/tools",http_headers={"Authorization"=${JSON.stringify(`Bearer ${token}`)},"X-Region"="us-east"}}`);
+    expect(overrides).toContain(`mcp_servers.local_tools={command="npx",args=["-y","example-mcp","--path","a path $(echo bad)"],env={"API_KEY"=${JSON.stringify(token)}}}`);
+    expect(overrides.join("\n")).not.toContain("https://invalid.example.com");
+  });
+
   it("gives Codex the MCP server, the hooks and the instructions as one -c override each", async () => {
     const { dir, env } = setup();
     // A stand-in `codex` that prints its arguments and the prompt it got on stdin.

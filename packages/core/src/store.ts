@@ -1,4 +1,5 @@
 import type { ReasoningEffort } from "./api.js";
+import type { McpOAuthState, McpServerInput, McpServerRow } from "./mcp.js";
 import { SqlClient, SqlError } from "@effect/sql";
 import { Array as Arr, Context, Effect, Layer, Option } from "effect";
 
@@ -245,6 +246,17 @@ export interface StoreService {
   readonly deleteApiKey: (userId: string, provider: string) => Q<void>;
   /** Encrypted keys for the runner to decrypt and inject into a run's sandbox. */
   readonly encryptedApiKeys: (userId: string) => Q<ReadonlyArray<{ provider: string; key_enc: string }>>;
+  // Account-wide MCP connections. Every operation checks ownership, including credential writes.
+  readonly listMcpServers: (userId: string) => Q<ReadonlyArray<McpServerRow>>;
+  readonly getMcpServer: (userId: string, serverId: string) => Q<Option.Option<McpServerRow>>;
+  readonly createMcpServer: (input: McpServerInput & { user_id: string }) => Q<McpServerRow>;
+  readonly updateMcpServer: (userId: string, serverId: string, input: McpServerInput, expectedRevision?: number) => Q<Option.Option<McpServerRow>>;
+  readonly deleteMcpServer: (userId: string, serverId: string) => Q<boolean>;
+  /** Compare-and-swap prevents an old OAuth refresh or callback from overwriting a newer credential. */
+  readonly saveMcpServerSecrets: (userId: string, serverId: string, expectedRevision: number, secretsEnc: string | null) => Q<Option.Option<McpServerRow>>;
+  readonly createMcpOAuthState: (state: McpOAuthState, ttlSeconds: number) => Q<void>;
+  /** Only the owning user's callback may consume a live attempt; consumption is atomic. */
+  readonly takeMcpOAuthState: (userId: string, stateHash: string) => Q<Option.Option<McpOAuthState>>;
   // instance settings (see instance.ts)
   readonly getSetting: (key: string) => Q<Option.Option<unknown>>;
   /** Saves a setting. With `onlyIfAbsent` an existing value is kept, and the result says whether this one was saved. */
@@ -536,6 +548,45 @@ const make = Effect.gen(function* () {
 
     encryptedApiKeys: (userId) =>
       sql<{ provider: string; key_enc: string }>`select provider, key_enc from user_api_keys where user_id = ${userId}`,
+
+    listMcpServers: (userId) =>
+      sql<McpServerRow>`select * from user_mcp_servers where user_id = ${userId} order by lower(name), id`,
+
+    getMcpServer: (userId, serverId) =>
+      sql<McpServerRow>`select * from user_mcp_servers where user_id = ${userId} and id = ${serverId}`.pipe(Effect.map(Arr.head)),
+
+    createMcpServer: (input) =>
+      sql<McpServerRow>`insert into user_mcp_servers ${sql.insert({ ...input, config: JSON.stringify(input.config) })}
+        returning *`.pipe(Effect.map((rows) => rows[0]!)),
+
+    updateMcpServer: (userId, serverId, input, expectedRevision) =>
+      sql<McpServerRow>`update user_mcp_servers
+        set ${sql.update({ ...input, config: JSON.stringify(input.config) })}, revision = revision + 1, updated_at = now()
+        where user_id = ${userId} and id = ${serverId}
+          ${expectedRevision === undefined ? sql`` : sql`and revision = ${expectedRevision}`}
+        returning *`.pipe(Effect.map(Arr.head)),
+
+    deleteMcpServer: (userId, serverId) =>
+      sql`delete from user_mcp_servers where user_id = ${userId} and id = ${serverId}
+        returning id`.pipe(Effect.map((rows) => rows.length > 0)),
+
+    saveMcpServerSecrets: (userId, serverId, expectedRevision, secretsEnc) =>
+      sql<McpServerRow>`update user_mcp_servers
+        set secrets_enc = ${secretsEnc}, revision = revision + 1, updated_at = now()
+        where user_id = ${userId} and id = ${serverId} and revision = ${expectedRevision}
+        returning *`.pipe(Effect.map(Arr.head)),
+
+    createMcpOAuthState: (state, ttlSeconds) => sql.withTransaction(Effect.gen(function* () {
+      yield* sql`delete from mcp_oauth_states where expires_at <= now()
+        or (user_id = ${state.user_id} and server_id = ${state.server_id})`;
+      yield* sql`insert into mcp_oauth_states (state_hash, user_id, server_id, revision, expires_at)
+        values (${state.state_hash}, ${state.user_id}, ${state.server_id}, ${state.revision}, now() + make_interval(secs => ${ttlSeconds}))`;
+    })),
+
+    takeMcpOAuthState: (userId, stateHash) =>
+      sql<McpOAuthState>`delete from mcp_oauth_states
+        where user_id = ${userId} and state_hash = ${stateHash} and expires_at > now()
+        returning state_hash, user_id, server_id, revision`.pipe(Effect.map(Arr.head)),
 
     getSetting: (key) =>
       sql<{ value: unknown }>`select value from instance_settings where key = ${key}`.pipe(

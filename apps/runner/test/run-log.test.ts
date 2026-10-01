@@ -16,9 +16,31 @@ describe("redact", () => {
   it("leaves messages without secrets alone", () => {
     expect(redact("all good", ["sk-ant-secret-value"])).toBe("all good");
   });
+
+  it("matches literal secrets once, including overlaps and short credentials", () => {
+    expect(redact("token.with[syntax] and token", ["token", "token.with[syntax]", "a"])).toBe("[redacted] [redacted]nd [redacted]");
+  });
 });
 
 describe("makeRunLog", () => {
+  it.effect("redacts arbitrary MCP credentials in text and nested structured events", () => Effect.gen(function* () {
+    const store = recordingStore();
+    const secret = 'key-"quoted"\\line\nsecond-line';
+    yield* Effect.gen(function* () {
+      const log = yield* makeRunLog("run-1");
+      log.addSecret(secret, { allowShort: true });
+      log.addSecret("pin7", { allowShort: true });
+      log.push("tool_result", `raw ${secret}; encoded ${JSON.stringify(secret)}; pin7`, {
+        _replayKey: "1:agent:0",
+        result: { token: secret, values: [secret, "pin7"], count: 2, ok: true, empty: null },
+      });
+    }).pipe(Effect.scoped, Effect.provide(store.layer));
+    expect(store.events).toEqual([{
+      kind: "tool_result", message: 'raw [redacted]; encoded "[redacted]"; [redacted]',
+      data: { _replayKey: "1:agent:0", result: { token: "[redacted]", values: ["[redacted]", "[redacted]"], count: 2, ok: true, empty: null } },
+    }]);
+  }));
+
   it.effect("retains failed writes for retry and reports durable flush errors", () => Effect.gen(function* () {
     const stored: RunEvent[] = [];
     const unavailable = new SqlError.SqlError({ message: "database restarting", cause: new Error("connection reset") });

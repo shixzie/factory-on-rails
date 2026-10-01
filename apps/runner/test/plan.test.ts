@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   CREDENTIAL_HELPER,
   describePrompt,
   followUpPrompt,
+  FACTORY_DIR,
   MAX_DESCRIPTION,
   parsePullRequest,
   pullRequestBody,
@@ -18,6 +19,7 @@ import {
   publishScript,
   shellQuote,
   summarizeTask,
+  SCRUB_SCRIPT,
   withHome,
 } from "../src/plan.js";
 
@@ -30,6 +32,17 @@ const fakeGitPath = (code: number) => {
 };
 
 describe("plan helpers", () => {
+  it("removes MCP credential files before checkpointing without deleting agent tools", () => {
+    const dir = mkdtempSync(join(tmpdir(), "scrub-"));
+    const factory = join(dir, ".factory");
+    mkdirSync(factory);
+    for (const name of ["mcp.json", "codex-config", "ask-server.mjs"]) writeFileSync(join(factory, name), "private");
+    execFileSync("sh", ["-c", SCRUB_SCRIPT.replaceAll(FACTORY_DIR, factory)], { env: { PATH: "/usr/bin:/bin" } });
+    expect(existsSync(join(factory, "mcp.json"))).toBe(false);
+    expect(existsSync(join(factory, "codex-config"))).toBe(false);
+    expect(existsSync(join(factory, "ask-server.mjs"))).toBe(true);
+  });
+
   it("shell-quotes hostile input", () => {
     const hostile = `it's $(rm -rf /) \`x\` "y"`;
     expect(execFileSync("sh", ["-c", `printf %s ${shellQuote(hostile)}`]).toString()).toBe(hostile);

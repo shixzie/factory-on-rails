@@ -24,6 +24,8 @@
     "@effect/platform-node": "0.108.2",
     "@effect/sql": "0.52.1",
     "@effect/sql-pg": "0.53.0",
-    "effect": "3.22.2"
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "effect": "3.22.2",
+    "undici": "^7.30.0"
   }
 }

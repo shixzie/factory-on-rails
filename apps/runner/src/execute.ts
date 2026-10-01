@@ -1,4 +1,4 @@
-import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type CiCheck, type RunExecution, type RunRow } from "@factory/core";
+import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type CiCheck, type ResolvedMcpServer, type RunExecution, type RunRow } from "@factory/core";
 import { Cause, Clock, Data, Duration, Effect, Exit, Option, Redacted, Schedule } from "effect";
 import { RailwayConnectionError, RailwayGraphQLError } from "railway";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
@@ -67,6 +67,11 @@ export interface ExecuteOptions {
    * run it, and the env (the user's own keys) every sandbox gets.
    */
   readonly agent: AgentCommands & { readonly id?: AgentId; readonly timeoutSec: number; readonly env: Record<string, string> };
+  /** Reload and refresh the owner's enabled MCP connections before each agent launch. */
+  readonly loadMcpServers?: Effect.Effect<{
+    readonly servers: ReadonlyArray<ResolvedMcpServer>;
+    readonly warnings: ReadonlyArray<string>;
+  }, { readonly message: string }>;
   /** The prepared checkpoint a new sandbox boots from (the user's sandbox snapshot), if any. */
   readonly snapshot?: string;
   readonly git: { readonly authorName: string; readonly authorEmail: string };
@@ -174,7 +179,7 @@ export const openPullRequest = (
  */
 const work = (
   run: RunRow,
-  { log, agent, snapshot, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds", ciPollEvery = "15 seconds", ciDiscoveryGrace = "60 seconds" }: ExecuteOptions,
+  { log, agent, loadMcpServers, snapshot, git, harnessUrl, preview = Option.none(), inboxEvery = "2 seconds", diffEvery = "3 seconds", ciPollEvery = "15 seconds", ciDiscoveryGrace = "60 seconds" }: ExecuteOptions,
   cancelled: () => boolean,
 ) =>
   Effect.gen(function* () {
@@ -338,7 +343,6 @@ const work = (
       }
       yield* sandbox.writeFile(TASK_FILE, execution.prompt.text);
       yield* sandbox.writeFile(COMMIT_MSG_FILE, execution.prompt.commitMessage);
-      for (const [path, content] of agentToolFiles()) yield* sandbox.writeFile(path, content);
     }
 
     yield* step("prepare", "Preparing the agent", agent.id === "codex" ? `${CODEX_AUTH_SCRIPT}\n${agent.setupCommand}` : agent.setupCommand);
@@ -412,6 +416,23 @@ const work = (
 
     const runAgent = (key: string, resume: boolean) => Effect.gen(function* () {
       if (execution.sessions[key]?.result) return;
+      const connections = loadMcpServers ? yield* loadMcpServers : { servers: [], warnings: [] };
+      for (const server of connections.servers) {
+        const values = server.transport === "http" ? server.headers : server.env;
+        for (const value of Object.values(values)) {
+          log.addSecret(value, { allowShort: true });
+          const bearer = /^Bearer\s+(.+)$/i.exec(value)?.[1];
+          if (bearer) log.addSecret(bearer, { allowShort: true });
+        }
+      }
+      for (const warning of connections.warnings) yield* log.info(warning);
+      // New runs, restored sandboxes, follow-ups and CI repairs all get the
+      // latest settings. A durable command already running keeps its files.
+      if (!execution.sessions[key]) {
+        for (const [path, content] of agentToolFiles(undefined, connections.servers)) {
+          yield* sandbox.writeFile(path, content, 0o600);
+        }
+      }
       asking.clear();
       let eventSequence = 0;
       const stream = makeAgentStream(

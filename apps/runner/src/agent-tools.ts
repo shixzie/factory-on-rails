@@ -20,6 +20,7 @@
  * The scripts are plain Node (the agent CLI is a Node program, so Node is in
  * the sandbox) with no dependencies.
  */
+import type { ResolvedMcpServer } from "@factory/core";
 import { FACTORY_DIR } from "./plan.js";
 
 export const INBOX_DIR = `${FACTORY_DIR}/inbox`;
@@ -168,7 +169,23 @@ They can also open any server you run in this sandbox from the run's Preview tab
 End with a short summary of what you changed and anything they should check.`;
 
 /** TOML for a string; a JSON string is also a valid TOML basic string. */
-const tomlString = (value: string) => JSON.stringify(value);
+const tomlString = (value: string) => JSON.stringify(value).replaceAll("\u007f", "\\u007f");
+const tomlMap = (values: Readonly<Record<string, string>>) =>
+  `{${Object.entries(values).map(([key, value]) => `${tomlString(key)}=${tomlString(value)}`).join(",")}}`;
+
+/** Names are validated on save as well; never let a saved server replace factory. */
+const userServers = (servers: ReadonlyArray<ResolvedMcpServer>) =>
+  servers.filter((server) => server.name.toLowerCase() !== "factory" && /^[A-Za-z0-9_-]+$/.test(server.name));
+
+/** Claude Code's config includes HTTP auth headers and stdio env as literal values. */
+export function claudeMcpConfig(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMcpServer> = []): string {
+  return JSON.stringify({ mcpServers: Object.fromEntries([
+    ...userServers(servers).map((server) => [server.name, server.transport === "http"
+      ? { type: "http", url: server.url, headers: server.headers }
+      : { type: "stdio", command: server.command, args: server.args, env: server.env }]),
+    ["factory", { type: "stdio", command: "node", args: [files(dir).askServer] }],
+  ]) }, null, 2);
+}
 
 /**
  * Codex's config overrides, one `-c key=value` per line (the default
@@ -177,13 +194,21 @@ const tomlString = (value: string) => JSON.stringify(value);
  * factory's instructions as developer instructions. The user's own
  * ~/.codex/config.toml and sign-in (from a sandbox snapshot) still apply.
  */
-export function codexConfig(dir = FACTORY_DIR): string {
+export function codexConfig(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMcpServer> = []): string {
   const f = files(dir);
   const hook = (event: string) => `[{hooks=[{type="command",command=${tomlString(`node ${f.inboxHook} ${event}`)},timeout=30}]}]`;
   return [
     `mcp_servers.factory.command="node"`,
     `mcp_servers.factory.args=[${tomlString(f.askServer)}]`,
     `mcp_servers.factory.tool_timeout_sec=${Math.round(ASK_TIMEOUT_MS / 1000) + 60}`,
+    ...userServers(servers).map((server) => {
+      // Replace the whole server table so changing transports cannot retain
+      // an incompatible command or URL from a snapshot's Codex configuration.
+      const fields = server.transport === "http"
+        ? `url=${tomlString(server.url)},http_headers=${tomlMap(server.headers)}`
+        : `command=${tomlString(server.command)},args=[${server.args.map(tomlString).join(",")}],env=${tomlMap(server.env)}`;
+      return `mcp_servers.${server.name}={${fields}}`;
+    }),
     `hooks.PostToolUse=${hook("post-tool-use")}`,
     `hooks.Stop=${hook("stop")}`,
     `developer_instructions=${tomlString(SYSTEM_PROMPT)}`,
@@ -191,15 +216,15 @@ export function codexConfig(dir = FACTORY_DIR): string {
 }
 
 /** What the runner writes into the sandbox before the agent starts, as [path, content] pairs. */
-export function agentToolFiles(dir = FACTORY_DIR): ReadonlyArray<readonly [string, string]> {
+export function agentToolFiles(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMcpServer> = []): ReadonlyArray<readonly [string, string]> {
   const f = files(dir);
   const hook = (event: string) => ({ type: "command", command: `node ${f.inboxHook} ${event}` });
   return [
     [f.askServer, ASK_SERVER_SCRIPT],
     [f.inboxHook, INBOX_HOOK_SCRIPT],
     [f.systemPrompt, SYSTEM_PROMPT],
-    [f.codexConfig, codexConfig(dir)],
-    [f.mcpConfig, JSON.stringify({ mcpServers: { factory: { type: "stdio", command: "node", args: [f.askServer] } } }, null, 2)],
+    [f.codexConfig, codexConfig(dir, servers)],
+    [f.mcpConfig, claudeMcpConfig(dir, servers)],
     [
       f.settings,
       JSON.stringify(

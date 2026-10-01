@@ -563,6 +563,35 @@ key under **Settings**, and it is used for their runs only.
   platform's network, stopped after a few idle minutes and deleted with the
   run after a week without activity.
 
+## MCP connections
+
+Users manage persistent MCP connections in **Settings → MCP servers**. The
+harness exposes authenticated, owner-scoped CRUD endpoints under
+`/api/settings/mcp`. A connection is either an HTTP endpoint with no auth,
+bearer auth or OAuth, or a stdio executable and argument list. Secret header
+values, environment variables, bearer tokens and OAuth state are encrypted with
+the same `TOKEN_ENCRYPTION_KEY` used for model credentials. Public responses
+contain only configuration, saved secret names and authentication status.
+
+OAuth begins at `POST /api/settings/mcp/:id/oauth` and returns a provider
+authorization URL. The callback at `/auth/mcp/callback` saves the authorization
+and returns to Settings. The flow uses discovery and dynamic client
+registration against public HTTPS endpoints; private-network OAuth endpoints
+and manually provisioned OAuth clients are not supported. Removing
+saved authorization does not revoke a provider-side grant.
+
+The runner reads the owner's enabled connections before launching an agent
+turn, including follow-ups in an existing thread, and merges them with the
+built-in `factory` MCP server for Claude Code and Codex. Changes apply at the
+next launch, while an already running command keeps its configuration. The
+runner refreshes expired OAuth access tokens when a refresh token is available.
+A long-running agent may need another turn when its access token expires.
+Changing a connection's destination or authentication configuration clears its
+previous credentials so secrets cannot be silently sent to a different server.
+Local commands execute inside the thread's sandbox and must be available in
+that environment. MCP names reserve `factory` so user configuration cannot
+replace the built-in question tool.
+
 ## Data model
 
 `packages/core/migrations/001_init.sql`:
@@ -577,6 +606,9 @@ key under **Settings**, and it is used for their runs only.
   a stopped one boots from, `last_activity_at`, `turns`, and the last user
   message handed to the agent.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
+- `user_mcp_servers` and `mcp_oauth_states` (`013_user_mcp_servers.sql`):
+  owner-scoped MCP configuration, encrypted credentials and short-lived,
+  single-use OAuth state tied to the connection revision.
 - `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):
   the agent a run uses, and the snapshot a user's runs start from.
 - `runs.title` and `runs.title_by_user` (`007_run_titles.sql`): the run's
