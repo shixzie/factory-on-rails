@@ -43,6 +43,13 @@ pnpm test
 
 See [docs/architecture.md](docs/architecture.md) for the design.
 
+Configure MCP servers under **Settings → MCP servers** to give Claude Code and
+Codex access to your tools across threads. Add a remote HTTP endpoint with a
+bearer token, custom headers, or OAuth sign-in, or configure a command that runs
+inside the sandbox. Servers and encrypted credentials belong to your account;
+enabled servers are loaded for each new thread and the next turn of existing
+threads. See [MCP setup](docs/setup.md#mcp-servers) for authentication and examples.
+
 ## Host your own
 
 <!-- Deploy button: replace TEMPLATE_CODE with the template's code (docs/railway-template.md, step 4), then uncomment.

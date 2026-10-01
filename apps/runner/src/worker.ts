@@ -5,6 +5,7 @@ import {
   DEFAULT_AGENT,
   isAgentId,
   MODEL_PROVIDERS,
+  resolveMcpServers,
   snapshotsFor,
   Store,
   TokenCipher,
@@ -77,11 +78,14 @@ export const handleRun = (run: RunRow) =>
     );
     // A snapshot can carry the agent's own sign-in, so it may stand in for a key.
     if (Object.keys(keyEnv).length === 0 && !snapshot && !run.recovering) return yield* fail(noKey(agent));
-    Object.values(keyEnv).forEach(log.addSecret);
+    Object.values(keyEnv).forEach((value) => log.addSecret(value));
     if (Object.keys(keyEnv).length === 0) yield* log.info(`No key saved for ${AGENTS[agent].label}, so it uses the sign-in in snapshot ${snapshot}`);
+
+    const mcpContext = yield* Effect.context<Effect.Effect.Context<ReturnType<typeof resolveMcpServers>>>();
 
     const outcome = yield* executeRun(run, {
       log,
+      loadMcpServers: resolveMcpServers(run.user_id).pipe(Effect.provide(mcpContext)),
       // The user's own keys win over any platform-level passthrough of the same name.
       agent: {
         id: agent,

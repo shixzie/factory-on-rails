@@ -92,6 +92,39 @@ const events = (runId: string) =>
 
 describe.skipIf(!testDatabaseUrl)("runner", () => {
   layer(Base, { timeout: 30_000, excludeTestServices: true })((it) => {
+    it.effect("reuses only the owner's enabled MCPs in new Claude and Codex threads", () => Effect.gen(function* () {
+      const store = yield* Store;
+      const first = yield* queueRunWith();
+      const secrets = { bearerToken: "shared-mcp-bearer-token" };
+      const enabled = yield* store.createMcpServer({ user_id: first.user_id, name: "shared-tools", enabled: true,
+        config: { transport: "http", url: "https://mcp.example.com", auth: "bearer" }, secrets_enc: encrypt(JSON.stringify(secrets), key) });
+      const disabled = yield* store.createMcpServer({ user_id: first.user_id, name: "disabled-tools", enabled: false,
+        config: { transport: "stdio", command: "node", args: ["disabled.mjs"] }, secrets_enc: null });
+      const otherUser = yield* store.upsertUser({ github_id: 71, github_login: "someone-else", name: null, avatar_url: null,
+        access_token_enc: "x", access_token_expires_at: null, refresh_token_enc: null, refresh_token_expires_at: null });
+      const privateServer = yield* store.createMcpServer({ user_id: otherUser.id, name: "someone-elses-tools", enabled: true,
+        config: { transport: "stdio", command: "node", args: ["private.mjs"] }, secrets_enc: null });
+      const captures: string[][] = [];
+      const capture = Effect.sync(() => {
+        const config = JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!);
+        captures.push(Object.keys(config.mcpServers).sort());
+        expect(config.mcpServers["shared-tools"].headers.Authorization).toBe(`Bearer ${secrets.bearerToken}`);
+        return { stdout: secrets.bearerToken };
+      });
+      const sandboxes = fakeSandboxes({ "run-agent": capture, "run-codex": capture });
+      const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+      yield* waitForRun(first.id, (r) => r.status === "succeeded");
+      const second = yield* queueRunWith({ agent: "codex", keys: { openai: "sk-openai-worker-mcp-test" } });
+      yield* waitForRun(second.id, (r) => r.status === "succeeded");
+      yield* Fiber.interrupt(worker);
+      expect(captures).toEqual([["factory", "shared-tools"], ["factory", "shared-tools"]]);
+      expect((yield* events(first.id)).join("\n")).not.toContain(secrets.bearerToken);
+      expect((yield* events(second.id)).join("\n")).not.toContain(secrets.bearerToken);
+      yield* store.deleteMcpServer(first.user_id, enabled.id);
+      yield* store.deleteMcpServer(first.user_id, disabled.id);
+      yield* store.deleteMcpServer(otherUser.id, privateServer.id);
+    }));
+
     it.effect("claims a queued run, opens the PR with the user's key, and redacts it", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes({ "run-agent": { stdout: `using ${API_KEY}` } });

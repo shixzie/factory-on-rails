@@ -1,6 +1,7 @@
 import { ExternalLinkIcon } from "lucide-react";
 import type { Metadata } from "next";
 import { ApiKeys } from "@/components/api-keys";
+import { McpServers } from "@/components/mcp-servers";
 import { PageHeader } from "@/components/page-header";
 import { SnapshotPicker } from "@/components/snapshot-picker";
 import { Button } from "@/components/ui/button";
@@ -21,8 +22,8 @@ function Section({ title, description, children }: { title: string; description:
   );
 }
 
-export default async function SettingsPage() {
-  const [me, keys, snapshot] = await Promise.all([getMe(), serverApi(api.keys), serverApi(api.snapshot)]);
+export default async function SettingsPage({ searchParams }: { searchParams: Promise<{ mcp?: string | string[] }> }) {
+  const [me, keys, snapshot, mcpServers, params] = await Promise.all([getMe(), serverApi(api.keys), serverApi(api.snapshot), serverApi(api.mcpServers), searchParams]);
   return (
     <>
       <PageHeader>
@@ -35,6 +36,12 @@ export default async function SettingsPage() {
             description="Bring your own key: your runs use your key, and only your runs. Each run gets the key for the agent it uses. Keys are encrypted at rest, never shown again after you save them, and only handed to the sandboxes that run your tasks."
           >
             <ApiKeys initial={keys} />
+          </Section>
+          <Section
+            title="MCP servers"
+            description="Connect tools for Claude Code and Codex. Your servers and credentials are saved for your account and used in every new thread and on the next turn of existing threads. Changes take effect when an agent next starts."
+          >
+            <McpServers initial={mcpServers} oauthResult={typeof params.mcp === "string" ? params.mcp : undefined} />
           </Section>
           <Section
             title="Sandbox snapshot"

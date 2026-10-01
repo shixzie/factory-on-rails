@@ -3,6 +3,8 @@ export * from "./config.js";
 export * from "./crypto.js";
 export * from "./db.js";
 export * from "./instance.js";
+export * from "./mcp.js";
+export * from "./mcp-auth.js";
 export * from "./preview.js";
 export * from "./preview-agent.js";
 export * from "./providers.js";

@@ -269,6 +269,79 @@ export type PreviewLink = typeof PreviewLink.Type;
 export const SaveKeyBody = Schema.Struct({ key: Schema.String });
 export type SaveKeyBody = typeof SaveKeyBody.Type;
 
+/** Server names become tool namespaces in both coding agents. */
+export const McpServerName = Schema.String.pipe(
+  Schema.pattern(/^[A-Za-z0-9_-]{1,64}$/),
+  Schema.filter((name) => !["factory", "__proto__", "constructor", "prototype"].includes(name.toLowerCase()), {
+    message: () => "This server name is reserved",
+  }),
+);
+
+const McpUrl = Schema.String.pipe(Schema.maxLength(2048), Schema.filter((value) => {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && !url.hash;
+  } catch {
+    return false;
+  }
+}, { message: () => "Use an HTTP or HTTPS URL without embedded credentials or a fragment" }));
+
+/** Public connection settings. Put credentials in headers, never in the URL query string. */
+export const McpServerConfig = Schema.Union(
+  Schema.Struct({
+    transport: Schema.Literal("http"),
+    url: McpUrl,
+    auth: Schema.Literal("none", "bearer", "oauth"),
+  }),
+  Schema.Struct({
+    transport: Schema.Literal("stdio"),
+    command: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(1024), Schema.pattern(/^[^\x00\r\n]+$/)),
+    args: Schema.Array(Schema.String.pipe(Schema.maxLength(4096), Schema.pattern(/^[^\x00]*$/))).pipe(Schema.maxItems(100)),
+  }),
+);
+export type McpServerConfig = typeof McpServerConfig.Type;
+
+const McpSecretValue = Schema.String.pipe(Schema.maxLength(16_384), Schema.pattern(/^[^\x00]*$/));
+const McpSecretMap = (key: Schema.Schema<string>) => Schema.Record({ key: Schema.String, value: McpSecretValue }).pipe(
+  Schema.filter((values) => Object.keys(values).every(Schema.is(key)), { message: () => "Invalid header or environment variable name" }),
+  Schema.filter((values) => Object.keys(values).length <= 50, { message: () => "At most 50 values are allowed" }),
+);
+
+/** Omitted values are preserved on edits; supplied maps replace the saved map. */
+export const McpServerSecretInput = Schema.Struct({
+  bearerToken: Schema.optional(Schema.String.pipe(Schema.maxLength(16_384), Schema.pattern(/^[^\x00\r\n]*$/))),
+  headers: Schema.optional(McpSecretMap(Schema.String.pipe(Schema.pattern(/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/))).pipe(
+    Schema.filter((values) => Object.values(values).every((value) => !/[\r\n]/.test(value)), {
+      message: () => "Header values cannot contain line breaks",
+    }),
+  )),
+  env: Schema.optional(McpSecretMap(Schema.String.pipe(Schema.pattern(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/)))),
+});
+export type McpServerSecretInput = typeof McpServerSecretInput.Type;
+
+export const SaveMcpServerBody = Schema.Struct({
+  name: McpServerName,
+  enabled: Schema.Boolean,
+  config: McpServerConfig,
+  secrets: Schema.optional(McpServerSecretInput),
+});
+export type SaveMcpServerBody = typeof SaveMcpServerBody.Type;
+
+/** Safe settings response: secret values, OAuth state, and encrypted payloads never appear here. */
+export const ApiMcpServer = Schema.Struct({
+  id: Schema.String,
+  name: McpServerName,
+  enabled: Schema.Boolean,
+  config: McpServerConfig,
+  authenticated: Schema.Boolean,
+  secretNames: Schema.Struct({ headers: Schema.Array(Schema.String), env: Schema.Array(Schema.String) }),
+  updatedAt: Schema.Date,
+});
+export type ApiMcpServer = typeof ApiMcpServer.Type;
+
+export const McpOAuthLink = Schema.Struct({ url: Schema.String });
+export type McpOAuthLink = typeof McpOAuthLink.Type;
+
 /**
  * The sandbox snapshots (prepared Railway checkpoints) this user may start
  * runs from, and the one they picked. `null` means the platform's default.

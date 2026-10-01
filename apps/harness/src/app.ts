@@ -31,6 +31,7 @@ import { fail } from "./errors.js";
 import { PullRequestStatuses } from "./pull-requests.js";
 import { appInstallUrl, setupRoutes } from "./setup.js";
 import { generateRunTitle } from "./titles.js";
+import { mcpRoutes } from "./mcp.js";
 import { validateImages } from "./images.js";
 
 /**
@@ -528,7 +529,7 @@ const routes = HttpRouter.empty.pipe(
   ),
 );
 
-export const router = HttpRouter.concat(routes, previewRoutes);
+export const router = routes.pipe(HttpRouter.concat(previewRoutes), HttpRouter.concat(mcpRoutes));
 
 /** Where the web app shows sign-in, with an optional error message. */
 const loginPage = (error?: string) =>

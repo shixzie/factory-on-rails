@@ -54,6 +54,58 @@ describe("thread settlement requests", () => {
   });
 });
 
+describe("MCP settings requests", () => {
+  const savedServer = {
+    id: "mcp/1", name: "tools", enabled: true,
+    config: { transport: "http", url: "https://mcp.example.com/mcp", auth: "oauth" },
+    authenticated: false, secretNames: { headers: [], env: [] }, updatedAt: "2026-10-01T00:00:00.000Z",
+  };
+
+  it("decodes saved servers without credential values", async () => {
+    vi.stubGlobal("window", { location: { origin: "https://factory.example" } });
+    const fetch = vi.fn(async () => Response.json([savedServer]));
+    vi.stubGlobal("fetch", fetch);
+
+    const result = await runInBrowser(api.mcpServers);
+
+    expect(result).toMatchObject({ _tag: "Right", right: [{ ...savedServer, updatedAt: new Date(savedServer.updatedAt) }] });
+  });
+
+  it("updates configuration without submitting credentials that were not changed", async () => {
+    vi.stubGlobal("window", { location: { origin: "https://factory.example" } });
+    const fetch = vi.fn(async (_url: unknown, _init: RequestInit) => Response.json([savedServer]));
+    vi.stubGlobal("fetch", fetch);
+    const body = { name: "tools", enabled: false, config: { transport: "http" as const, url: savedServer.config.url, auth: "oauth" as const } };
+
+    await runInBrowser(api.saveMcpServer("mcp/1", body));
+
+    expect(String(fetch.mock.calls[0]?.[0])).toBe("https://factory.example/api/settings/mcp/mcp%2F1");
+    expect(fetch.mock.calls[0]?.[1]).toMatchObject({ method: "PUT" });
+    expect(await new Response(fetch.mock.calls[0]?.[1].body).json()).toEqual(body);
+  });
+
+  it("starts OAuth through the same-origin API", async () => {
+    vi.stubGlobal("window", { location: { origin: "https://factory.example" } });
+    const fetch = vi.fn(async (_url: unknown, _init: RequestInit) => Response.json({ url: "https://auth.example.com/authorize?state=opaque" }));
+    vi.stubGlobal("fetch", fetch);
+
+    expect(await runInBrowser(api.authenticateMcpServer("mcp/1"))).toMatchObject({
+      _tag: "Right", right: { url: "https://auth.example.com/authorize?state=opaque" },
+    });
+    expect(String(fetch.mock.calls[0]?.[0])).toBe("https://factory.example/api/settings/mcp/mcp%2F1/oauth");
+    expect(fetch.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
+  });
+
+  it("reports authentication failures without discarding the server's explanation", async () => {
+    vi.stubGlobal("window", { location: { origin: "https://factory.example" } });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ code: "bad_request", error: "This server does not support OAuth discovery." }, { status: 400 })));
+
+    expect(await runInBrowser(api.authenticateMcpServer("mcp-1"))).toMatchObject({
+      _tag: "Left", left: { status: 400, message: "This server does not support OAuth discovery." },
+    });
+  });
+});
+
 describe("image attachment requests", () => {
   it("sends image content for both new runs and follow-up messages", async () => {
     vi.stubGlobal("window", { location: { origin: "https://factory.example" } });

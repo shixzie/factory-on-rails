@@ -72,6 +72,17 @@ export const api = {
     call(json("PUT", `/api/settings/keys/${encodeURIComponent(provider)}`, { key }), Schema.Array(Api.ApiKeySlot)),
   deleteKey: (provider: string) =>
     call(HttpClientRequest.del(`/api/settings/keys/${encodeURIComponent(provider)}`), Schema.Array(Api.ApiKeySlot)),
+  mcpServers: call(HttpClientRequest.get("/api/settings/mcp"), Schema.Array(Api.ApiMcpServer)),
+  createMcpServer: (body: Api.SaveMcpServerBody) =>
+    call(json("POST", "/api/settings/mcp", body), Schema.Array(Api.ApiMcpServer)),
+  saveMcpServer: (id: string, body: Api.SaveMcpServerBody) =>
+    call(json("PUT", `/api/settings/mcp/${encodeURIComponent(id)}`, body), Schema.Array(Api.ApiMcpServer)),
+  deleteMcpServer: (id: string) =>
+    call(HttpClientRequest.del(`/api/settings/mcp/${encodeURIComponent(id)}`), Schema.Array(Api.ApiMcpServer)),
+  authenticateMcpServer: (id: string) =>
+    call(HttpClientRequest.post(`/api/settings/mcp/${encodeURIComponent(id)}/oauth`), Api.McpOAuthLink),
+  disconnectMcpServer: (id: string) =>
+    call(HttpClientRequest.del(`/api/settings/mcp/${encodeURIComponent(id)}/auth`), Schema.Array(Api.ApiMcpServer)),
   snapshot: call(HttpClientRequest.get("/api/settings/snapshot"), Api.SnapshotSettings),
   saveSnapshot: (snapshot: string | null) => call(json("PUT", "/api/settings/snapshot", { snapshot }), Api.SnapshotSettings),
   setup: call(HttpClientRequest.get("/api/setup"), Api.SetupStatus),

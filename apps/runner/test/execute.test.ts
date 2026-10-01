@@ -91,6 +91,42 @@ const PREVIEW_KEY = "s".repeat(40);
 const preview = Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make(PREVIEW_KEY) });
 
 describe("executeRun", () => {
+  for (const origin of ["new", "kept", "restored"] as const) {
+    it.effect(`loads authenticated MCP tools outside the repository in a ${origin} sandbox`, () => Effect.gen(function* () {
+      const token = "mcp-bearer-secret";
+      const envSecret = 'mcp-"env"-secret';
+      const sandboxes = fakeSandboxes({ "run-agent": { stdout: `using ${token} and ${envSecret}` } }, {
+        alive: ["sbx_live"], checkpoints: { cp_1: "saved-sandbox" },
+      });
+      sandboxes.state.files["/workspace/.factory/mcp.json"] = '{"mcpServers":{"removed":{}}}';
+      const turn = origin === "new" ? run : followUp(origin === "kept"
+        ? { sandbox_state: "running", sandbox_id: "sbx_live" }
+        : { sandbox_state: "stopped", sandbox_checkpoint_id: "cp_1", sandbox_checkpoint_name: "saved-sandbox" });
+      let loads = 0;
+      const { outcome, events } = yield* execute(sandboxes, recordingStore(), {
+        loadMcpServers: Effect.sync(() => {
+          loads++;
+          return { servers: [
+            { name: "remote", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: `Bearer ${token}` } },
+            { name: "local", transport: "stdio" as const, command: "node", args: ["server.mjs"], env: { API_KEY: envSecret } },
+          ], warnings: ["MCP needs-login requires authentication. Reconnect in Settings."] };
+        }),
+      }, { turn });
+      expect(outcome.status).toBe("succeeded");
+      expect(loads).toBe(1);
+      const config = JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!);
+      expect(Object.keys(config.mcpServers).sort()).toEqual(["factory", "local", "remote"]);
+      expect(config.mcpServers.remote.headers.Authorization).toBe(`Bearer ${token}`);
+      expect(config.mcpServers.local.env.API_KEY).toBe(envSecret);
+      expect(sandboxes.state.files["/workspace/.factory/codex-config"]).toContain('mcp_servers.remote={url="https://mcp.example.com"');
+      for (const name of ["mcp.json", "codex-config"]) expect(sandboxes.state.modes[`/workspace/.factory/${name}`]).toBe(0o600);
+      expect(Object.keys(sandboxes.state.files).some((path) => path.startsWith("/workspace/repo/"))).toBe(false);
+      expect(events.join("\n")).not.toContain(token);
+      expect(events.join("\n")).not.toContain(envSecret);
+      expect(events).toContain("info:MCP needs-login requires authentication. Reconnect in Settings.");
+    }));
+  }
+
   describe("deployment recovery", () => {
     const done = (name: string, stdout = "") => ({ name, result: { exitCode: 0, stdout, timedOut: false } });
     const prepared: RunExecution = {
@@ -122,14 +158,21 @@ describe("executeRun", () => {
 
     it.effect("reattaches to the saved agent without overwriting its task or restarting previews", () =>
       Effect.gen(function* () {
-        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const sandboxes = fakeSandboxes({ "run-agent": { stdout: "existing-mcp-secret" } }, { alive: ["sbx_live"] });
+        const previousConfig = '{"mcpServers":{"existing":{"type":"http","url":"https://mcp.example.com"}}}';
+        sandboxes.state.files["/workspace/.factory/mcp.json"] = previousConfig;
         const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: { name: "live-agent", startedAt: Date.now() } } });
-        const { outcome } = yield* execute(sandboxes, recordingStore(), { preview }, { turn });
+        const { outcome, events } = yield* execute(sandboxes, recordingStore(), {
+          preview,
+          loadMcpServers: Effect.succeed({ servers: [{ name: "existing", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: "Bearer existing-mcp-secret" } }], warnings: [] }),
+        }, { turn });
         expect(outcome.status).toBe("succeeded");
         expect(sandboxes.state.attachments).toEqual(["live-agent"]);
         expect(sandboxes.state.files["/workspace/TASK.md"]).toBeUndefined();
         expect(sandboxes.state.files[PREVIEW_AGENT_FILE]).toBeUndefined();
         expect(sandboxes.state.commands.some((c) => c.includes("setup-agent"))).toBe(false);
+        expect(sandboxes.state.files["/workspace/.factory/mcp.json"]).toBe(previousConfig);
+        expect(events.join("\n")).not.toContain("existing-mcp-secret");
       }),
     );
 
@@ -287,10 +330,20 @@ describe("executeRun", () => {
   it.effect("resumes the agent on CI failure, pushes the fix, and verifies the new commit", () =>
     Effect.gen(function* () {
       let heads = 0;
+      let loads = 0;
+      const seen: string[][] = [];
       const sandboxes = fakeSandboxes({
+        "run-agent": Effect.sync(() => {
+          seen.push(Object.keys(JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!).mcpServers).sort());
+          return {};
+        }),
         "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
       });
-      const { outcome, github } = yield* execute(sandboxes, recordingStore(), {}, {
+      const { outcome, github } = yield* execute(sandboxes, recordingStore(), {
+        loadMcpServers: Effect.sync(() => ({ servers: ++loads === 1
+          ? [{ name: "removed", transport: "http" as const, url: "https://mcp.example.com", headers: {} }]
+          : [{ name: "fresh", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: "Bearer refreshed-token" } }], warnings: [] })),
+      }, {
         ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : "passed", url: "https://github.com/shixzie/demo/actions/runs/1" }]),
         pullRequest: () => Effect.succeed(prState({ head: { sha: (heads === 1 ? "a" : "b").repeat(40) } })),
       });
@@ -301,6 +354,9 @@ describe("executeRun", () => {
       expect(agents).toHaveLength(2);
       expect(sandboxes.state.envs[agents[1]!]).toMatchObject({ FACTORY_CONTINUE: "1" });
       expect(sandboxes.state.files["/workspace/TASK.md"]).toContain("https://github.com/shixzie/demo/actions/runs/1");
+      expect(loads).toBe(2);
+      expect(seen).toEqual([["factory", "removed"], ["factory", "fresh"]]);
+      expect(sandboxes.state.files["/workspace/.factory/mcp.json"]).toContain("Bearer refreshed-token");
     }),
   );
 
