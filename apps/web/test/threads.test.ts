@@ -8,7 +8,7 @@ const run = (patch: Partial<ApiRun> = {}): ApiRun => ({
   agent: "codex", model: null, reasoningEffort: null, status: "succeeded", branch: "feature", error: null,
   pullRequestUrl: url(1), pullRequestUrls: [url(1)], pullRequests: [{ url: url(1), state: "merged" }],
   createdAt: new Date("2026-09-01T00:00:00Z"), startedAt: null, finishedAt: null, lastActivityAt: null,
-  awaitingInput: false, sandboxState: "stopped", previewPorts: null,
+  awaitingInput: false, sandboxState: "stopped", previewPorts: null, settledAt: null,
   ...patch,
 });
 
@@ -40,6 +40,24 @@ describe("thread settlement", () => {
 
   it("keeps unanswered questions visible, even if the run has finished", () => {
     expect(isThreadSettled(run({ awaitingInput: true }))).toBe(false);
+  });
+
+  it.each(["succeeded", "failed", "cancelled"] as const)("can manually settle a %s thread without a PR", (status) => {
+    expect(isThreadSettled(run({
+      status, settledAt: new Date(), pullRequestUrl: null, pullRequestUrls: [], pullRequests: [],
+    }))).toBe(true);
+  });
+
+  it.each(["open", "draft", "closed", "unknown"] as const)("manual settlement does not require a %s PR to merge", (state) => {
+    expect(isThreadSettled(run({ settledAt: new Date(), pullRequests: [{ url: url(1), state }] }))).toBe(true);
+  });
+
+  it.each(["queued", "running", "cancelling"] as const)("keeps a manually settled thread visible if it becomes %s", (status) => {
+    expect(isThreadSettled(run({ settledAt: new Date(), status }))).toBe(false);
+  });
+
+  it("keeps unanswered questions visible even with a manual settlement", () => {
+    expect(isThreadSettled(run({ settledAt: new Date(), awaitingInput: true }))).toBe(false);
   });
 
   it("deduplicates canonical links and includes legacy and newly linked PRs", () => {
@@ -78,6 +96,20 @@ describe("sidebar threads", () => {
     const result = sidebarThreads([run({ status: "queued" })], null);
     expect(result.active.map((r) => r.id)).toEqual(["run"]);
     expect(result.repos[0]!.settled).toEqual([]);
+  });
+
+  it("moves manually settled threads into history immediately, including the selected thread", () => {
+    const settled = run({ settledAt: new Date(), pullRequestUrl: null, pullRequestUrls: [], pullRequests: [] });
+    for (const selected of [null, settled.id]) {
+      const result = sidebarThreads([settled], selected);
+      expect(result.active).toEqual([]);
+      expect(result.repos[0]).toMatchObject({ repo: "acme/app", recent: [], settled: [{ id: "run" }] });
+    }
+  });
+
+  it("shows a manually settled thread in recent history again after its follow-up finishes", () => {
+    const continued = run({ settledAt: null, pullRequestUrl: null, pullRequestUrls: [], pullRequests: [] });
+    expect(sidebarThreads([continued], null).repos[0]).toMatchObject({ recent: [{ id: "run" }], settled: [] });
   });
 
   it("never hides the selected thread behind the recent-history limit", () => {

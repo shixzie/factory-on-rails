@@ -14,6 +14,9 @@ The sidebar keeps active threads at the top, with unanswered questions first
 and each thread's pull request status visible. Once every linked PR has merged
 and no work or question remains, the thread moves into its repository's
 collapsed **Settled** list. Sending a follow-up brings it back to **Active**.
+To settle a finished thread yourself, hover or focus its sidebar row and click
+the **Settle thread** archive button. This also works for threads without a PR;
+threads still working or waiting for an answer must finish first.
 Hover or focus a repository to use **+** and start a new thread in that repo.
 
 Our own instance runs at [factory.shixzie.com](https://factory.shixzie.com), and

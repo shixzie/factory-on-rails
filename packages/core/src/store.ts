@@ -77,6 +77,8 @@ export interface RunRow {
   created_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
+  /** Manual settlement is independent of the run outcome and clears on a follow-up. */
+  settled_at: Date | null;
   awaiting_input: boolean;
   sandbox_state: SandboxState;
   sandbox_state_at: Date | null;
@@ -198,6 +200,8 @@ export interface StoreService {
   readonly setGeneratedTitle: (runId: string, title: string) => Q<boolean>;
   /** The user names their run; generated titles never replace it afterwards. None if it is not their run. */
   readonly renameRun: (runId: string, userId: string, title: string) => Q<Option.Option<RunRow>>;
+  /** Settles an idle thread. None if it is not the user's or still needs attention. */
+  readonly settleRun: (runId: string, userId: string) => Q<Option.Option<RunRow>>;
   /**
    * Ends a turn. A run that succeeded while the user sent a message the agent
    * never got goes straight back to the queue, so that message is answered.
@@ -381,6 +385,13 @@ const make = Effect.gen(function* () {
         where id = ${runId} and user_id = ${userId}
         returning *`.pipe(Effect.map(Arr.head)),
 
+    settleRun: (runId, userId) =>
+      sql<RunRow>`
+        update runs set settled_at = coalesce(settled_at, now())
+        where id = ${runId} and user_id = ${userId}
+          and status in ${sql.in(TERMINAL_STATUSES)} and not awaiting_input
+        returning *`.pipe(Effect.map(Arr.head)),
+
     finishRun: (runId, status, error, workerId) =>
       Effect.gen(function* () {
         const rows = yield* sql<{ status: RunStatus }>`
@@ -434,7 +445,7 @@ const make = Effect.gen(function* () {
         .withTransaction(
           Effect.gen(function* () {
             const rows = yield* sql<RunRow>`
-              update runs set status = 'queued', last_activity_at = now(), awaiting_input = false,
+              update runs set status = 'queued', last_activity_at = now(), awaiting_input = false, settled_at = null,
                 execution = null, recovering = false, claimed_by = null, heartbeat_at = null
               where id = ${runId} and status in ${sql.in(TERMINAL_STATUSES)}
               returning *`;

@@ -340,7 +340,55 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(detail.run).toMatchObject({ sandboxState: "none" });
   });
 
-  it("continues a finished run when the user writes to it", async () => {
+  it("lets only the owner settle an idle thread and persists its settlement", async () => {
+    const owner = await signIn("settler", 101);
+    const other = await signIn("other-settler", 102);
+    const created = await run(Effect.gen(function* () {
+      const store = yield* Store;
+      const r = yield* store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "finished task" });
+      yield* store.updateRun(r.id, { pull_request_url: "https://github.com/o/r/pull/404" });
+      yield* Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'succeeded' where id = ${r.id}`);
+      return r;
+    }));
+    expect((await post(`/api/runs/${created.id}/settle`, "")).status).toBe(401);
+    expect((await post(`/api/runs/${created.id}/settle`, other.cookie)).status).toBe(404);
+    expect((await post("/api/runs/not-a-uuid/settle", owner.cookie)).status).toBe(400);
+
+    const res = await post(`/api/runs/${created.id}/settle`, owner.cookie);
+    expect(res.status).toBe(200);
+    const settled = await json(res);
+    expect(settled).toMatchObject({
+      id: created.id, status: "succeeded", settledAt: expect.any(String),
+      pullRequestUrl: "https://github.com/o/r/pull/404", pullRequestUrls: ["https://github.com/o/r/pull/404"],
+    });
+    expect((await json(post(`/api/runs/${created.id}/settle`, owner.cookie))).settledAt).toBe(settled.settledAt);
+    const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+    expect(detail.run.settledAt).toBe(settled.settledAt);
+    expect(detail.events).toEqual([]);
+    const listed = await json(request("/api/runs", { headers: { cookie: owner.cookie } }));
+    expect(listed.find((r: { id: string }) => r.id === created.id).settledAt).toBe(settled.settledAt);
+    const page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+    expect(page.run.settledAt).toBe(settled.settledAt);
+  });
+
+  it("rejects settlement of queued, working, stopping, or awaiting-input threads", async () => {
+    const owner = await signIn("active-settler", 103);
+    const created = await run(Effect.flatMap(Store, (store) =>
+      store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "unfinished" }),
+    ));
+    for (const status of ["queued", "running", "cancelling", "succeeded"] as const) {
+      await run(Effect.flatMap(SqlClient.SqlClient, (sql) =>
+        sql`update runs set status = ${status}, awaiting_input = ${status === "succeeded"} where id = ${created.id}`,
+      ));
+      const res = await post(`/api/runs/${created.id}/settle`, owner.cookie);
+      expect(res.status).toBe(409);
+      expect(await json(res)).toMatchObject({ code: "bad_request", error: expect.stringContaining("before settling") });
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run).toMatchObject({ status, awaitingInput: status === "succeeded", settledAt: null });
+    }
+  });
+
+  it("continues and reopens a settled run when the user writes to it", async () => {
     const owner = await signIn("continuer", 4);
     const created = await run(
       Effect.gen(function* () {
@@ -351,6 +399,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
         return r;
       }),
     );
+    expect((await post(`/api/runs/${created.id}/settle`, owner.cookie)).status).toBe(200);
     const noKey = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
     expect(noKey.status).toBe(400);
     expect((await json(noKey)).code).toBe("api_key_required");
@@ -358,7 +407,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     await send("PUT", "/api/settings/keys/anthropic", owner.cookie, { key: "sk-ant-" + "c".repeat(30) });
     const sent = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
     expect(sent.status).toBe(201);
-    expect(await json(sent)).toMatchObject({ status: "queued", sandboxState: "stopped", lastActivityAt: expect.any(String) });
+    expect(await json(sent)).toMatchObject({ status: "queued", sandboxState: "stopped", lastActivityAt: expect.any(String), settledAt: null });
     const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
     expect(detail.events.map((e: { kind: string; message: string }) => `${e.kind}:${e.message}`)).toEqual(["user_message:Now add tests"]);
     await send("DELETE", "/api/settings/keys/anthropic", owner.cookie);

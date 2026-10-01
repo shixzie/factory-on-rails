@@ -341,7 +341,60 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
-    it.effect("continues a finished run as its next turn, with the user's message", () =>
+    it.effect("settles idle threads independently of their outcome and PRs", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        for (const status of ["succeeded", "failed", "cancelled"] as const) {
+          const run = yield* enqueue(id, `settle ${status}`);
+          expect(run.settled_at).toBeNull();
+          const pr = "https://github.com/o/r/pull/42";
+          yield* store.updateRun(run.id, { pull_request_url: pr, sandbox_id: "sbx_settle", sandbox_state: "running" });
+          yield* sql`update runs set status = ${status}, finished_at = now() where id = ${run.id}`;
+          const before = Option.getOrThrow(yield* store.getRun(run.id));
+          expect(Option.isNone(yield* store.settleRun(run.id, "00000000-0000-0000-0000-000000000000"))).toBe(true);
+          const settled = Option.getOrThrow(yield* store.settleRun(run.id, id));
+          expect(settled.settled_at).toBeInstanceOf(Date);
+          expect(settled).toEqual({ ...before, settled_at: settled.settled_at });
+          expect(Option.getOrThrow(yield* store.settleRun(run.id, id))).toEqual(settled);
+          expect((yield* store.listRuns(id)).find((r) => r.id === run.id)?.settled_at).toEqual(settled.settled_at);
+        }
+      }),
+    );
+
+    it.effect("refuses settlement while a thread is active or needs input", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "still needs attention");
+        for (const status of ["queued", "running", "cancelling", "succeeded"] as const) {
+          yield* sql`update runs set status = ${status}, awaiting_input = ${status === "succeeded"} where id = ${run.id}`;
+          const before = Option.getOrThrow(yield* store.getRun(run.id));
+          expect(Option.isNone(yield* store.settleRun(run.id, id))).toBe(true);
+          expect(Option.getOrThrow(yield* store.getRun(run.id))).toEqual(before);
+        }
+      }),
+    );
+
+    it.effect("keeps a follow-up active when settlement races with it", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        const run = yield* enqueue(id, "follow-up race");
+        yield* sql`update runs set status = 'succeeded' where id = ${run.id}`;
+        yield* Effect.all([
+          store.settleRun(run.id, id),
+          store.continueRun(run.id, "one more thing"),
+        ], { concurrency: "unbounded" });
+        expect(Option.getOrThrow(yield* store.getRun(run.id))).toMatchObject({ status: "queued", settled_at: null });
+        expect((yield* store.listUserMessages(run.id, 0)).map((e) => e.message)).toEqual(["one more thing"]);
+      }),
+    );
+
+    it.effect("continues a settled run as its next turn, with the user's message", () =>
       Effect.gen(function* () {
         const store = yield* Store;
         const sql = yield* SqlClient.SqlClient;
@@ -352,13 +405,14 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
         // Not finished yet: messages go to the live agent instead.
         expect(Option.isNone(yield* store.continueRun(run.id, "too soon"))).toBe(true);
         yield* store.finishRun(run.id, "failed", "boom");
+        expect(Option.getOrThrow(yield* store.settleRun(run.id, id)).settled_at).toBeInstanceOf(Date);
 
         const queued = Option.getOrThrow(yield* store.continueRun(run.id, "try again"));
         expect(queued.status).toBe("queued");
-        expect(queued).toMatchObject({ execution: null, recovering: false, claimed_by: null, heartbeat_at: null });
+        expect(queued).toMatchObject({ execution: null, recovering: false, claimed_by: null, heartbeat_at: null, settled_at: null });
         expect((yield* store.listUserMessages(run.id, 0)).map((e) => e.message)).toEqual(["try again"]);
         const claimed = Option.getOrThrow(yield* store.claimNextRun("w"));
-        expect(claimed).toMatchObject({ id: run.id, turns: 2, error: null, finished_at: null });
+        expect(claimed).toMatchObject({ id: run.id, turns: 2, error: null, finished_at: null, settled_at: null });
       }),
     );
 

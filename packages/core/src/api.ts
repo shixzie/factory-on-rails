@@ -110,6 +110,8 @@ export const ApiRun = Schema.Struct({
   createdAt: Schema.Date,
   startedAt: Schema.NullOr(Schema.Date),
   finishedAt: Schema.NullOr(Schema.Date),
+  /** The user settled this thread; cleared when a follow-up starts another turn. */
+  settledAt: Schema.optionalWith(Schema.NullOr(Schema.Date), { default: () => null }),
   /** The agent asked a question and is waiting for the user's answer. */
   awaitingInput: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   sandboxState: Schema.optionalWith(SandboxState, { default: () => "none" as const }),

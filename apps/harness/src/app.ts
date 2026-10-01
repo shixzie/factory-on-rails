@@ -68,6 +68,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   createdAt: r.created_at,
   startedAt: r.started_at,
   finishedAt: r.finished_at,
+  settledAt: r.settled_at,
   awaitingInput: r.awaiting_input,
   sandboxState: r.sandbox_state,
   lastActivityAt: r.last_activity_at,
@@ -435,6 +436,18 @@ const routes = HttpRouter.empty.pipe(
       if (Option.isNone(diff)) return yield* fail(404, "not_found", "This run has not changed any files yet.");
       const { patch, truncated, updated_at } = diff.value;
       return yield* json(Api.ApiRunDiff)({ patch, truncated, updatedAt: updated_at });
+    }),
+  ),
+
+  HttpRouter.post(
+    "/api/runs/:id/settle",
+    Effect.gen(function* () {
+      const { user, run } = yield* ownedRun;
+      const settled = yield* (yield* Store).settleRun(run.id, user.id);
+      if (Option.isNone(settled)) {
+        return yield* fail(409, "bad_request", "Wait until this thread has stopped and no longer needs input before settling it.");
+      }
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(settled.value));
     }),
   ),
 
