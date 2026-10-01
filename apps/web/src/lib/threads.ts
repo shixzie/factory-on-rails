@@ -19,6 +19,7 @@ export function isThreadActive(run: Pick<Api.ApiRun, "status" | "awaitingInput">
 
 export function isThreadSettled(run: Api.ApiRun): boolean {
   if (isThreadActive(run)) return false;
+  if (run.settledAt) return true;
   const prs = threadPullRequests(run);
   return prs.length > 0 && prs.every((pr) => pr.state === "merged");
 }
@@ -47,8 +48,9 @@ export function sidebarThreads(runs: readonly Api.ApiRun[], selectedId: string |
     const group = repos.get(run.repo) ?? { repo: run.repo, recent: [], settled: [], activeCount: 0 };
     repos.set(run.repo, group);
     if (isThreadActive(run)) group.activeCount++;
-    // Keep the thread being read visible even when it has just settled.
-    else if (isThreadSettled(run) && run.id !== selectedId) group.settled.push(run);
+    // Automatic settlement keeps the thread being read visible; an explicit
+    // settlement moves it into history immediately, even when selected.
+    else if (isThreadSettled(run) && (run.settledAt || run.id !== selectedId)) group.settled.push(run);
     else group.recent.push(run);
   }
   return { active, repos: [...repos.values()] };

@@ -520,7 +520,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {run.task}
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground" suppressHydrationWarning>
+                <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground">
                   <span>{run.repo}</span>
                   <span>·</span>
                   <span>{Api.AGENT_LABELS[run.agent]}</span>
@@ -532,7 +532,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                   <GitBranchIcon className="size-3" />
                   <span>{run.branch ? `${run.baseBranch} ← ${run.branch}` : run.baseBranch}</span>
                   <span>·</span>
-                  <span>{ago(run.createdAt)}</span>
+                  <span suppressHydrationWarning>{ago(run.createdAt)}</span>
                 </div>
               </div>
 

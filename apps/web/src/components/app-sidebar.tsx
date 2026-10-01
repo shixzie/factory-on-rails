@@ -6,6 +6,7 @@ import {
   FolderGit2Icon,
   FolderPlusIcon,
   LogOutIcon,
+  LoaderCircleIcon,
   MonitorIcon,
   MoonIcon,
   PlusIcon,
@@ -14,9 +15,10 @@ import {
   SunIcon,
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { Logo } from "@/components/logo";
 import { NewThreadLink } from "@/components/new-thread-link";
 import { ThreadPullRequestStatus } from "@/components/pull-request-status";
@@ -54,7 +56,7 @@ import {
 } from "@/components/ui/sidebar";
 import { api, runInBrowser, type Api } from "@/lib/api";
 import { runTitle, shortAge } from "@/lib/format";
-import { sidebarThreads, threadActivityLabel, visibleRecentThreads, type RepoThreads } from "@/lib/threads";
+import { isThreadActive, sidebarThreads, threadActivityLabel, visibleRecentThreads, type RepoThreads } from "@/lib/threads";
 import { cn } from "@/lib/utils";
 
 const RUNS_PER_REPO = 6;
@@ -62,6 +64,11 @@ const RUNS_PER_REPO = 6;
 /** Refresh across every page, including when a PR merges after its run has finished. */
 function useSidebarRuns(initial: readonly Api.ApiRun[]) {
   const [runs, setRuns] = useState(initial);
+  const revision = useRef(0);
+  const updateRun = useCallback((run: Api.ApiRun) => {
+    revision.current++;
+    setRuns((current) => current.map((item) => item.id === run.id ? run : item));
+  }, []);
   useEffect(() => {
     setRuns(initial);
     let stopped = false;
@@ -69,9 +76,11 @@ function useSidebarRuns(initial: readonly Api.ApiRun[]) {
     const refresh = async () => {
       if (document.visibilityState === "hidden" || pending) return;
       pending = true;
+      const startedAtRevision = revision.current;
       try {
         const result = await runInBrowser(api.runs);
-        if (!stopped && result._tag === "Right") setRuns(result.right);
+        // A poll started before a settlement must not undo the saved change.
+        if (!stopped && revision.current === startedAtRevision && result._tag === "Right") setRuns(result.right);
       } finally {
         pending = false;
       }
@@ -86,10 +95,27 @@ function useSidebarRuns(initial: readonly Api.ApiRun[]) {
       document.removeEventListener("visibilitychange", refresh);
     };
   }, [initial]);
-  return runs;
+  return { runs, updateRun };
 }
 
-function RecentThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string | null }) {
+function RecentThread({ run, selectedId, onSettled }: { run: Api.ApiRun; selectedId: string | null; onSettled?: (run: Api.ApiRun) => void }) {
+  const [settling, setSettling] = useState(false);
+  const canSettle = onSettled && !isThreadActive(run) && !run.settledAt;
+  const settle = async () => {
+    if (!onSettled || settling) return;
+    setSettling(true);
+    try {
+      const result = await runInBrowser(api.settleRun(run.id), { timeoutMs: 15_000 });
+      if (result._tag === "Left") {
+        toast.error(result.left.message);
+        return;
+      }
+      onSettled(result.right);
+      toast.success("Thread settled");
+    } finally {
+      setSettling(false);
+    }
+  };
   return (
     <SidebarMenuSubItem>
       <SidebarMenuSubButton
@@ -98,7 +124,7 @@ function RecentThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string
         className="h-auto min-h-11 flex-col items-stretch gap-1 py-1.5 pr-1.5"
         title={runTitle(run, 200)}
       >
-        <span className="flex min-w-0 items-center gap-2">
+        <span className={cn("flex min-w-0 items-center gap-2", canSettle && "pr-7")}>
           <StatusDot status={run.status} awaiting={run.awaitingInput} />
           <span className="truncate">{runTitle(run, 60)}</span>
           <span className="sr-only">{threadActivityLabel(run)}</span>
@@ -110,6 +136,19 @@ function RecentThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string
           </span>
         </span>
       </SidebarMenuSubButton>
+      {canSettle ? (
+        <button
+          type="button"
+          onClick={() => void settle()}
+          disabled={settling}
+          aria-busy={settling}
+          aria-label={`Settle thread: ${runTitle(run, 200)}`}
+          title="Settle thread"
+          className="absolute top-1 right-1 flex size-7 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring disabled:cursor-wait disabled:opacity-100 group-hover/menu-sub-item:opacity-100 group-focus-within/menu-sub-item:opacity-100 md:opacity-0 [@media(hover:none)]:opacity-100"
+        >
+          {settling ? <LoaderCircleIcon className="size-3.5 animate-spin" aria-hidden /> : <ArchiveIcon className="size-3.5" aria-hidden />}
+        </button>
+      ) : null}
     </SidebarMenuSubItem>
   );
 }
@@ -142,12 +181,12 @@ function ActiveThread({ run, selectedId }: { run: Api.ApiRun; selectedId: string
   );
 }
 
-function RepoRuns({ group, activeRunId }: { group: RepoThreads; activeRunId: string | null }) {
+function RepoRuns({ group, activeRunId, onSettled }: { group: RepoThreads; activeRunId: string | null; onSettled: (run: Api.ApiRun) => void }) {
   const [expanded, setExpanded] = useState(false);
   const [owner, name] = group.repo.split("/");
   const shown = visibleRecentThreads(group.recent, expanded, activeRunId, RUNS_PER_REPO);
   const hiddenCount = group.recent.length - shown.length;
-  const hasSelected = group.recent.some((r) => r.id === activeRunId);
+  const hasSelected = [...group.recent, ...group.settled].some((r) => r.id === activeRunId);
   return (
     <Collapsible defaultOpen render={<SidebarMenuItem />} className="group/collapsible">
       <CollapsibleTrigger
@@ -171,7 +210,7 @@ function RepoRuns({ group, activeRunId }: { group: RepoThreads; activeRunId: str
       </SidebarMenuAction>
       <CollapsibleContent>
         <SidebarMenuSub className="mr-0 pr-0">
-          {shown.map((run) => <RecentThread key={run.id} run={run} selectedId={activeRunId} />)}
+          {shown.map((run) => <RecentThread key={run.id} run={run} selectedId={activeRunId} onSettled={onSettled} />)}
           {hiddenCount > 0 || expanded ? (
             <SidebarMenuSubItem>
               <SidebarMenuSubButton
@@ -253,9 +292,14 @@ function UserMenu({ me }: { me: Api.Me }) {
 
 export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.ApiRun> }) {
   const pathname = usePathname();
+  const router = useRouter();
   const activeRunId = pathname.startsWith("/runs/") ? (pathname.split("/")[2] ?? null) : null;
-  const currentRuns = useSidebarRuns(runs);
+  const { runs: currentRuns, updateRun } = useSidebarRuns(runs);
   const { active, repos: groups } = useMemo(() => sidebarThreads(currentRuns, activeRunId), [currentRuns, activeRunId]);
+  const onSettled = (run: Api.ApiRun) => {
+    updateRun(run);
+    router.refresh();
+  };
 
   return (
     <Sidebar collapsible="offcanvas" variant="inset">
@@ -308,7 +352,7 @@ export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.A
             ) : (
               <SidebarMenu>
                 {groups.map((group) => (
-                  <RepoRuns key={group.repo} group={group} activeRunId={activeRunId} />
+                  <RepoRuns key={group.repo} group={group} activeRunId={activeRunId} onSettled={onSettled} />
                 ))}
               </SidebarMenu>
             )}

@@ -65,6 +65,7 @@ export const api = {
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/pull-requests`, { url }), Api.ApiRun),
   renameRun: (id: string, title: string) =>
     call(json("PATCH", `/api/runs/${encodeURIComponent(id)}`, { title }), Api.ApiRun),
+  settleRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/settle`), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),
   keys: call(HttpClientRequest.get("/api/settings/keys"), Schema.Array(Api.ApiKeySlot)),
   saveKey: (provider: string, key: string) =>
