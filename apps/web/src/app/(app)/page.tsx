@@ -42,9 +42,6 @@ export default function NewRunPage({ searchParams }: Props) {
         <div className="flex flex-col items-center gap-3 text-center">
           <Logo className="size-9 rounded-lg [&_svg]:size-5" />
           <h1 className="text-xl font-medium tracking-tight">What should the factory build?</h1>
-          <p className="max-w-md text-sm text-muted-foreground">
-            Each run gets its own Railway sandbox, works on a fresh branch, and comes back as a pull request.
-          </p>
         </div>
         <Suspense fallback={<ComposerSkeleton />}>
           <NewRunComposer searchParams={searchParams} />

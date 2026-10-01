@@ -101,6 +101,12 @@ Recovery requires Railway to retain the sandbox and its command sessions;
 explicit cancellation still stops the work. See the
 [run lifecycle](docs/architecture.md#the-harness-and-the-run-lifecycle).
 
+### Image attachments
+
+Paste or drop PNG, JPEG, WebP, or GIF images into either composer, or use its attachment button. A task or follow-up can include up to four images, each at most 5 MiB, with or without text. Images stay in the conversation and are delivered to the agent as files in its sandbox. Only the run's owner can view them, and they are deleted with the run.
+
+Apply migration `013_run_images.sql` before deploying the updated harness and runner; the harness runs migrations before it deploys.
+
 ### Run model and reasoning effort
 
 The new-run composer lets you choose a model and reasoning/thinking effort beside the agent picker. Choose a preset or enter a custom model ID. Default model and Default effort leave the agent’s own configuration in control. Choices are saved with the run, displayed in its details, reused for follow-up turns and PR descriptions, and prefilled for your next run. Switching agents resets both choices.

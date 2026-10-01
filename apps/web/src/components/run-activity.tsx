@@ -22,6 +22,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AttachedImages } from "@/components/composer-images";
 import { DiffLines, DiffStat } from "@/components/diff-view";
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
@@ -650,12 +651,14 @@ function Question({
  * them, the questions it asked and what you told it.
  */
 export function RunActivity({
+  runId,
   blocks,
   live,
   onAnswer,
   sending,
   focusAgent,
 }: {
+  runId: string;
   blocks: Block[];
   live: boolean;
   onAnswer: (text: string) => void;
@@ -699,6 +702,7 @@ export function RunActivity({
               <div key={block.id} className="flex flex-col items-end gap-1">
                 <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {block.text}
+                  <AttachedImages runId={runId} images={block.images ?? []} />
                 </div>
                 <span className="text-[11px] text-muted-foreground" suppressHydrationWarning>
                   {ago(block.at)}

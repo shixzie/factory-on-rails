@@ -36,7 +36,7 @@ export interface SandboxHandle {
   /** Cancel a saved command, including one this runner has not reattached to yet. */
   readonly stopSession: (sessionName: string) => Effect.Effect<void, SandboxError>;
   /** `mode` defaults to 0644; secrets go in with 0600. */
-  readonly writeFile: (path: string, content: string, mode?: number) => Effect.Effect<void, SandboxError>;
+  readonly writeFile: (path: string, content: string | Uint8Array, mode?: number) => Effect.Effect<void, SandboxError>;
 }
 
 /** A saved copy of a sandbox's disk, which a new sandbox can boot from. */
@@ -201,7 +201,7 @@ const attempt = <A>(context: string, f: () => Promise<A>) =>
 export interface SandboxLike {
   readonly id: string;
   exec(command: ExecTarget, options: RailwayExecOptions): SandboxExecHandle;
-  readonly files: { write(path: string, content: string, options?: { mode?: number }): Promise<unknown> };
+  readonly files: { write(path: string, content: string | Uint8Array, options?: { mode?: number }): Promise<unknown> };
 }
 
 interface SandboxExecHandle extends PromiseLike<ExecResult> {

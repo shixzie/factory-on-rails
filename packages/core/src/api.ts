@@ -34,6 +34,22 @@ export const SANDBOX_IDLE_STOP_MINUTES = 5;
 /** A run with no activity for this long is deleted, with its sandbox. */
 export const RUN_RETENTION_DAYS = 7;
 
+/** Images attached to a single task or follow-up message. */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_IMAGES = 4;
+export const ImageMediaType = Schema.Literal("image/png", "image/jpeg", "image/webp", "image/gif");
+export type ImageMediaType = typeof ImageMediaType.Type;
+export const ImageUpload = Schema.Struct({
+  name: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(255)),
+  mediaType: ImageMediaType,
+  /** Canonical base64, without a data URL prefix. */
+  data: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4 * Math.ceil(MAX_IMAGE_BYTES / 3))),
+});
+export type ImageUpload = typeof ImageUpload.Type;
+export const ImageAttachment = Schema.Struct({ id: Schema.UUID, name: Schema.String, mediaType: ImageMediaType });
+export type ImageAttachment = typeof ImageAttachment.Type;
+const ImageUploads = Schema.Array(ImageUpload).pipe(Schema.maxItems(MAX_IMAGES));
+
 export const ApiUser = Schema.Struct({
   login: Schema.String,
   name: Schema.NullOr(Schema.String),
@@ -93,6 +109,7 @@ export const ApiRun = Schema.Struct({
   repo: Schema.String,
   baseBranch: Schema.String,
   task: Schema.String,
+  images: Schema.optional(Schema.Array(ImageAttachment)),
   /** A short name for the run (generated from the task, or the user's). Null until one exists: show `task` instead. */
   title: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   /** The user named the run themselves. */
@@ -185,7 +202,7 @@ export type RunEventsPage = typeof RunEventsPage.Type;
  * A message to the agent: an answer to its question or new direction while it
  * runs, or, once it has finished, the next turn of the conversation.
  */
-export const SendMessageBody = Schema.Struct({ text: Schema.String });
+export const SendMessageBody = Schema.Struct({ text: Schema.String, images: Schema.optional(ImageUploads) });
 export type SendMessageBody = typeof SendMessageBody.Type;
 
 /** One provider a user can bring a key for, and the key saved for it (never the key itself). */
@@ -209,6 +226,7 @@ export const CreateRunBody = Schema.Struct({
   installationId: Schema.Number,
   repo: Schema.String,
   task: Schema.String,
+  images: Schema.optional(ImageUploads),
   baseBranch: Schema.optional(Schema.String),
   agent: Schema.optional(AgentId),
   model: Schema.optional(Schema.NullOr(ModelId)),

@@ -1,6 +1,7 @@
 import { HttpApp } from "@effect/platform";
 import { SqlClient } from "@effect/sql";
 import {
+  Api,
   decrypt,
   GitHubError,
   GitHubUserApi,
@@ -338,6 +339,60 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
 
     await post(`/api/runs/${created.id}/cancel`, owner.cookie);
     expect(detail.run).toMatchObject({ sandboxState: "none" });
+  });
+
+  it("stores pasted images for tasks and follow-ups and only serves them to the run owner", async () => {
+    const owner = await signIn("image-owner", 981);
+    const other = await signIn("image-other", 982);
+    const image = {
+      name: "screenshot.png", mediaType: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aC2kAAAAASUVORK5CYII=",
+    };
+    await run(Effect.flatMap(Store, (s) => s.setSandboxSnapshot(owner.user.id, "node-base")));
+    const previousRepos = github.repos;
+    github.repos = [{ id: 1, full_name: "image/repo", name: "repo", private: true, default_branch: "main", html_url: "h" }];
+    try {
+      const res = await post("/api/runs", owner.cookie, { installationId: 1, repo: "image/repo", task: "", images: [image] });
+      expect(res.status).toBe(201);
+      const created = await json(res);
+      expect(created).toMatchObject({ task: "Please use the attached images.", images: [{ id: expect.any(String), name: image.name, mediaType: image.mediaType }] });
+      expect(JSON.stringify(created)).not.toContain(image.data);
+      const path = `/api/runs/${created.id}/images/${created.images[0].id}`;
+      const download = await request(path, { headers: { cookie: owner.cookie } });
+      expect(download.status).toBe(200);
+      expect(download.headers.get("content-type")).toBe("image/png");
+      expect(Buffer.from(await download.arrayBuffer()).toString("base64")).toBe(image.data);
+      expect((await request(path)).status).toBe(401);
+      expect((await request(path, { headers: { cookie: other.cookie } })).status).toBe(404);
+      const otherRun = await run(Effect.flatMap(Store, (s) => s.enqueueRun({
+        user_id: owner.user.id, installation_id: 1, repo_full_name: "image/repo", base_branch: "main", task: "other",
+      })));
+      expect((await request(`/api/runs/${otherRun.id}/images/${created.images[0].id}`, { headers: { cookie: owner.cookie } })).status).toBe(404);
+
+      expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "", images: [image] })).status).toBe(201);
+      let page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(page.events).toEqual([expect.objectContaining({ message: "Please use the attached images.", data: { images: [{ id: expect.any(String), name: image.name, mediaType: image.mediaType }] } })]);
+      expect(JSON.stringify(page)).not.toContain(image.data);
+      await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'succeeded' where id = ${created.id}`));
+      expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "next", images: [image] })).status).toBe(201);
+      page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(page.run.status).toBe("queued");
+      expect(page.events).toHaveLength(2);
+      expect(await run(Effect.flatMap(Store, (s) => s.listRunImages(created.id)))).toHaveLength(3);
+
+      for (const images of [
+        [{ ...image, data: "not base64" }],
+        [{ ...image, mediaType: "image/jpeg" }],
+        [{ ...image, mediaType: "image/svg+xml" }],
+        Array.from({ length: Api.MAX_IMAGES + 1 }, () => image),
+      ]) {
+        expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "bad image", images })).status).toBe(400);
+        expect((await post("/api/runs", owner.cookie, { installationId: 1, repo: "image/repo", task: "bad image", images })).status).toBe(400);
+      }
+      expect(await run(Effect.flatMap(Store, (s) => s.listRunImages(created.id)))).toHaveLength(3);
+    } finally {
+      github.repos = previousRepos;
+    }
   });
 
   it("lets only the owner settle an idle thread and persists its settlement", async () => {
