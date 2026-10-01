@@ -4,7 +4,8 @@
  * command output grouped into work logs, questions the agent asked, messages
  * the user sent, and the agent's closing result.
  */
-import type { ApiRunEvent } from "@factory/core/api";
+import { eventImages } from "./composer-images";
+import type { ImageAttachment, ApiRunEvent } from "@factory/core/api";
 
 /** The tool the agent calls to ask the user something (the factory's MCP server in the sandbox). */
 export const ASK_USER_TOOL = "mcp__factory__ask_user";
@@ -48,7 +49,7 @@ export type WorkItem =
 export type Block =
   | { type: "work"; id: string; items: WorkItem[] }
   | { type: "message"; id: string; text: string }
-  | { type: "user"; id: string; text: string; at: Date }
+  | { type: "user"; id: string; text: string; at: Date; images?: readonly ImageAttachment[] }
   | { type: "question"; id: string; call: ToolCall }
   | { type: "result"; id: string; text: string; isError: boolean; turns?: number; durationMs?: number; costUsd?: number };
 
@@ -153,7 +154,7 @@ export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
         break;
       }
       case "user_message":
-        blocks.push({ type: "user", id: e.id, text: e.message, at: e.at });
+        blocks.push({ type: "user", id: e.id, text: e.message, at: e.at, ...(data.images ? { images: eventImages(data) } : {}) });
         break;
       case "agent_result":
         blocks.push({

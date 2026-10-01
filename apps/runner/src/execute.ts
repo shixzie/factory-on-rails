@@ -5,6 +5,7 @@ import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
 import { makeCodexParser } from "./codex-stream.js";
 import type { AgentCommands, PreviewSettings } from "./config.js";
+import { materializeImage, messageImages, withImages } from "./images.js";
 import {
   AGENT_RAN_FILE,
   CODEX_AUTH_SCRIPT,
@@ -332,13 +333,32 @@ const work = (
     }
     keep = true;
 
-    const messages = pending.map((m) => m.message);
+    // Recreate every attachment on each connection, including checkpoint restores
+    // and recovery of an already-running command whose prompt is frozen.
+    const materialized = new Set<string>();
+    const syncImages = Effect.gen(function* () {
+      for (const image of yield* store.listRunImages(run.id)) {
+        if (materialized.has(image.id)) continue;
+        yield* materializeImage(sandbox, image);
+        materialized.add(image.id);
+      }
+    });
+    const requireImages = (images: ReturnType<typeof messageImages>) => Effect.gen(function* () {
+      if (images.some((image) => !materialized.has(image.id))) yield* syncImages;
+      if (images.some((image) => !materialized.has(image.id))) {
+        return yield* new SandboxError({ message: "Could not find an image attached to the user's message" });
+      }
+    });
+    yield* syncImages;
+    yield* requireImages([...(run.images ?? []), ...pending.flatMap(messageImages)]);
+    const messages = pending.map((m) => withImages(m.message, messageImages(m)));
+    const task = withImages(run.task, run.images);
     const prompt = followUp
-      ? followUpPrompt({ task: run.task, messages: messages.length > 0 ? messages : ["Carry on."], continuing })
-      : run.task;
+      ? followUpPrompt({ task, messages: messages.length > 0 ? messages : ["Carry on."], continuing })
+      : task;
     if (!execution.sessions.agent) {
       if (!execution.prompt) {
-        execution.prompt = { text: prompt, commitMessage: commitMessage(messages[0] ?? run.task, run.id), deliveredMessageId: String(pending.at(-1)?.id ?? run.delivered_message_id) };
+        execution.prompt = { text: prompt, commitMessage: commitMessage(pending[0]?.message ?? run.task, run.id), deliveredMessageId: String(pending.at(-1)?.id ?? run.delivered_message_id) };
         yield* updateExecution();
       }
       yield* sandbox.writeFile(TASK_FILE, execution.prompt.text);
@@ -371,8 +391,10 @@ const work = (
     let awaiting = run.awaiting_input ?? false;
     const syncInbox = Effect.gen(function* () {
       for (const message of yield* store.listUserMessages(run.id, delivered)) {
+        const images = messageImages(message);
+        yield* requireImages(images);
         const result = yield* sandbox.exec(withHome(deliverMessageScript(message.id.padStart(16, "0"))), {
-          env: { FACTORY_MESSAGE: JSON.stringify({ text: message.message, at: message.at }) },
+          env: { FACTORY_MESSAGE: JSON.stringify({ text: withImages(message.message, images), at: message.at }) },
           timeoutSec: 30,
         });
         if (result.exitCode !== 0) return;

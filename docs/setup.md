@@ -160,7 +160,7 @@ also run on the sign-in inside a sandbox snapshot (step 7).
 
 ### MCP servers
 
-Apply migration `013_user_mcp_servers.sql` before deploying this feature (the
+Apply migration `014_user_mcp_servers.sql` before deploying this feature (the
 harness runs migrations before deployment).
 
 Open **Settings → MCP servers → Add MCP server**. Give the server a unique name

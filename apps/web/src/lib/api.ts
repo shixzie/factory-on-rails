@@ -57,8 +57,8 @@ export const api = {
     ),
   createRun: (body: Api.CreateRunBody) => call(json("POST", "/api/runs", body), Api.ApiRun),
   runDiff: (id: string) => call(HttpClientRequest.get(`/api/runs/${encodeURIComponent(id)}/diff`), Api.ApiRunDiff),
-  sendMessage: (id: string, text: string) =>
-    call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
+  sendMessage: (id: string, text: string, images?: readonly Api.ImageUpload[]) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text, images }), Api.ApiRun),
   openPreview: (id: string, body: Api.OpenPreviewBody) =>
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/previews`, body), Api.PreviewLink),
   linkPullRequest: (id: string, url: string) =>

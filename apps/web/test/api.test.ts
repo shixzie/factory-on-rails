@@ -105,3 +105,22 @@ describe("MCP settings requests", () => {
     });
   });
 });
+
+describe("image attachment requests", () => {
+  it("sends image content for both new runs and follow-up messages", async () => {
+    vi.stubGlobal("window", { location: { origin: "https://factory.example" } });
+    const fetch = vi.fn(async (_url: unknown, _init: RequestInit) => Response.json({
+      id: "run/1", repo: "acme/app", baseBranch: "main", task: "Use the image", status: "queued",
+      branch: null, pullRequestUrl: null, error: null,
+      createdAt: "2026-09-01T00:00:00.000Z", startedAt: null, finishedAt: null,
+    }));
+    vi.stubGlobal("fetch", fetch);
+    const images = [{ name: "screenshot.png", mediaType: "image/png" as const, data: "aGVsbG8=" }];
+
+    expect((await runInBrowser(api.createRun({ installationId: 1, repo: "acme/app", task: "Use the image", images })))._tag).toBe("Right");
+    expect((await runInBrowser(api.sendMessage("run/1", "", images)))._tag).toBe("Right");
+    expect(await new Response(fetch.mock.calls[0]?.[1].body).json()).toMatchObject({ task: "Use the image", images });
+    expect(String(fetch.mock.calls[1]?.[0])).toBe("https://factory.example/api/runs/run%2F1/messages");
+    expect(await new Response(fetch.mock.calls[1]?.[1].body).json()).toEqual({ text: "", images });
+  });
+});

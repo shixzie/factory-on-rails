@@ -19,6 +19,8 @@ import {
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
+import { AttachedImages, ImageDrafts, ImagePicker } from "@/components/composer-images";
+import { useComposerImages } from "@/hooks/use-composer-images";
 import { ChangedFiles, DiffPane, DiffStat, useDiffFiles } from "@/components/diff-view";
 import { PageHeader } from "@/components/page-header";
 import { PreviewPane } from "@/components/preview-pane";
@@ -81,13 +83,14 @@ function MessageComposer({
   disabled: boolean;
   sending: boolean;
   stopping: boolean;
-  onSend: (text: string) => Promise<boolean>;
+  onSend: (text: string, images?: readonly Api.ImageUpload[]) => Promise<boolean>;
   onStop: () => void;
 }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
-  const empty = text.trim().length === 0;
-  const canSend = !disabled && !sending && !empty;
+  const images = useComposerImages(disabled || sending);
+  const empty = text.trim().length === 0 && images.images.length === 0;
+  const canSend = !disabled && !sending && !empty && !images.reading;
   // With nothing typed, a live run's send button stops it instead, as in t3code.
   const showStop = live && empty && !sending;
   useEffect(() => {
@@ -95,10 +98,14 @@ function MessageComposer({
   }, [question]);
   const submit = async () => {
     if (!canSend) return;
-    if (await onSend(text)) setText("");
+    if (await onSend(text, images.uploads)) {
+      setText("");
+      images.clear();
+    }
   };
   return (
     <form
+      {...images.dragHandlers}
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
@@ -107,9 +114,12 @@ function MessageComposer({
         "mx-auto w-full max-w-3xl rounded-lg border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
         question && "border-warning/50",
         disabled && "opacity-60",
+        images.dragging && "border-primary bg-accent/40 ring-2 ring-primary/20",
       )}
     >
+      <ImageDrafts images={images} disabled={disabled || sending} />
       <textarea
+        onPaste={images.onPaste}
         ref={ref}
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -119,7 +129,7 @@ function MessageComposer({
             void submit();
           }
         }}
-        disabled={disabled}
+        disabled={disabled || sending}
         rows={2}
         placeholder={
           question ? "Answer the agent's question…" : working ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
@@ -128,6 +138,7 @@ function MessageComposer({
         className="field-sizing-content block max-h-60 min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
       />
       <div className="flex items-center gap-2 px-2.5 pb-2.5">
+        <ImagePicker images={images} disabled={disabled || sending} />
         <span className="min-w-0 px-1.5 text-[11px] text-muted-foreground">
           {question
             ? "The agent is waiting for you."
@@ -402,9 +413,9 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
       else setRun(result.right);
     });
 
-  const send = async (text: string) => {
+  const send = async (text: string, images?: readonly Api.ImageUpload[]) => {
     setSending(true);
-    const result = await runInBrowser(api.sendMessage(run.id, text));
+    const result = await runInBrowser(api.sendMessage(run.id, text, images));
     setSending(false);
     if (result._tag === "Left") {
       toast.error(result.left.message);
@@ -519,6 +530,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
               <div className="flex flex-col items-end gap-1.5">
                 <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {run.task}
+                  <AttachedImages runId={run.id} images={run.images ?? []} />
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground">
                   <span>{run.repo}</span>
@@ -536,7 +548,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 </div>
               </div>
 
-              <RunActivity blocks={blocks} live={agentWorking} onAnswer={send} sending={sending} focusAgent={focusAgent} />
+              <RunActivity runId={run.id} blocks={blocks} live={agentWorking} onAnswer={send} sending={sending} focusAgent={focusAgent} />
 
               {active ? (
                 <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
@@ -586,11 +598,6 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
               onSend={send}
               onStop={cancel}
             />
-            {!active ? (
-              <p className="mx-auto mt-2 max-w-3xl px-1 text-center text-[11px] text-muted-foreground/80">
-                Runs are deleted after {Api.RUN_RETENTION_DAYS} days without activity, along with their sandbox.
-              </p>
-            ) : null}
           </div>
         </div>
 

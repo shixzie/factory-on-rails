@@ -34,6 +34,40 @@ describe.skipIf(!testDatabaseUrl)("Store (Postgres)", () => {
       }),
     );
 
+    it.effect("keeps image bytes separate from tasks and messages, and deletes them with the run", () =>
+      Effect.gen(function* () {
+        const store = yield* Store;
+        const sql = yield* SqlClient.SqlClient;
+        const { id } = yield* user;
+        const image = { name: "screen.png", mediaType: "image/png" as const, data: "aW1hZ2U=" };
+        const run = yield* store.enqueueRun({
+          user_id: id, repo_full_name: "o/r", installation_id: 7, base_branch: "main", task: "see image", images: [image],
+        });
+        expect(run.images).toEqual([{ id: expect.any(String), name: image.name, mediaType: image.mediaType }]);
+        expect(JSON.stringify(run)).not.toContain(image.data);
+        expect(Option.getOrThrow(yield* store.getRun(run.id)).images).toEqual(run.images);
+        const stored = yield* store.listRunImages(run.id);
+        expect(stored).toEqual([{ id: run.images![0]!.id, run_id: run.id, name: image.name, media_type: image.mediaType, data: image.data }]);
+        expect(yield* store.getRunImage(run.id, stored[0]!.id)).toEqual(Option.some(stored[0]!));
+
+        yield* store.addUserMessage(run.id, "another image", [image]);
+        const messages = yield* store.listUserMessages(run.id, 0);
+        expect(messages[0]!.data).toEqual({ images: [{ id: expect.any(String), name: image.name, mediaType: image.mediaType }] });
+        expect(JSON.stringify(messages)).not.toContain(image.data);
+        expect(yield* store.listRunImages(run.id)).toHaveLength(2);
+        expect(yield* store.continueRun(run.id, "not finished", [image])).toEqual(Option.none());
+        expect(yield* store.listRunImages(run.id)).toHaveLength(2);
+        yield* sql`update runs set status = 'succeeded' where id = ${run.id}`;
+        expect(Option.isSome(yield* store.continueRun(run.id, "next turn", [image]))).toBe(true);
+        expect(yield* store.listRunImages(run.id)).toHaveLength(3);
+        expect(yield* store.listUserMessages(run.id, 0)).toHaveLength(2);
+
+        yield* sql`update runs set status = 'succeeded', last_activity_at = now() - interval '8 days' where id = ${run.id}`;
+        expect(yield* store.deleteExpiredRun(run.id, 7)).toBe(true);
+        expect(yield* store.listRunImages(run.id)).toEqual([]);
+      }),
+    );
+
     it.effect("backfills existing PR links when upgrading the database", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;

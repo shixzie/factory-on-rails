@@ -4,6 +4,7 @@ import { Duration, Effect, Fiber, Layer, TestClock, Option, Redacted } from "eff
 import { ExecInterruptedError } from "railway";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
+import { imagePath, withImages } from "../src/images.js";
 import {
   HAS_SESSION_MARKER,
   MAX_DIFF_BYTES,
@@ -960,6 +961,129 @@ describe("executeRun", () => {
       expect(flags).toEqual([{ awaiting_input: true }, { awaiting_input: false }]);
     }),
   );
+
+  describe("image attachments", () => {
+    const image = { id: "aabbccdd-0000-4000-8000-000000000000", name: "Design.png", mediaType: "image/png" as const };
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff]);
+    const storedImage = { id: image.id, run_id: run.id, name: image.name, media_type: image.mediaType, data: bytes.toString("base64") };
+
+    for (const id of ["claude", "codex"] as const) {
+      it.effect(`makes original images available before starting ${id}`, () =>
+        Effect.gen(function* () {
+          const store = recordingStore();
+          store.images.push(storedImage);
+          const sandboxes = fakeSandboxes({
+            "run-agent": () => Effect.sync(() => {
+              expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+              return {};
+            }),
+          });
+          const { outcome, events } = yield* execute(sandboxes, store, { agent: { ...agent, id } }, { turn: { ...run, images: [image] } });
+          expect(outcome.status).toBe("succeeded");
+          expect(sandboxes.state.files["/workspace/TASK.md"]).toBe(withImages(run.task, [image]));
+          expect(events.join("\n")).not.toContain(storedImage.data);
+        }),
+      );
+    }
+
+    it.effect("recreates original and follow-up images when restoring or replacing a sandbox", () =>
+      Effect.gen(function* () {
+        const laterImage = { ...image, id: "11223344-0000-4000-8000-000000000000" };
+        for (const restored of [true, false]) {
+          const store = withMessage();
+          store.userMessages[0]!.data = { images: [laterImage] };
+          store.images.push(storedImage, { ...storedImage, id: laterImage.id });
+          const sandboxes = fakeSandboxes({}, restored ? { checkpoints: { cp_9: "run-x" } } : { failRestore: "checkpoint missing" });
+          const turn = followUp({ images: [image], sandbox_state: "stopped", sandbox_checkpoint_id: "cp_9", sandbox_checkpoint_name: "run-x" });
+          const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+          expect(outcome.status).toBe("succeeded");
+          expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+          expect(sandboxes.state.binaryFiles[imagePath(laterImage)]).toEqual(bytes);
+          const prompt = sandboxes.state.files["/workspace/TASK.md"]!;
+          expect(prompt).toContain(withImages(run.task, [image]));
+          expect(prompt).toContain(withImages("Also add a license", [laterImage]));
+          expect(store.updates).toContainEqual({ delivered_message_id: "5" });
+        }
+      }),
+    );
+
+    it.effect("restores images before reconnecting to an interrupted agent", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        store.images.push(storedImage);
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.sync(() => {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+            return {};
+          }),
+        }, { alive: ["sbx_live"] });
+        const turn: RunRow = { ...run, images: [image], recovering: true, sandbox_id: "sbx_live", sandbox_state: "running", execution: { checkout: "resume", sessions: { agent: { name: "live-agent", startedAt: Date.now() } } } };
+        const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.attachments).toContain("live-agent");
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBeUndefined();
+      }),
+    );
+
+    it.effect("stops before the agent or delivery marker when an original or pending image is missing", () =>
+      Effect.gen(function* () {
+        for (const followup of [false, true]) {
+          const store = recordingStore();
+          if (followup) {
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "Use this", data: { images: [image] } });
+          }
+          const sandboxes = fakeSandboxes();
+          const turn = followup ? followUp({}) : { ...run, images: [image] };
+          const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+          expect(outcome.status).toBe("failed");
+          expect(sandboxes.state.commands.some((command) => command.includes("run-agent"))).toBe(false);
+          expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+        }
+      }),
+    );
+
+    it.live("uploads newly received images before handing their message to the live agent", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.gen(function* () {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toBeUndefined();
+            store.images.push(storedImage);
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "", data: { images: [image] } });
+            yield* Effect.sleep("100 millis");
+            return {};
+          }),
+          "FACTORY_MESSAGE": () => Effect.sync(() => {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+            expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+            return {};
+          }),
+        });
+        yield* execute(sandboxes, store, { inboxEvery: "10 millis" });
+        const delivered = sandboxes.state.commands.findIndex((command) => command.includes("FACTORY_MESSAGE"));
+        expect(delivered).toBeGreaterThan(0);
+        expect(JSON.parse(sandboxes.state.envs[delivered]!.FACTORY_MESSAGE!).text).toBe(withImages("", [image]));
+        expect(store.updates).toContainEqual({ delivered_message_id: "7" });
+      }),
+    );
+
+    it.live("keeps an image message pending when its upload fails", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.gen(function* () {
+            store.images.push(storedImage);
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "Use this", data: { images: [image] } });
+            yield* Effect.sleep("50 millis");
+            return {};
+          }),
+        }, { failWrite: "/images/" });
+        yield* execute(sandboxes, store, { inboxEvery: "10 millis" });
+        expect(sandboxes.state.commands.some((command) => command.includes("FACTORY_MESSAGE"))).toBe(false);
+        expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+      }),
+    );
+  });
 
   describe("a later turn", () => {
     it.effect("continues the agent's session in the sandbox the last turn left running", () =>

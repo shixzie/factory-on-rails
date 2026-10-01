@@ -34,6 +34,20 @@ const stillCreating = () =>
   new ExecInterruptedError({ closeCode: 1008, reason: "Sandbox is not running (status: CREATING). ", stdout: "", stderr: "" });
 
 describe("wrapSandbox", () => {
+  it.effect("uploads image bytes through the SDK without text conversion", () =>
+    Effect.gen(function* () {
+      const uploaded: unknown[][] = [];
+      const sandbox: SandboxLike = {
+        id: "sbx",
+        exec: () => handle(Promise.resolve({ exitCode: 0, stdout: "", timedOut: false })),
+        files: { write: async (...args) => { uploaded.push(args); } },
+      };
+      const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff]);
+      yield* wrapSandbox(sandbox).writeFile("/workspace/.factory/images/image.png", bytes, 0o600);
+      expect(uploaded).toEqual([["/workspace/.factory/images/image.png", bytes, { mode: 0o600 }]]);
+    }),
+  );
+
   it.effect("streams output and returns the result", () =>
     Effect.gen(function* () {
       const chunks: string[] = [];

@@ -606,7 +606,7 @@ replace the built-in question tool.
   a stopped one boots from, `last_activity_at`, `turns`, and the last user
   message handed to the agent.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
-- `user_mcp_servers` and `mcp_oauth_states` (`013_user_mcp_servers.sql`):
+- `user_mcp_servers` and `mcp_oauth_states` (`014_user_mcp_servers.sql`):
   owner-scoped MCP configuration, encrypted credentials and short-lived,
   single-use OAuth state tied to the connection revision.
 - `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):

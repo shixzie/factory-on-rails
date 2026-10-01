@@ -331,7 +331,7 @@ export function AppSidebar({ me, runs }: { me: Api.Me; runs: ReadonlyArray<Api.A
               <span className="ml-2 rounded bg-info/10 px-1.5 text-[10px] font-semibold text-info">{active.length}</span>
             </SidebarGroupLabel>
             <SidebarGroupContent>
-              <SidebarMenu>
+              <SidebarMenu className="gap-2">
                 {active.map((run) => <ActiveThread key={run.id} run={run} selectedId={activeRunId} />)}
               </SidebarMenu>
             </SidebarGroupContent>
