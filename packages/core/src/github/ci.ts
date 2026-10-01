@@ -9,7 +9,7 @@ export interface CiCheck {
 }
 
 const Check = Schema.Struct({ name: Schema.String, status: Schema.String, conclusion: Schema.NullOr(Schema.String), html_url: Schema.NullOr(Schema.String) });
-const Suite = Schema.Struct({ id: Schema.Number, status: Schema.String, conclusion: Schema.NullOr(Schema.String) });
+const Suite = Schema.Struct({ id: Schema.Number, status: Schema.String, conclusion: Schema.NullOr(Schema.String), latest_check_runs_count: Schema.optional(Schema.Number) });
 const Workflow = Schema.Struct({ id: Schema.Number, name: Schema.NullOr(Schema.String), status: Schema.String, conclusion: Schema.NullOr(Schema.String), html_url: Schema.String });
 const Status = Schema.Struct({ context: Schema.String, state: Schema.String, target_url: Schema.NullOr(Schema.String) });
 
@@ -31,10 +31,14 @@ export const readCiChecks = (client: HttpClient.HttpClient, token: Redacted.Reda
       checks.push(...result.check_runs.map((c) => ({ name: c.name, state: checkState(c.status, c.conclusion), url: c.html_url })));
       if (result.check_runs.length < 100) break;
     }
-    // A third-party suite may be queued before its individual checks exist.
+    // Suites can report work before its individual checks exist.
     for (let page = 1; ; page++) {
       const result = yield* get(`commits/${encodeURIComponent(sha)}/check-suites?per_page=100&page=${page}`, Schema.Struct({ check_suites: Schema.Array(Suite) }));
       for (const suite of result.check_suites) {
+        // GitHub automatically queues empty suites for installed apps, even
+        // when those apps never create checks. They are not evidence of CI.
+        // Actual queued Actions workflows are read separately below.
+        if (suite.status === "queued" && suite.latest_check_runs_count === 0) continue;
         // Completed empty suites can have no conclusion and no checks to run.
         if (suite.status === "completed" && suite.conclusion === null) continue;
         const state = checkState(suite.status, suite.conclusion);
