@@ -40,7 +40,7 @@ export default function NewRunPage({ searchParams }: Props) {
       </PageHeader>
       <div className="flex flex-1 flex-col items-center justify-center gap-8 px-4 pb-[12vh]">
         <div className="flex flex-col items-center gap-3 text-center">
-          <Logo className="size-9 rounded-lg [&_svg]:size-5" />
+          <Logo className="size-9" />
           <h1 className="text-xl font-medium tracking-tight">What should the factory build?</h1>
         </div>
         <Suspense fallback={<ComposerSkeleton />}>

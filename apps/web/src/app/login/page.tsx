@@ -18,7 +18,7 @@ export default async function LoginPage({ searchParams }: Props) {
   return (
     <main className="flex min-h-svh flex-col items-center justify-center px-4">
       <div className="flex w-full max-w-sm flex-col items-center gap-6 text-center">
-        <Logo className="size-10 rounded-xl [&_svg]:size-5" />
+        <Logo className="size-10" />
         <div className="flex flex-col gap-2">
           <h1 className="text-xl font-medium tracking-tight">Factory on Rails</h1>
           <p className="text-sm text-muted-foreground">

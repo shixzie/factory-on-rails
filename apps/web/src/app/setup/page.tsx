@@ -58,7 +58,7 @@ export default async function SetupPage({ searchParams }: Props) {
     <main className="flex min-h-svh flex-col items-center px-4 py-16">
       <div className="flex w-full max-w-lg flex-col gap-6">
         <div className="flex flex-col items-center gap-4 text-center">
-          <Logo className="size-10 rounded-xl [&_svg]:size-5" />
+          <Logo className="size-10" />
           <div className="flex flex-col gap-2">
             <h1 className="text-xl font-medium tracking-tight">Set up Factory on Rails</h1>
             <p className="text-sm text-muted-foreground">
