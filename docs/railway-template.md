@@ -32,11 +32,12 @@ between services, the public domain, and a generated encryption key.
    (the `main` branch). Name them exactly `web`, `harness`, `runner` and
    `Postgres`: the variables below refer to each other by those names.
 3. Fill in each service's **Settings** and **Variables** as listed.
-4. **Create Template**, then on the Templates page open it, copy its URL (it
+4. In the template's details, upload `apps/web/public/logo.svg` as its icon
+   and use the overview text at the end of this page.
+5. **Create Template**, then on the Templates page open it, copy its URL (it
    ends in the template code, for example `/new/template/AbCdEf`), and put the
    code in the README's Deploy button.
-5. Optional: **Publish** it to the marketplace with the overview text at the
-   end of this page, category "AI/ML".
+6. Optional: **Publish** it to the marketplace, category "AI/ML".
 
 ### Postgres
 
@@ -60,7 +61,7 @@ over the private network.
 | Variable | Value | Description |
 |---|---|---|
 | `ALLOWED_GITHUB_LOGINS` | *(empty, required)* | Your GitHub username. Only these accounts can sign in, and the GitHub App must belong to one of them. Comma-separate several; add an organization's name to create the App under it. After setup you can set `*` to let any GitHub account in. |
-| `TOKEN_ENCRYPTION_KEY` | `${{secret(43, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}=` | Encrypts GitHub tokens, users' model keys and the App's credentials. Generated; don't change it after deploy. |
+| `TOKEN_ENCRYPTION_KEY` | `${{secret(43, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}=` | Encrypts GitHub tokens, users' model keys and MCP credentials, and the App's credentials. Generated; don't change it after deploy. |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | |
 | `PUBLIC_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | The address people use. Change it if you add a custom domain. |
 | `PORT` | `8080` | |
@@ -143,12 +144,13 @@ describes. For reference, the service it adds:
 # Deploy and Host Factory on Rails with Railway
 
 Factory on Rails is a self-hosted software factory. Sign in with GitHub, pick
-a repository, describe a change, and a coding agent (Claude Code or Codex) does the work
-in its own Railway sandbox and opens a pull request. You can follow the agent
-live, answer its questions and keep the conversation going. When it's done,
-the agent writes the pull request's title and description itself, and with an
-optional wildcard domain you can open the app it's running in its sandbox,
-privately.
+a repository, describe a change, and a coding agent (Claude Code or Codex) does
+the work in its own Railway sandbox and opens a pull request. You can follow
+the agent live, answer its questions, attach screenshots and keep the
+conversation going. The agent writes the PR's title and description, waits for
+CI and fixes failing checks itself. Users bring their own tools as MCP
+servers, and with an optional wildcard domain can open the app the agent is
+running in its sandbox, privately.
 
 ## About Hosting Factory on Rails
 
@@ -165,11 +167,12 @@ workspace.
 - Hand small, well-defined changes to a coding agent and review them as PRs
 - Run several agents in parallel, each isolated in its own sandbox
 - Give a team one place to queue agent work against its repositories
+- Let agents keep a PR's CI green without anyone babysitting it
 
 ## Dependencies for Factory on Rails Hosting
 
 - A GitHub account (for the GitHub App and sign-in)
-- A model credential per user: a Claude subscription token, an Anthropic API key, or an OpenAI API key
+- A model credential per user: a Claude subscription token, an Anthropic API key, a ChatGPT sign-in, or an OpenAI API key
 - Railway Sandboxes
 
 ### Deployment Dependencies

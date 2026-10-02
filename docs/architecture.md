@@ -420,7 +420,8 @@ show up the same way on the run page.
 | ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` |
 | Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` |
 | Output parser | `agent-stream.ts` | `codex-stream.ts` |
-| Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY` |
+| Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY`, or a ChatGPT sign-in (`CODEX_AUTH_JSON`, written to `~/.codex/auth.json`) |
+| Model and effort | `--model`, `--effort` | `--model`, `-c model_reasoning_effort=…` |
 
 Codex prints `thread.started`, `turn.*` and `item.*` events. Each item maps
 onto the Claude Code tool it stands for, so the run page, the subagent cards
@@ -431,6 +432,29 @@ becomes `TodoWrite`, `web_search` becomes `WebSearch`, a `spawn_agent` call
 becomes `Agent`, and `file_change`, which names the files a patch touched but
 not its lines, becomes `FileChange` (the Diff panel has the lines). Its hooks
 take the same JSON as Claude Code's, so the inbox hook serves both.
+
+### Model and reasoning effort
+
+The new-run composer picks a model (a preset or any model id) and a reasoning
+effort next to the agent; "Default" leaves the agent's own configuration in
+charge. Both are saved with the run (`009_run_model_effort.sql`), reused for
+follow-up turns and the PR write-up, prefilled for the user's next run, and
+reset when the agent changes. A preset grants no access: what works depends
+on the user's account and the installed CLI.
+
+The runner passes them to the agent command as `FACTORY_MODEL` and
+`FACTORY_REASONING_EFFORT` (empty for the default), plus
+`FACTORY_CODEX_EFFORT`, the whole quoted `-c` assignment for Codex or empty.
+A custom `AGENT_COMMAND`, `CODEX_COMMAND` or describe command must use them
+itself, quoted, as the defaults do.
+
+### Images
+
+A task or follow-up can carry up to four PNG, JPEG, WebP or GIF images of at
+most 5 MiB each, pasted, dropped or attached in the composer. They are stored
+in Postgres (`run_images`, `013_run_images.sql`), shown only to the run's
+owner, written into the sandbox as files the agent's prompt points to, and
+deleted with the run.
 
 ## Watching and talking to the agent
 
