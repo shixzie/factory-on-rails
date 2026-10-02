@@ -1,13 +1,12 @@
 import { Store, type RunEvent } from "@factory/core";
+import type { SqlError } from "@effect/sql";
 import { Duration, Effect, Schedule, type Scope } from "effect";
 
 /** Replaces every occurrence of each secret with a marker. */
 export function redact(message: string, secrets: Iterable<string>): string {
-  let out = message;
-  for (const secret of secrets) {
-    if (secret) out = out.split(secret).join("[redacted]");
-  }
-  return out;
+  const patterns = [...secrets].filter(Boolean).sort((a, b) => b.length - a.length)
+    .map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return patterns.length === 0 ? message : message.replace(new RegExp(patterns.join("|"), "g"), "[redacted]");
 }
 
 /** Kinds that count toward a run's output budget: everything the agent produces. */
@@ -25,10 +24,12 @@ export interface RunLog {
    * stored. A secret split across two output chunks can slip through, so this
    * is a safety net, not a guarantee.
    */
-  readonly addSecret: (value: string) => void;
+  readonly addSecret: (value: string, options?: { readonly allowShort?: boolean }) => void;
   readonly info: (message: string) => Effect.Effect<void>;
   readonly error: (message: string) => Effect.Effect<void>;
   readonly flush: Effect.Effect<void>;
+  /** Flushes before a durable checkpoint; failure keeps the batch queued and must not be ignored. */
+  readonly flushDurable?: Effect.Effect<void, SqlError.SqlError>;
 }
 
 /**
@@ -49,9 +50,20 @@ export const makeRunLog = (
     let outputBytes = 0;
     let truncated = false;
 
+    // Redact values before serialization: arbitrary MCP credentials can contain
+    // quotes and newlines, which would either escape matching or corrupt JSON.
+    const scrubData = (value: unknown): unknown => {
+      if (typeof value === "string") return redact(value, secrets);
+      if (Array.isArray(value)) return value.map(scrubData);
+      if (typeof value === "object" && value !== null) {
+        return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, scrubData(nested)]));
+      }
+      return value;
+    };
+
     const push = (kind: RunEvent["kind"], raw: string, rawData?: RunEvent["data"]) => {
       const message = redact(raw, secrets);
-      const data = rawData == null ? null : (JSON.parse(redact(JSON.stringify(rawData), secrets)) as RunEvent["data"]);
+      const data = rawData == null ? null : scrubData(rawData) as RunEvent["data"];
       if (BUDGETED.has(kind)) {
         if (truncated) return;
         outputBytes += Buffer.byteLength(message) + (data ? Buffer.byteLength(JSON.stringify(data)) : 0);
@@ -70,13 +82,22 @@ export const makeRunLog = (
       pending.push(data ? { kind, message, data } : { kind, message });
     };
 
-    const flush = lock.withPermits(1)(
-      Effect.suspend(() => {
-        const batch = pending;
-        pending = [];
-        return batch.length === 0 ? Effect.void : store.appendEvents(runId, batch);
-      }),
-    ).pipe(Effect.catchAllCause((cause) => Effect.logError("Could not store run events", cause)));
+    const flushDurable = lock.withPermits(1)(
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const batch = pending;
+          pending = [];
+          return batch;
+        }),
+        (batch) => batch.length === 0 ? Effect.void : store.appendEvents(runId, batch),
+        (batch, exit) => Effect.sync(() => {
+          // Output can arrive while the insert is in flight. Restore the old
+          // batch before it, including when scope shutdown interrupted a flush.
+          if (exit._tag === "Failure") pending = [...batch, ...pending];
+        }),
+      ),
+    );
+    const flush = flushDurable.pipe(Effect.catchAllCause((cause) => Effect.logError("Could not store run events", cause)));
 
     yield* Effect.addFinalizer(() => flush);
     yield* flush.pipe(Effect.repeat(Schedule.spaced(flushEvery)), Effect.forkScoped);
@@ -84,11 +105,15 @@ export const makeRunLog = (
     return {
       push,
       redact: (text) => redact(text, secrets),
-      addSecret: (value) => {
-        if (value.length >= 8) secrets.add(value);
+      addSecret: (value, options) => {
+        if (value.length >= (options?.allowShort ? 1 : 8)) {
+          secrets.add(value);
+          secrets.add(JSON.stringify(value).slice(1, -1));
+        }
       },
       info: (message) => Effect.sync(() => push("info", message)),
       error: (message) => Effect.sync(() => push("error", message)),
       flush,
+      flushDurable,
     };
   });

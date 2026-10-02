@@ -24,6 +24,7 @@ const url = new URL(process.env.FACTORY_PREVIEW_URL);
 const tokenFile = process.env.FACTORY_PREVIEW_TOKEN_FILE;
 const pidFile = process.env.FACTORY_PREVIEW_PID_FILE;
 const scanMs = Number(process.env.FACTORY_PREVIEW_SCAN_MS) || 2000;
+const reportMs = Number(process.env.FACTORY_PREVIEW_REPORT_MS) || 30000;
 // Dial this host:port instead of the URL's own (tests and local development).
 const dial = process.env.FACTORY_PREVIEW_CONNECT ? new URL("tcp://" + process.env.FACTORY_PREVIEW_CONNECT) : url;
 
@@ -114,11 +115,15 @@ function describe(pid) {
 }
 
 let lastPorts = "";
+let lastReportAt = 0;
 function scanPorts(force) {
   const sockets = listeningSockets();
   const key = [...sockets.keys()].sort((a, b) => a - b).join(",");
-  if (key === lastPorts && !force) return;
+  // An older gateway can finish clearing metadata after our new connection
+  // reports its ports. Periodic reports repair that rolling-deploy race.
+  if (key === lastPorts && !force && Date.now() - lastReportAt < reportMs) return;
   lastPorts = key;
+  lastReportAt = Date.now();
   const names = processNames(new Set(sockets.values()));
   const ports = [...sockets.entries()]
     .sort((a, b) => a[0] - b[0])

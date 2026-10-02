@@ -74,9 +74,9 @@ All application code is written with Effect 3:
   components and in the browser. React stays plain React.
 - **Resources and cancellation.** A turn's sandbox is a scoped resource
   (`acquireRelease`): once it holds the checkout it is kept for the next turn,
-  and before that it is destroyed however the turn ends. Cancelling a run, or
-  stopping the runner, interrupts the fiber, which kills the command in the
-  sandbox.
+  and an interrupted turn keeps it while its saved commands await recovery.
+  Explicit cancellation kills the command. Runner shutdown detaches from saved
+  command sessions and releases the run so another runner can reconnect.
 - **Tests** use `@effect/vitest`.
 
 ## The web app
@@ -128,6 +128,10 @@ read on 2026-12-01, so this repo does not use it.
   web app reaches it at `harness.railway.internal:8080`.
 - The harness runs database migrations as its pre-deploy command, so a failed
   migration stops the deploy instead of shipping a broken schema.
+  Apply `011_run_recovery.sql` before starting the updated runner; independent
+  service deploys must preserve that ordering. The first upgrade cannot retrofit
+  recovery onto commands started by the old runner, which still kills its
+  commands on shutdown. Subsequent runner deploys preserve saved sessions.
 - `.github/workflows/railway-config.yml` uses `railwayapp/config@v1`: every PR
   that touches `.railway/` gets a plan comment, and merging applies exactly the
   reviewed plan. It skips itself until the `RAILWAY_TOKEN` secret exists.
@@ -151,7 +155,10 @@ Railway environment. The runner uses the SDK (`import { Sandbox } from "railway"
    refuse with "status: CREATING" (close code 1008) just after the API reports RUNNING.
 2. `sandbox.exec(...)` to check the sandbox can reach GitHub, clone, run the
    agent, commit and push, with `onStdout` / `onStderr` streaming into
-   `run_events`. Every command starts with `export HOME="${HOME:-/root}"`,
+   `run_events`. The runner saves each main step's session name and result in
+   Postgres, then reattaches to that session after a disconnect or deployment.
+   Replayed structured agent events are deduplicated. Every command starts with
+   `export HOME="${HOME:-/root}"`,
    because exec can start a shell without HOME and git needs it, and exports
    the current GitHub token as `GH_TOKEN` (see below).
 3. `sandbox.files.write(...)` for the task text, commit message and token, so
@@ -292,8 +299,9 @@ flowchart LR
 ## The harness and the run lifecycle
 
 A **run** is one conversation against one repository in one sandbox. Each
-time the runner picks it up is a **turn**: the first does the task, and each
-later one answers the messages the user sent since.
+new task or follow-up starts a **turn**: the first does the task, and each
+later one answers the messages the user sent since. Reconnecting to an
+interrupted turn preserves its turn number and start time.
 
 ```
 queued ──▶ running ──▶ succeeded | failed ──(user sends a message)──▶ queued
@@ -307,7 +315,7 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
 2. A runner replica claims it with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)`,
    so any number of runner replicas can share the queue without double-claiming.
 3. The runner mints an installation token scoped to that one repository
-   (contents and pull requests write), creates the sandbox, clones the base
+   (contents and pull requests write; checks, statuses and actions read), creates the sandbox, clones the base
    branch, and checks out `factory/run-<id>`.
 4. It runs the run's agent in the repo: `AGENT_SETUP_COMMAND` and
    `AGENT_COMMAND` for Claude Code, in headless mode
@@ -318,14 +326,27 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    shown as a log.
 5. It commits whatever the agent left uncommitted and pushes the branch if it
    moved. The same agent then writes the pull request (see "Pull request
-   text" below), and the runner opens it. The sandbox stays up for the next
-   turn.
+   text" below), and the runner opens it. The runner polls check runs, check
+   suites, workflows and commit statuses for the published SHA. Failures resume
+   the agent with diagnostics; its fixes are pushed and checked again before
+   the run can succeed. Passing CI or a merged PR immediately leaves the agent
+   idle, including interrupting an automatic repair if checks turn green or
+   the PR is merged while it works. PR description updates happen before the
+   next CI wait and are skipped or interrupted on success. A closed, unmerged PR
+   does not count as merged. An unchanged follow-up still verifies CI. Missing CI
+   gets a 60-second discovery period; unreadable CI, a timeout or an agent
+   unable to produce a fix fails the run. The sandbox stays up for the next turn.
 6. The runner heartbeats every 10 seconds. If a user cancels, the heartbeat
    sees `cancelling` and interrupts the run, which kills the agent process.
-   When a runner is stopped (redeploy, scale down), it interrupts its runs
-   the same way and marks them failed. If a runner dies without stopping
-   cleanly, another replica's reaper fails its runs. Either way the sandbox
-   is kept, so a message picks the run up again.
+   On graceful shutdown (redeploy, scale down), the runner detaches from its
+   saved command sessions and releases its claims. Another runner reconnects
+   in the same sandbox and continues the same turn automatically. A forced
+   exit waits until its heartbeat is older than `STALE_RUN_SECONDS` (180 by
+   default), then the reaper releases the claim. Ownership checks prevent the
+   old runner from updating or finishing a replacement's run. Pending
+   cancellation survives either handoff. Recovery depends on Railway's
+   retained command sessions; a lost sandbox or missing session cannot resume
+   its running process.
 7. A message to a finished run (`POST /api/runs/:id/messages`) queues it
    again. On that turn the agent continues its Claude Code session
    (`claude --continue`, signalled by `FACTORY_CONTINUE`) with the new
@@ -334,6 +355,20 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    title and description the agent writes again to cover the whole branch;
    if that pull request was merged or closed, a new one is opened. A run that
    finishes while a message is still unread goes straight back to the queue.
+
+### Thread pull requests
+
+A thread retains every associated PR in `runs.pull_request_urls`, exposed as
+`pullRequestUrls` in the API. Publishing a new PR appends its URL atomically;
+repeat publications keep one link per PR. Migration 010 preserves existing
+links. The singular `pull_request_url` remains the runner's current PR for
+follow-up work and is still returned as `pullRequestUrl` for older clients.
+
+The thread header's PRs menu lists all links and lets the owner associate an
+existing GitHub PR using `POST /api/runs/:id/pull-requests` with `{ "url": "…" }`.
+Manual associations do not change the runner's branch or current PR. Links
+are validated as GitHub PR URLs, normalized, and deduplicated; linking does
+not check the PR's existence or change it on GitHub.
 
 ### Pull request text
 
@@ -516,13 +551,16 @@ key under **Settings**, and it is used for their runs only.
   provider. The UI only ever shows the last four characters.
 - Providers: an Anthropic API key and a Claude subscription token (from
   `claude setup-token`, which bills the user's Pro, Max, Team or Enterprise
-  plan) for Claude Code, and an OpenAI API key for Codex.
+  plan) for Claude Code; a Codex ChatGPT device-login document and an OpenAI
+  API key for Codex.
 - The harness refuses to queue a run whose agent has no credential (unless
   the user picked a sandbox snapshot, which can carry the agent's sign-in)
   and sends them to Settings. The runner decrypts the one credential the
   run's agent should use when it picks the run up and injects it under its
-  env var, so the agent CLI in the sandbox bills that user's account. Only
-  one goes in: Claude Code prefers an API key over a subscription token, so
+  env var, so the agent CLI in the sandbox bills that user's account. A saved
+  ChatGPT login is written to `~/.codex/auth.json` for the user's sandbox and
+  is removed before checkpoints are saved. Only the selected credential goes
+  in: Claude Code prefers an API key over a subscription token, so
   a saved subscription token is passed alone.
 - Providers and agents live in `packages/core/src/providers.ts`. Adding one
   is a new entry there with its env var and key check.
@@ -531,13 +569,42 @@ key under **Settings**, and it is used for their runs only.
   platform's network, stopped after a few idle minutes and deleted with the
   run after a week without activity.
 
+## MCP connections
+
+Users manage persistent MCP connections in **Settings → MCP servers**. The
+harness exposes authenticated, owner-scoped CRUD endpoints under
+`/api/settings/mcp`. A connection is either an HTTP endpoint with no auth,
+bearer auth or OAuth, or a stdio executable and argument list. Secret header
+values, environment variables, bearer tokens and OAuth state are encrypted with
+the same `TOKEN_ENCRYPTION_KEY` used for model credentials. Public responses
+contain only configuration, saved secret names and authentication status.
+
+OAuth begins at `POST /api/settings/mcp/:id/oauth` and returns a provider
+authorization URL. The callback at `/auth/mcp/callback` saves the authorization
+and returns to Settings. The flow uses discovery and dynamic client
+registration against public HTTPS endpoints; private-network OAuth endpoints
+and manually provisioned OAuth clients are not supported. Removing
+saved authorization does not revoke a provider-side grant.
+
+The runner reads the owner's enabled connections before launching an agent
+turn, including follow-ups in an existing thread, and merges them with the
+built-in `factory` MCP server for Claude Code and Codex. Changes apply at the
+next launch, while an already running command keeps its configuration. The
+runner refreshes expired OAuth access tokens when a refresh token is available.
+A long-running agent may need another turn when its access token expires.
+Changing a connection's destination or authentication configuration clears its
+previous credentials so secrets cannot be silently sent to a different server.
+Local commands execute inside the thread's sandbox and must be available in
+that environment. MCP names reserve `factory` so user configuration cannot
+replace the built-in question tool.
+
 ## Data model
 
 `packages/core/migrations/001_init.sql`:
 
 - `users`: GitHub identity plus encrypted user tokens.
 - `sessions`: hashed session tokens with expiry.
-- `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat).
+- `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat and owner).
 - `run_events`: append-only log per run: runner steps, command output, and the agent's messages, tool calls and results, plus messages from the user (`003_run_activity.sql`).
 - `run_diffs`: the latest diff of each run's branch against its base commit.
 - `runs` also tracks its sandbox between turns (`004_sandbox_lifecycle.sql`):
@@ -545,6 +612,9 @@ key under **Settings**, and it is used for their runs only.
   a stopped one boots from, `last_activity_at`, `turns`, and the last user
   message handed to the agent.
 - `user_api_keys`: each user's encrypted model API keys (bring your own key).
+- `user_mcp_servers` and `mcp_oauth_states` (`014_user_mcp_servers.sql`):
+  owner-scoped MCP configuration, encrypted credentials and short-lived,
+  single-use OAuth state tied to the connection revision.
 - `runs.agent` and `users.sandbox_snapshot` (`005_agents_and_snapshots.sql`):
   the agent a run uses, and the snapshot a user's runs start from.
 - `runs.title` and `runs.title_by_user` (`007_run_titles.sql`): the run's
@@ -555,6 +625,10 @@ key under **Settings**, and it is used for their runs only.
 - `runs.preview_ports` and `runs.preview_seen_at` (`008_previews.sql`): the
   ports listening in the sandbox while its preview agent is connected, and
   when someone last used a preview.
+- `runs.execution` and `runs.recovering` (`011_run_recovery.sql`): saved command
+  sessions and turn context, and whether the next claim resumes an interrupted
+  turn. Structured events carry replay keys so reconnecting does not duplicate
+  the conversation.
 
 ## What this foundation does not do yet
 

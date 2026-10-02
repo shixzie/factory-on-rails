@@ -22,6 +22,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AttachedImages } from "@/components/composer-images";
 import { DiffLines, DiffStat } from "@/components/diff-view";
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
@@ -137,7 +138,7 @@ function Todos({ todos }: { todos: TodoItem[] }) {
 /** One tool call as a single line (verb and target), expanding to its input and output. */
 function ToolLine({ call, live, latestPlan }: { call: ToolCall; live: boolean; latestPlan: boolean }) {
   const { input, result } = call;
-  const status = !result ? (live ? "pending" : undefined) : result.isError ? "error" : "done";
+  const status = !result ? (live && !call.stoppedAt ? "pending" : undefined) : result.isError ? "error" : "done";
   const output = result?.text ? <Pre tone={result.isError ? "error" : undefined}>{result.text}</Pre> : null;
   const common = { status: status as "pending" | "error" | "done" | undefined };
 
@@ -416,7 +417,7 @@ function WorkItems({ items, ctx }: { items: WorkItem[]; ctx: WorkContext }) {
 /** A run of work between the agent's messages. */
 function WorkGroup({ items, ctx }: { items: WorkItem[]; ctx: WorkContext }) {
   return (
-    <div className="rounded-xl border bg-card/40 px-3 py-1.5">
+    <div className="rounded-lg border bg-card/40 px-3 py-1.5">
       <WorkItems items={items} ctx={ctx} />
     </div>
   );
@@ -429,7 +430,7 @@ function ToolStrip({ calls, live }: { calls: ToolCall[]; live: boolean }) {
   return (
     <span className="flex h-2.5 items-end gap-[2px]" aria-hidden>
       {shown.map((c, i) => {
-        const pending = !c.result && live;
+        const pending = !c.result && !c.stoppedAt && live;
         return (
           <span
             key={c.id}
@@ -465,8 +466,8 @@ function SubagentCard({ call, ctx }: { call: ToolCall; ctx: WorkContext }) {
   const color = laneColor(lane);
   const children = call.children ?? [];
   const tools = children.filter((c): c is ToolCall => c.type === "tool");
-  const running = !result && ctx.runLive;
-  const stopped = !result && !ctx.runLive;
+  const running = !result && !call.stoppedAt && ctx.runLive;
+  const stopped = !result && !running;
   const lastTool = tools.at(-1);
   const now = running && lastTool ? describeCall(lastTool.name, lastTool.input) : undefined;
   const [open, setOpen] = useState(false);
@@ -618,9 +619,9 @@ function Question({
 }) {
   const question = s(call.input.question);
   const options = Array.isArray(call.input.options) ? call.input.options.filter((o): o is string => typeof o === "string") : [];
-  const waiting = !call.result && live;
+  const waiting = !call.result && !call.stoppedAt && live;
   return (
-    <div className={cn("rounded-xl border px-4 py-3", waiting ? "border-warning/40 bg-warning/5" : "bg-card/40")}>
+    <div className={cn("rounded-lg border px-4 py-3", waiting ? "border-warning/40 bg-warning/5" : "bg-card/40")}>
       <div className="mb-1.5 flex items-center gap-2 text-xs font-medium text-muted-foreground">
         <MessageCircleQuestionIcon className={cn("size-3.5", waiting && "text-warning")} />
         {waiting ? "The agent is waiting for your answer" : call.result ? "The agent asked" : "The agent asked (no answer)"}
@@ -650,12 +651,14 @@ function Question({
  * them, the questions it asked and what you told it.
  */
 export function RunActivity({
+  runId,
   blocks,
   live,
   onAnswer,
   sending,
   focusAgent,
 }: {
+  runId: string;
   blocks: Block[];
   live: boolean;
   onAnswer: (text: string) => void;
@@ -697,8 +700,9 @@ export function RunActivity({
           case "user":
             return (
               <div key={block.id} className="flex flex-col items-end gap-1">
-                <div className="max-w-[85%] rounded-2xl rounded-br-md border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
+                <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {block.text}
+                  <AttachedImages runId={runId} images={block.images ?? []} />
                 </div>
                 <span className="text-[11px] text-muted-foreground" suppressHydrationWarning>
                   {ago(block.at)}

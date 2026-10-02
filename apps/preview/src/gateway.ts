@@ -87,16 +87,18 @@ export function makeGateway(options: GatewayOptions) {
 
   // ---- pages the gateway answers itself -------------------------------------------
 
-  const page = (res: ServerResponse, status: number, title: string, body: string, runId?: string) => {
+  const page = (res: ServerResponse, status: number, title: string, body: string, runId?: string, retrySeconds?: number) => {
     const link = runId ? `<p><a href="${webUrl}/runs/${runId}" target="_top">Back to the run</a></p>` : "";
     res.writeHead(status, {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
       "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self' ${webUrl}`,
       "referrer-policy": "no-referrer",
+      ...(retrySeconds ? { "retry-after": String(retrySeconds) } : {}),
     });
     res.end(
       `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+        (retrySeconds ? `<meta http-equiv="refresh" content="${retrySeconds}">` : "") +
         `<title>${escape(title)}</title>` +
         `<style>:root{color-scheme:light dark}body{font:14px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:Canvas;color:CanvasText}` +
         `main{max-width:28rem;padding:24px}h1{font-size:16px;margin:0 0 8px}p{margin:0 0 8px;opacity:.8}a{color:inherit}</style>` +
@@ -104,7 +106,7 @@ export function makeGateway(options: GatewayOptions) {
     );
   };
 
-  const noTunnel = async (res: ServerResponse, runId: string) => {
+  const noTunnel = async (req: IncomingMessage, res: ServerResponse, runId: string) => {
     const state = await backend.sandboxState(runId).catch(() => undefined);
     if (state === "stopped" || state === "stopping") {
       return page(
@@ -120,8 +122,11 @@ export function makeGateway(options: GatewayOptions) {
         res,
         503,
         "Waiting for the sandbox",
-        "The sandbox is running but its preview connection is not up. It connects at the start of each turn, so send the agent a message if this persists.",
+        "The sandbox is still running. Its preview connection is reconnecting. " +
+          (req.method === "GET" ? "This page will retry automatically." : "Try again once the preview reconnects."),
         runId,
+        // Only a navigation can refresh safely; never replay a submitted form.
+        req.method === "GET" ? 2 : undefined,
       );
     }
     return page(res, 404, "No sandbox", "This run has no sandbox right now. Send the agent a message to start one.", runId);
@@ -301,7 +306,7 @@ export function makeGateway(options: GatewayOptions) {
       return page(res, 401, "Open this preview from its run", "Previews are private to the person who started the run.", run);
     }
     const tunnel = tunnels.get(run);
-    if (!tunnel) return void noTunnel(res, run);
+    if (!tunnel) return void noTunnel(req, res, run);
     touch(run);
     proxy(req, res, tunnel, port);
   });

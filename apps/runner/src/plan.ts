@@ -131,7 +131,21 @@ export function resumeScript(p: { repo: string }): string {
 }
 
 /** Run before a sandbox is checkpointed, so the saved disk holds no token. */
-export const SCRUB_SCRIPT = `rm -f ${TOKEN_FILE} ${PREVIEW_TOKEN_FILE}`;
+export const SCRUB_SCRIPT = [
+  `rm -f ${TOKEN_FILE} ${PREVIEW_TOKEN_FILE} ${FACTORY_DIR}/mcp.json ${FACTORY_DIR}/codex-config`,
+  // A saved auth document is restored from encrypted storage next turn. Do
+  // not bake it into a Railway checkpoint (or remove snapshot-only auth).
+  'if [ -n "${CODEX_AUTH_JSON:-}" ]; then rm -f "$HOME/.codex/auth.json"; fi',
+].join("\n");
+
+/** Installs a saved ChatGPT device-login document where Codex reads it. */
+export const CODEX_AUTH_SCRIPT = [
+  'if [ -n "${CODEX_AUTH_JSON:-}" ]; then',
+  '  mkdir -p "$HOME/.codex"',
+  '  printf %s "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"',
+  '  chmod 600 "$HOME/.codex/auth.json"',
+  "fi",
+].join("\n");
 
 /**
  * Starts the preview agent in the background, detached from the exec session

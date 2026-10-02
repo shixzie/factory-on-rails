@@ -1,4 +1,4 @@
-import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
+import { HttpIncomingMessage, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import {
   agentCredential,
   AGENTS,
@@ -28,8 +28,11 @@ import { Effect, Option, Redacted, Schema } from "effect";
 import { beginLogin, completeLogin, logout, requireUser, userAccessToken } from "./auth.js";
 import { HarnessConfig } from "./config.js";
 import { fail } from "./errors.js";
+import { PullRequestStatuses } from "./pull-requests.js";
 import { appInstallUrl, setupRoutes } from "./setup.js";
 import { generateRunTitle } from "./titles.js";
+import { mcpRoutes } from "./mcp.js";
+import { validateImages } from "./images.js";
 
 /**
  * The harness is the web app's API and auth backend. Pages live in apps/web,
@@ -53,20 +56,31 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   repo: r.repo_full_name,
   baseBranch: r.base_branch,
   task: r.task,
+  images: r.images ?? [],
   title: r.title,
   titleByUser: r.title_by_user,
   agent: r.agent === "codex" ? "codex" : "claude",
+  model: r.model ?? null,
+  reasoningEffort: r.reasoning_effort ?? null,
   status: r.status,
   branch: r.branch,
   pullRequestUrl: r.pull_request_url,
+  pullRequestUrls: r.pull_request_urls,
+  pullRequests: [],
   error: r.error,
   createdAt: r.created_at,
   startedAt: r.started_at,
   finishedAt: r.finished_at,
+  settledAt: r.settled_at,
   awaitingInput: r.awaiting_input,
   sandboxState: r.sandbox_state,
   lastActivityAt: r.last_activity_at,
   previewPorts: r.preview_ports ?? null,
+});
+
+const runWithPullRequests = (run: RunRow) => Effect.gen(function* () {
+  const pullRequests = yield* (yield* PullRequestStatuses).forRun(run);
+  return { ...toApiRun(run), pullRequests };
 });
 
 const toApiEvent = (e: RunEventRow): Api.ApiRunEvent => ({
@@ -130,6 +144,7 @@ const keySlots = (user: UserRow) =>
         placeholder: meta.placeholder,
         consoleUrl: meta.helpUrl,
         consoleLabel: meta.helpLabel,
+        multiline: "multiline" in meta && meta.multiline,
         saved: key ? { hint: key.hint, updatedAt: key.updated_at } : null,
       };
     });
@@ -285,7 +300,7 @@ const routes = HttpRouter.empty.pipe(
       const error = validateApiKey(provider, key);
       if (error) return yield* fail(400, "bad_request", error);
       const cipher = yield* TokenCipher;
-      yield* (yield* Store).upsertApiKey({ user_id: user.id, provider, key_enc: cipher.encrypt(key), hint: keyHint(key) });
+      yield* (yield* Store).upsertApiKey({ user_id: user.id, provider, key_enc: cipher.encrypt(key), hint: keyHint(key, provider) });
       return yield* json(Schema.Array(Api.ApiKeySlot))(yield* keySlots(user));
     }),
   ),
@@ -327,7 +342,7 @@ const routes = HttpRouter.empty.pipe(
     Effect.gen(function* () {
       const user = yield* requireUser;
       const runs = yield* (yield* Store).listRuns(user.id, 100);
-      return yield* json(Schema.Array(Api.ApiRun))(runs.map(toApiRun));
+      return yield* json(Schema.Array(Api.ApiRun))(yield* Effect.forEach(runs, runWithPullRequests, { concurrency: "unbounded" }));
     }),
   ),
 
@@ -337,9 +352,15 @@ const routes = HttpRouter.empty.pipe(
       const user = yield* requireUser;
       const store = yield* Store;
       const body = yield* HttpServerRequest.schemaBodyJson(Api.CreateRunBody);
-      const task = body.task.trim();
+      const images = body.images ?? [];
+      const imageError = validateImages(images);
+      if (imageError) return yield* fail(400, "bad_request", imageError);
+      const task = body.task.trim() || (images.length ? "Please use the attached images." : "");
       if (!body.repo || !task) return yield* fail(400, "bad_request", "Pick a repository and describe the task.");
       const agent = body.agent ?? DEFAULT_AGENT;
+      if (body.reasoningEffort && !Api.AGENT_EFFORTS[agent].includes(body.reasoningEffort)) {
+        return yield* fail(400, "bad_request", "That reasoning effort is not supported by the selected agent.");
+      }
       if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
       if (!(yield* (yield* InstanceSettings).sandboxesReady).ready) {
         return yield* fail(400, "setup_required", "Sandboxes aren't set up yet. Finish setup at /setup first.");
@@ -358,10 +379,27 @@ const routes = HttpRouter.empty.pipe(
         base_branch: body.baseBranch?.trim() || repo.defaultBranch,
         task,
         agent,
+        model: body.model ?? null,
+        reasoning_effort: body.reasoningEffort ?? null,
+        images,
       });
       // Named in the background: the run starts without waiting, and a failed title never fails it.
       yield* Effect.forkDaemon(generateRunTitle(run));
       return yield* json(Api.ApiRun)(toApiRun(run), 201);
+    }),
+  ),
+
+  HttpRouter.get(
+    "/api/runs/:id/images/:imageId",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const { imageId } = yield* HttpRouter.schemaPathParams(Schema.Struct({ imageId: Schema.UUID }));
+      const image = yield* (yield* Store).getRunImage(run.id, imageId);
+      if (Option.isNone(image)) return yield* fail(404, "not_found", "Image not found.");
+      return HttpServerResponse.uint8Array(Buffer.from(image.value.data, "base64"), {
+        contentType: image.value.media_type,
+        headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
+      });
     }),
   ),
 
@@ -373,11 +411,27 @@ const routes = HttpRouter.empty.pipe(
       const diff = yield* (yield* Store).getDiff(run.id);
       const { preview } = yield* HarnessConfig;
       return yield* json(Api.RunDetail)({
-        run: toApiRun(run),
+        run: yield* runWithPullRequests(run),
         ...page,
         diff: Option.getOrNull(Option.map(diff, (d) => ({ patch: d.patch, truncated: d.truncated, updatedAt: d.updated_at }))),
         previewsEnabled: Option.isSome(preview),
       });
+    }),
+  ),
+
+  HttpRouter.post(
+    "/api/runs/:id/pull-requests",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const input = (yield* HttpServerRequest.schemaBodyJson(Api.LinkPullRequestBody)).url.trim();
+      const match = /^https:\/\/github\.com\/([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)\/pull\/([1-9]\d*)\/?$/.exec(input);
+      if (!match) return yield* fail(400, "bad_request", "Enter a GitHub pull request URL, such as https://github.com/owner/repo/pull/123.");
+      const url = `https://github.com/${match[1]!.toLowerCase()}/pull/${match[2]}`;
+      const store = yield* Store;
+      yield* store.linkPullRequest(run.id, url);
+      const updated = yield* store.getRun(run.id);
+      if (Option.isNone(updated)) return yield* fail(404, "not_found", "Run not found.");
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated.value));
     }),
   ),
 
@@ -391,7 +445,7 @@ const routes = HttpRouter.empty.pipe(
         return yield* fail(400, "bad_request", `Keep the name to ${Api.RUN_TITLE_MAX_CHARS} characters or fewer.`);
       }
       const renamed = yield* (yield* Store).renameRun(run.id, user.id, title);
-      return yield* json(Api.ApiRun)(toApiRun(Option.getOrElse(renamed, () => run)));
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(Option.getOrElse(renamed, () => run)));
     }),
   ),
 
@@ -407,11 +461,27 @@ const routes = HttpRouter.empty.pipe(
   ),
 
   HttpRouter.post(
+    "/api/runs/:id/settle",
+    Effect.gen(function* () {
+      const { user, run } = yield* ownedRun;
+      const settled = yield* (yield* Store).settleRun(run.id, user.id);
+      if (Option.isNone(settled)) {
+        return yield* fail(409, "bad_request", "Wait until this thread has stopped and no longer needs input before settling it.");
+      }
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(settled.value));
+    }),
+  ),
+
+  HttpRouter.post(
     "/api/runs/:id/messages",
     Effect.gen(function* () {
       const { user, run } = yield* ownedRun;
       const store = yield* Store;
-      const text = (yield* HttpServerRequest.schemaBodyJson(Api.SendMessageBody)).text.trim();
+      const body = yield* HttpServerRequest.schemaBodyJson(Api.SendMessageBody);
+      const images = body.images ?? [];
+      const imageError = validateImages(images);
+      if (imageError) return yield* fail(400, "bad_request", imageError);
+      const text = body.text.trim() || (images.length ? "Please use the attached images." : "");
       if (!text) return yield* fail(400, "bad_request", "Write a message first.");
       if (text.length > MAX_MESSAGE_CHARS) return yield* fail(400, "bad_request", "That message is too long.");
       if (run.status === "cancelling") {
@@ -419,15 +489,15 @@ const routes = HttpRouter.empty.pipe(
       }
       if (run.status === "queued" || run.status === "running") {
         // The runner hands the message to the agent; an answer clears the open question.
-        yield* store.addUserMessage(run.id, text);
+        yield* store.addUserMessage(run.id, text, images);
       } else {
         // A finished run: the message starts the next turn, in the same sandbox when it is still there.
         const agent = toApiRun(run).agent;
         if (!(yield* agentsFor(user)).find((a) => a.id === agent)?.ready) return yield* agentNotReady(agent);
-        yield* store.continueRun(run.id, text);
+        yield* store.continueRun(run.id, text, images);
       }
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
-      return yield* json(Api.ApiRun)(toApiRun(updated), 201);
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated), 201);
     }),
   ),
 
@@ -438,7 +508,7 @@ const routes = HttpRouter.empty.pipe(
       const store = yield* Store;
       yield* store.requestCancel(run.id, user.id);
       const updated = Option.getOrElse(yield* store.getRun(run.id), () => run);
-      return yield* json(Api.ApiRun)(toApiRun(updated));
+      return yield* json(Api.ApiRun)(yield* runWithPullRequests(updated));
     }),
   ),
 
@@ -454,12 +524,12 @@ const routes = HttpRouter.empty.pipe(
       );
       const page = yield* eventsPage(run.id, after);
       const diffUpdatedAt = yield* (yield* Store).diffUpdatedAt(run.id);
-      return yield* json(Api.RunEventsPage)({ run: toApiRun(run), ...page, diffUpdatedAt: Option.getOrNull(diffUpdatedAt) });
+      return yield* json(Api.RunEventsPage)({ run: yield* runWithPullRequests(run), ...page, diffUpdatedAt: Option.getOrNull(diffUpdatedAt) });
     }),
   ),
 );
 
-export const router = HttpRouter.concat(routes, previewRoutes);
+export const router = routes.pipe(HttpRouter.concat(previewRoutes), HttpRouter.concat(mcpRoutes));
 
 /** Where the web app shows sign-in, with an optional error message. */
 const loginPage = (error?: string) =>
@@ -470,6 +540,8 @@ const loginPage = (error?: string) =>
  * redirects back to the web app's sign-in page for the browser-facing auth routes.
  */
 export const app = router.pipe(
+  // Four 5 MiB images expand to about 27 MiB in base64, plus the JSON text.
+  HttpIncomingMessage.withMaxBodySize(Option.some(30 * 1024 * 1024)),
   Effect.catchTags({
     ApiFailure: (e) => Effect.succeed(errorJson(e.status, e.code, e.message)),
     Unauthorized: () => Effect.succeed(errorJson(401, "unauthorized", "Sign in to continue.")),

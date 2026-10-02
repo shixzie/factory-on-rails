@@ -92,6 +92,39 @@ const events = (runId: string) =>
 
 describe.skipIf(!testDatabaseUrl)("runner", () => {
   layer(Base, { timeout: 30_000, excludeTestServices: true })((it) => {
+    it.effect("reuses only the owner's enabled MCPs in new Claude and Codex threads", () => Effect.gen(function* () {
+      const store = yield* Store;
+      const first = yield* queueRunWith();
+      const secrets = { bearerToken: "shared-mcp-bearer-token" };
+      const enabled = yield* store.createMcpServer({ user_id: first.user_id, name: "shared-tools", enabled: true,
+        config: { transport: "http", url: "https://mcp.example.com", auth: "bearer" }, secrets_enc: encrypt(JSON.stringify(secrets), key) });
+      const disabled = yield* store.createMcpServer({ user_id: first.user_id, name: "disabled-tools", enabled: false,
+        config: { transport: "stdio", command: "node", args: ["disabled.mjs"] }, secrets_enc: null });
+      const otherUser = yield* store.upsertUser({ github_id: 71, github_login: "someone-else", name: null, avatar_url: null,
+        access_token_enc: "x", access_token_expires_at: null, refresh_token_enc: null, refresh_token_expires_at: null });
+      const privateServer = yield* store.createMcpServer({ user_id: otherUser.id, name: "someone-elses-tools", enabled: true,
+        config: { transport: "stdio", command: "node", args: ["private.mjs"] }, secrets_enc: null });
+      const captures: string[][] = [];
+      const capture = Effect.sync(() => {
+        const config = JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!);
+        captures.push(Object.keys(config.mcpServers).sort());
+        expect(config.mcpServers["shared-tools"].headers.Authorization).toBe(`Bearer ${secrets.bearerToken}`);
+        return { stdout: secrets.bearerToken };
+      });
+      const sandboxes = fakeSandboxes({ "run-agent": capture, "run-codex": capture });
+      const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+      yield* waitForRun(first.id, (r) => r.status === "succeeded");
+      const second = yield* queueRunWith({ agent: "codex", keys: { openai: "sk-openai-worker-mcp-test" } });
+      yield* waitForRun(second.id, (r) => r.status === "succeeded");
+      yield* Fiber.interrupt(worker);
+      expect(captures).toEqual([["factory", "shared-tools"], ["factory", "shared-tools"]]);
+      expect((yield* events(first.id)).join("\n")).not.toContain(secrets.bearerToken);
+      expect((yield* events(second.id)).join("\n")).not.toContain(secrets.bearerToken);
+      yield* store.deleteMcpServer(first.user_id, enabled.id);
+      yield* store.deleteMcpServer(first.user_id, disabled.id);
+      yield* store.deleteMcpServer(otherUser.id, privateServer.id);
+    }));
+
     it.effect("claims a queued run, opens the PR with the user's key, and redacts it", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes({ "run-agent": { stdout: `using ${API_KEY}` } });
@@ -102,7 +135,7 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         yield* Fiber.interrupt(worker);
 
         expect(finished.pull_request_url).toBe("https://github.com/shixzie/demo/pull/1");
-        expect(finished.claimed_by).toBe("test-runner");
+        expect(finished.claimed_by).toBeNull();
         expect(sandboxes.state.createdWith?.ANTHROPIC_API_KEY).toBe(API_KEY);
         expect(finished).toMatchObject({ sandbox_state: "running", sandbox_id: "sbx_1", turns: 1 });
         expect(sandboxes.state.destroyed).toBe(false);
@@ -126,6 +159,23 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         expect(sandboxes.state.commands.some((c) => c.includes("run-agent"))).toBe(false);
         expect(sandboxes.state.createdWith?.CODEX_API_KEY).toBe("sk-proj-worker-test-key-0000");
         expect(sandboxes.state.createdWith?.ANTHROPIC_API_KEY).toBeUndefined();
+      }),
+    );
+
+    it.effect("installs a ChatGPT device login for Codex instead of using the API key", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes();
+        const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+        const auth = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "access-secret", refresh_token: "refresh-secret" } });
+        const run = yield* queueRunWith({ agent: "codex", keys: { openai: "sk-proj-unused-key-0000", codex_oauth: auth } });
+
+        yield* waitForRun(run.id, (r) => r.status === "succeeded");
+        yield* Fiber.interrupt(worker);
+
+        expect(sandboxes.state.createdWith?.CODEX_AUTH_JSON).toBe(auth);
+        expect(sandboxes.state.createdWith?.CODEX_API_KEY).toBeUndefined();
+        expect(sandboxes.state.commands).toContainEqual(expect.stringContaining('"$HOME/.codex/auth.json"'));
+        expect((yield* events(run.id)).join("\n")).not.toContain("access-secret");
       }),
     );
 
@@ -193,24 +243,50 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
       }),
     );
 
-    it.effect("fails in-flight runs and keeps their sandboxes when the runner stops", () =>
+    it.effect("detaches on deploy and reconnects the same run, sandbox and command", () =>
       Effect.gen(function* () {
         const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
         const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
         const run = yield* queueRun;
-        yield* waitForRun(run.id, () => sandboxes.state.commands.some((c) => c.includes("run-agent")));
+        const active = yield* waitForRun(run.id, (r) => Boolean(r.execution?.sessions.agent));
 
         yield* Fiber.interrupt(worker);
-        const [row] = yield* Effect.flatMap(
-          SqlClient.SqlClient,
-          (sql) => sql<{ status: string; error: string }>`select status, error from runs where id = ${run.id}`,
-        );
-        expect(row).toEqual({
-          status: "failed",
-          error: "The runner stopped before this run finished. Send a message to pick it up again.",
-        });
-        expect(sandboxes.state.killed).toBe(true);
+        const store = yield* Store;
+        const released = Option.getOrThrow(yield* store.getRun(run.id));
+        expect(released).toMatchObject({ status: "queued", error: null, recovering: true, claimed_by: null, turns: 1 });
+        expect(sandboxes.state.detached).toBe(true);
+        expect(sandboxes.state.killed).toBe(false);
         expect(sandboxes.state.destroyed).toBe(false);
+
+        const replacement = fakeSandboxes({}, { alive: [active.sandbox_id!] });
+        const worker2 = yield* runner.pipe(Effect.provide(Layer.merge(replacement.layer, fakeGitHub())), Effect.fork);
+        const finished = yield* waitForRun(run.id, (r) => r.status === "succeeded");
+        yield* Fiber.interrupt(worker2);
+        expect(finished).toMatchObject({ turns: 1, sandbox_id: active.sandbox_id, recovering: false, execution: null });
+        expect(replacement.state.attachments).toContain(active.execution!.sessions.agent!.name);
+        expect(replacement.state.createdWith).toBeUndefined();
+        expect(replacement.state.files["/workspace/TASK.md"]).toBeUndefined();
+        expect(replacement.state.commands.some((c) => c.includes("setup-agent"))).toBe(false);
+      }),
+    );
+
+    it.effect("honors cancellation sent while a deployed runner is disconnected", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { hang: "run-agent" });
+        const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+        const run = yield* queueRun;
+        const active = yield* waitForRun(run.id, (r) => Boolean(r.execution?.sessions.agent));
+        yield* Fiber.interrupt(worker);
+        yield* (yield* Store).requestCancel(run.id, run.user_id);
+
+        const replacement = fakeSandboxes({}, { alive: [active.sandbox_id!] });
+        const worker2 = yield* runner.pipe(Effect.provide(Layer.merge(replacement.layer, fakeGitHub())), Effect.fork);
+        const finished = yield* waitForRun(run.id, (r) => r.status === "cancelled");
+        yield* Fiber.interrupt(worker2);
+        expect(finished.turns).toBe(1);
+        expect(replacement.state.stoppedSessions).toContain(active.execution!.sessions.agent!.name);
+        expect(replacement.state.killed).toBe(true);
+        expect(replacement.state.destroyed).toBe(false);
       }),
     );
 

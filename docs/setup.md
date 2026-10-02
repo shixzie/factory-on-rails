@@ -22,7 +22,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Expire user authorization tokens | On (default) |
 | Request user authorization (OAuth) during installation | Optional |
 | Webhook | Off for now |
-| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Workflows: **Read and write** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
+| Repository permissions | Contents: **Read and write** · Pull requests: **Read and write** · Workflows: **Read and write** · Checks: **Read** · Commit statuses: **Read** · Actions: **Read** · Metadata: Read · Repository creation: **Read and write** (if your account doesn't offer it, use Administration: Read and write instead) |
 | Where can this App be installed | Only on this account |
 
 Then:
@@ -30,6 +30,23 @@ Then:
 - Note the **App ID**, **Client ID** and the app's **slug** (the last part of its public URL).
 - Generate a **client secret** and a **private key** (`.pem`).
 - **Install** the App on your account, for all repositories or the ones the factory should work on.
+
+CI verification requires **Checks**, **Commit statuses**, and **Actions** read access.
+For an existing GitHub App, add these repository permissions in the App settings
+and accept the permission update on each installation. Runs fail if CI cannot be
+read; they do not silently skip verification.
+
+After opening or updating a PR, the runner waits for checks and commit statuses
+on the pushed commit. Failed checks resume the agent to diagnose and fix them,
+then the runner pushes and verifies the new commit. The agent is idle while
+the factory waits for CI and stays idle once checks pass or the PR is merged.
+If checks turn green or the PR is merged during an automatic repair, the
+factory stops that repair. A new message still starts a new turn, and idle
+sandboxes are saved and stopped as usual. Neutral/skipped checks are
+accepted as GitHub terminal non-failures. Repositories reporting no checks get a
+60-second discovery period. CI waiting and repair share an additional
+`AGENT_TIMEOUT_SECONDS` budget (one hour by default); a timeout or an agent that
+cannot produce a fix leaves the run failed with the PR available for inspection.
 
 Workflows lets agents change files in `.github/workflows`. Without it, GitHub
 rejects any push that touches them, and the run fails with a message saying so.
@@ -59,7 +76,7 @@ Project → `production` → Settings → **Shared Variables**:
 | `GITHUB_APP_CLIENT_ID` | Client ID |
 | `GITHUB_APP_CLIENT_SECRET` | Client secret |
 | `GITHUB_APP_PRIVATE_KEY` | Full `.pem` contents |
-| `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Encrypts stored GitHub tokens and users' API keys. Don't rotate it casually: after a rotation users sign in again and re-save their API keys. |
+| `TOKEN_ENCRYPTION_KEY` | Output of `openssl rand -base64 32`. Encrypts stored GitHub tokens, users' API keys and MCP credentials. Don't rotate it casually: after a rotation users must sign in again and re-save their credentials. |
 | `RAILWAY_SANDBOX_TOKEN` | Token from step 2 |
 | `SANDBOX_ENVIRONMENT_ID` | Environment id from step 2 |
 | `PREVIEW_SIGNING_KEY` | Output of `openssl rand -base64 48`. Signs preview links and sandbox tunnel grants (step 8). Without it previews are off and the `preview` service won't start. |
@@ -132,10 +149,62 @@ runs use it. Runs use Claude Code or Codex, picked per run in the composer:
 | Claude Code | Claude subscription token (`claude setup-token`) | Your Pro, Max, Team or Enterprise plan |
 | Claude Code | Anthropic API key | Your Anthropic Console account |
 | Codex | OpenAI API key | Your OpenAI Platform account |
+| Codex | ChatGPT device login (`codex login --device-auth`) | Your eligible ChatGPT plan |
 
-A run gets only its agent's credential. With both saved, Claude Code gets the
+A run gets only its agent's credential. For ChatGPT, run `codex login
+--device-auth` locally, finish the code login, and paste the contents of
+`~/.codex/auth.json` into the ChatGPT subscription field in Settings. With
+both saved, Claude Code gets the
 subscription token (it would prefer an API key if it had both). An agent can
 also run on the sign-in inside a sandbox snapshot (step 7).
+
+### MCP servers
+
+Apply migration `014_user_mcp_servers.sql` before deploying this feature (the
+harness runs migrations before deployment).
+
+Open **Settings → MCP servers → Add MCP server**. Give the server a unique name
+using letters, numbers, underscores or hyphens (`factory` is reserved for the
+built-in tools), then choose a connection:
+
+- **Remote HTTP:** enter the MCP endpoint, such as
+  `https://mcp.example.com/mcp`. Select no authentication, paste a bearer token,
+  or select OAuth. Optional HTTP headers are a JSON object of string values,
+  such as `{"X-API-Key":"your-key"}`.
+- **Local command (stdio):** enter an executable available in the sandbox,
+  such as `npx`, and arguments as a JSON array, such as
+  `["-y","@example/mcp-server"]`. Environment variables are an optional JSON
+  object of string values, such as `{"API_KEY":"your-key"}`. Install any required
+  executable in your sandbox snapshot or use an available package runner.
+
+For OAuth, save the server and click **Sign in**, then complete authorization
+at its provider. The server must use public HTTPS endpoints and support OAuth
+discovery and automatic client registration. Private-network OAuth endpoints
+are not supported. Providers that require a separately configured client ID and
+secret are not supported by this flow; use a provider-issued bearer token or
+header if the provider offers one. The callback address is
+`<PUBLIC_URL>/auth/mcp/callback`. **Reconnect** starts a new sign-in and
+**Disconnect** removes Factory's saved authorization. Disconnecting does not
+revoke the grant at the provider; use its account settings to do that.
+
+Saved servers apply to your account's Claude Code and Codex threads. Each new
+thread and each subsequent agent turn loads your latest enabled servers and
+credentials. Settings do not change a command already running. OAuth access
+tokens are refreshed before a new turn when possible; a long-running agent may
+need a new turn after its token expires. Sign in again if a grant expires or is
+revoked. An unauthenticated server remains listed so you can
+finish connecting it.
+
+Tokens, HTTP header values, environment values and OAuth credentials are
+encrypted with `TOKEN_ENCRYPTION_KEY`. Settings shows saved header and variable
+names, never their values. When editing, leave a secret field blank to keep its
+saved value. Changing the URL, authentication method, transport, command or
+arguments clears previous credentials; enter replacements and sign in again as
+needed. Renaming or enabling a server keeps its credentials. Entering a JSON
+object replaces all saved headers or environment variables; `{}` clears them.
+Disabling or removing a server takes effect on the
+next turn. MCP credentials are made available to your isolated task sandbox,
+where the coding agent needs them to use the server.
 
 ## 6. Smoke test
 

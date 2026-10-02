@@ -17,10 +17,38 @@ export const AgentId = Schema.Literal("claude", "codex");
 export type AgentId = typeof AgentId.Type;
 export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex" };
 
+/** Null leaves the agent's own model/effort configuration in control. */
+export const ReasoningEffort = Schema.Literal("low", "medium", "high", "xhigh", "max", "ultra");
+export type ReasoningEffort = typeof ReasoningEffort.Type;
+export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra",
+};
+export const AGENT_EFFORTS: Record<AgentId, readonly ReasoningEffort[]> = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["low", "medium", "high", "xhigh", "max", "ultra"],
+};
+export const ModelId = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._:/@+\[\]-]*$/));
+
 /** A finished run's sandbox is stopped (checkpointed, then destroyed) after this long without activity. */
 export const SANDBOX_IDLE_STOP_MINUTES = 5;
 /** A run with no activity for this long is deleted, with its sandbox. */
 export const RUN_RETENTION_DAYS = 7;
+
+/** Images attached to a single task or follow-up message. */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_IMAGES = 4;
+export const ImageMediaType = Schema.Literal("image/png", "image/jpeg", "image/webp", "image/gif");
+export type ImageMediaType = typeof ImageMediaType.Type;
+export const ImageUpload = Schema.Struct({
+  name: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(255)),
+  mediaType: ImageMediaType,
+  /** Canonical base64, without a data URL prefix. */
+  data: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4 * Math.ceil(MAX_IMAGE_BYTES / 3))),
+});
+export type ImageUpload = typeof ImageUpload.Type;
+export const ImageAttachment = Schema.Struct({ id: Schema.UUID, name: Schema.String, mediaType: ImageMediaType });
+export type ImageAttachment = typeof ImageAttachment.Type;
+const ImageUploads = Schema.Array(ImageUpload).pipe(Schema.maxItems(MAX_IMAGES));
 
 export const ApiUser = Schema.Struct({
   login: Schema.String,
@@ -69,23 +97,38 @@ export const PreviewPort = Schema.Struct({
 });
 export type PreviewPort = typeof PreviewPort.Type;
 
+/** GitHub's current state, or unknown when the user cannot read the PR. */
+export const ApiPullRequest = Schema.Struct({
+  url: Schema.String,
+  state: Schema.Literal("open", "draft", "closed", "merged", "unknown"),
+});
+export type ApiPullRequest = typeof ApiPullRequest.Type;
+
 export const ApiRun = Schema.Struct({
   id: Schema.String,
   repo: Schema.String,
   baseBranch: Schema.String,
   task: Schema.String,
+  images: Schema.optional(Schema.Array(ImageAttachment)),
   /** A short name for the run (generated from the task, or the user's). Null until one exists: show `task` instead. */
   title: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   /** The user named the run themselves. */
   titleByUser: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   agent: Schema.optionalWith(AgentId, { default: () => "claude" as const }),
+  model: Schema.optionalWith(Schema.NullOr(ModelId), { default: () => null }),
+  reasoningEffort: Schema.optionalWith(Schema.NullOr(ReasoningEffort), { default: () => null }),
   status: RunStatus,
   branch: Schema.NullOr(Schema.String),
+  /** Latest PR; retained for clients that only display one. */
   pullRequestUrl: Schema.NullOr(Schema.String),
+  pullRequestUrls: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
+  pullRequests: Schema.optionalWith(Schema.Array(ApiPullRequest), { default: () => [] }),
   error: Schema.NullOr(Schema.String),
   createdAt: Schema.Date,
   startedAt: Schema.NullOr(Schema.Date),
   finishedAt: Schema.NullOr(Schema.Date),
+  /** The user settled this thread; cleared when a follow-up starts another turn. */
+  settledAt: Schema.optionalWith(Schema.NullOr(Schema.Date), { default: () => null }),
   /** The agent asked a question and is waiting for the user's answer. */
   awaitingInput: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   sandboxState: Schema.optionalWith(SandboxState, { default: () => "none" as const }),
@@ -159,7 +202,7 @@ export type RunEventsPage = typeof RunEventsPage.Type;
  * A message to the agent: an answer to its question or new direction while it
  * runs, or, once it has finished, the next turn of the conversation.
  */
-export const SendMessageBody = Schema.Struct({ text: Schema.String });
+export const SendMessageBody = Schema.Struct({ text: Schema.String, images: Schema.optional(ImageUploads) });
 export type SendMessageBody = typeof SendMessageBody.Type;
 
 /** One provider a user can bring a key for, and the key saved for it (never the key itself). */
@@ -173,6 +216,8 @@ export const ApiKeySlot = Schema.Struct({
   /** Where to get one. */
   consoleUrl: Schema.String,
   consoleLabel: Schema.optionalWith(Schema.String, { default: () => "Get a key" }),
+  /** Credentials such as an auth.json document need a multi-line input. */
+  multiline: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   saved: Schema.NullOr(Schema.Struct({ hint: Schema.String, updatedAt: Schema.Date })),
 });
 export type ApiKeySlot = typeof ApiKeySlot.Type;
@@ -181,13 +226,19 @@ export const CreateRunBody = Schema.Struct({
   installationId: Schema.Number,
   repo: Schema.String,
   task: Schema.String,
+  images: Schema.optional(ImageUploads),
   baseBranch: Schema.optional(Schema.String),
   agent: Schema.optional(AgentId),
+  model: Schema.optional(Schema.NullOr(ModelId)),
+  reasoningEffort: Schema.optional(Schema.NullOr(ReasoningEffort)),
 });
 export type CreateRunBody = typeof CreateRunBody.Type;
 
 /** The longest name a run can have. */
 export const RUN_TITLE_MAX_CHARS = 80;
+
+/** Associates an existing GitHub pull request with a run. */
+export const LinkPullRequestBody = Schema.Struct({ url: Schema.String });
 
 /** Renames a run. Generated titles never replace a name the user gave it. */
 export const RenameRunBody = Schema.Struct({ title: Schema.String });
@@ -217,6 +268,79 @@ export type PreviewLink = typeof PreviewLink.Type;
 
 export const SaveKeyBody = Schema.Struct({ key: Schema.String });
 export type SaveKeyBody = typeof SaveKeyBody.Type;
+
+/** Server names become tool namespaces in both coding agents. */
+export const McpServerName = Schema.String.pipe(
+  Schema.pattern(/^[A-Za-z0-9_-]{1,64}$/),
+  Schema.filter((name) => !["factory", "__proto__", "constructor", "prototype"].includes(name.toLowerCase()), {
+    message: () => "This server name is reserved",
+  }),
+);
+
+const McpUrl = Schema.String.pipe(Schema.maxLength(2048), Schema.filter((value) => {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && !url.hash;
+  } catch {
+    return false;
+  }
+}, { message: () => "Use an HTTP or HTTPS URL without embedded credentials or a fragment" }));
+
+/** Public connection settings. Put credentials in headers, never in the URL query string. */
+export const McpServerConfig = Schema.Union(
+  Schema.Struct({
+    transport: Schema.Literal("http"),
+    url: McpUrl,
+    auth: Schema.Literal("none", "bearer", "oauth"),
+  }),
+  Schema.Struct({
+    transport: Schema.Literal("stdio"),
+    command: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(1024), Schema.pattern(/^[^\x00\r\n]+$/)),
+    args: Schema.Array(Schema.String.pipe(Schema.maxLength(4096), Schema.pattern(/^[^\x00]*$/))).pipe(Schema.maxItems(100)),
+  }),
+);
+export type McpServerConfig = typeof McpServerConfig.Type;
+
+const McpSecretValue = Schema.String.pipe(Schema.maxLength(16_384), Schema.pattern(/^[^\x00]*$/));
+const McpSecretMap = (key: Schema.Schema<string>) => Schema.Record({ key: Schema.String, value: McpSecretValue }).pipe(
+  Schema.filter((values) => Object.keys(values).every(Schema.is(key)), { message: () => "Invalid header or environment variable name" }),
+  Schema.filter((values) => Object.keys(values).length <= 50, { message: () => "At most 50 values are allowed" }),
+);
+
+/** Omitted values are preserved on edits; supplied maps replace the saved map. */
+export const McpServerSecretInput = Schema.Struct({
+  bearerToken: Schema.optional(Schema.String.pipe(Schema.maxLength(16_384), Schema.pattern(/^[^\x00\r\n]*$/))),
+  headers: Schema.optional(McpSecretMap(Schema.String.pipe(Schema.pattern(/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/))).pipe(
+    Schema.filter((values) => Object.values(values).every((value) => !/[\r\n]/.test(value)), {
+      message: () => "Header values cannot contain line breaks",
+    }),
+  )),
+  env: Schema.optional(McpSecretMap(Schema.String.pipe(Schema.pattern(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/)))),
+});
+export type McpServerSecretInput = typeof McpServerSecretInput.Type;
+
+export const SaveMcpServerBody = Schema.Struct({
+  name: McpServerName,
+  enabled: Schema.Boolean,
+  config: McpServerConfig,
+  secrets: Schema.optional(McpServerSecretInput),
+});
+export type SaveMcpServerBody = typeof SaveMcpServerBody.Type;
+
+/** Safe settings response: secret values, OAuth state, and encrypted payloads never appear here. */
+export const ApiMcpServer = Schema.Struct({
+  id: Schema.String,
+  name: McpServerName,
+  enabled: Schema.Boolean,
+  config: McpServerConfig,
+  authenticated: Schema.Boolean,
+  secretNames: Schema.Struct({ headers: Schema.Array(Schema.String), env: Schema.Array(Schema.String) }),
+  updatedAt: Schema.Date,
+});
+export type ApiMcpServer = typeof ApiMcpServer.Type;
+
+export const McpOAuthLink = Schema.Struct({ url: Schema.String });
+export type McpOAuthLink = typeof McpOAuthLink.Type;
 
 /**
  * The sandbox snapshots (prepared Railway checkpoints) this user may start

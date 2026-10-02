@@ -58,6 +58,31 @@ describe("flow", () => {
     expect(live.usesWeb).toBe(false);
     // Once the run is over, a subagent that never reported back was cut off.
     expect(flowModel(run, false).agents[1]!.status).toBe("stopped");
+    expect(flowModel(run, false).main).toMatchObject({ active: false, current: undefined });
+  });
+
+  it("clears unfinished work when the agent rests while CI is pending or green", () => {
+    for (const message of ["Waiting for CI on abc", "CI passed for abc", "Pull request merged: https://github.com/o/r/pull/1"]) {
+      const model = flowModel([...run, ev("info", message)], true);
+      expect(model.main).toMatchObject({ active: false, current: undefined });
+      expect(model.agents.every((agent) => agent.status !== "running")).toBe(true);
+      expect(model.agents[0]!.status).toBe("done");
+    }
+  });
+
+  it("does not restart unfinished subagents when a new agent turn starts", () => {
+    for (const boundary of [
+      ev("agent_result", "Done."),
+      ev("info", "Waiting for CI on abc"),
+      ev("info", "CI passed for abc"),
+      ev("info", "Pull request merged: https://github.com/o/r/pull/1"),
+    ]) {
+      const model = flowModel([...run, boundary, ev("info", "Continuing the agent's session")], true);
+      expect(model.main).toMatchObject({ active: true, current: undefined });
+      expect(model.agents[1]!.status).toBe("stopped");
+      expect(model.agents[1]!.current).toBeUndefined();
+      expect(model.agents[1]!.doneAt).toEqual(boundary.at);
+    }
   });
 
   it("counts what a subagent's own subagents do as its work", () => {

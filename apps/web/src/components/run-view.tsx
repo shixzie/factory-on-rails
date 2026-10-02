@@ -7,6 +7,7 @@ import {
   CircleAlertIcon,
   CircleDotIcon,
   CircleSlashIcon,
+  ClockIcon,
   ExternalLinkIcon,
   FileDiffIcon,
   GitBranchIcon,
@@ -18,11 +19,14 @@ import {
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
+import { AttachedImages, ImageDrafts, ImagePicker } from "@/components/composer-images";
+import { useComposerImages } from "@/hooks/use-composer-images";
 import { ChangedFiles, DiffPane, DiffStat, useDiffFiles } from "@/components/diff-view";
 import { PageHeader } from "@/components/page-header";
 import { PreviewPane } from "@/components/preview-pane";
 import { RunActivity } from "@/components/run-activity";
 import { RunFlow } from "@/components/run-flow";
+import { RunPullRequests, pullRequests } from "@/components/run-pull-requests";
 import { RunTitle } from "@/components/run-title";
 import { isActive, SandboxLabel, sandboxHint, StatusLabel } from "@/components/run-status";
 import { Badge } from "@/components/ui/badge";
@@ -31,13 +35,15 @@ import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useFollow } from "@/hooks/use-follow";
-import { openQuestion, toBlocks } from "@/lib/activity";
+import { agentActivity, openQuestion, toBlocks } from "@/lib/activity";
 import { Api, api, runInBrowser } from "@/lib/api";
 import { diffTotals } from "@/lib/diff";
 import { ago, duration } from "@/lib/format";
+import { startPolling } from "@/lib/poll";
 import { cn } from "@/lib/utils";
 
 const POLL_MS = 2000;
+const POLL_TIMEOUT_MS = 15_000;
 /** While a finished run's sandbox is up, check now and then whether it has been stopped. */
 const SANDBOX_POLL_MS = 15_000;
 /** Sooner while the Preview tab is open, so servers the sandbox starts show up. */
@@ -61,6 +67,7 @@ function useNow(on: boolean) {
 function MessageComposer({
   question,
   live,
+  working,
   hint,
   disabled,
   sending,
@@ -70,18 +77,20 @@ function MessageComposer({
 }: {
   question: boolean;
   live: boolean;
+  working: boolean;
   /** What happens when you send, once the run has finished. */
   hint?: string;
   disabled: boolean;
   sending: boolean;
   stopping: boolean;
-  onSend: (text: string) => Promise<boolean>;
+  onSend: (text: string, images?: readonly Api.ImageUpload[]) => Promise<boolean>;
   onStop: () => void;
 }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
-  const empty = text.trim().length === 0;
-  const canSend = !disabled && !sending && !empty;
+  const images = useComposerImages(disabled || sending);
+  const empty = text.trim().length === 0 && images.images.length === 0;
+  const canSend = !disabled && !sending && !empty && !images.reading;
   // With nothing typed, a live run's send button stops it instead, as in t3code.
   const showStop = live && empty && !sending;
   useEffect(() => {
@@ -89,49 +98,58 @@ function MessageComposer({
   }, [question]);
   const submit = async () => {
     if (!canSend) return;
-    if (await onSend(text)) setText("");
+    if (await onSend(text, images.uploads)) {
+      setText("");
+      images.clear();
+    }
   };
   return (
     <form
+      {...images.dragHandlers}
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
       }}
       className={cn(
-        "mx-auto w-full max-w-3xl rounded-2xl border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
+        "mx-auto w-full max-w-3xl rounded-lg border bg-card shadow-sm transition-colors focus-within:border-ring/60 dark:shadow-none",
         question && "border-warning/50",
         disabled && "opacity-60",
+        images.dragging && "border-primary bg-accent/40 ring-2 ring-primary/20",
       )}
     >
+      <ImageDrafts images={images} disabled={disabled || sending} />
       <textarea
+        onPaste={images.onPaste}
         ref={ref}
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
             e.preventDefault();
             void submit();
           }
         }}
-        disabled={disabled}
+        disabled={disabled || sending}
         rows={2}
         placeholder={
-          question ? "Answer the agent's question…" : live ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
+          question ? "Answer the agent's question…" : working ? "Send the agent a message while it works…" : "Ask for changes or a next step…"
         }
         aria-label="Message to the agent"
         className="field-sizing-content block max-h-60 min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
       />
       <div className="flex items-center gap-2 px-2.5 pb-2.5">
+        <ImagePicker images={images} disabled={disabled || sending} />
         <span className="min-w-0 px-1.5 text-[11px] text-muted-foreground">
           {question
             ? "The agent is waiting for you."
-            : live
+            : working
               ? "It reads your message after its current step."
-              : (hint ?? "The agent picks up where it left off.")}
+              : live
+                ? "Your message will be picked up on the agent's next turn."
+                : (hint ?? "The agent picks up where it left off.")}
         </span>
         <span className="ml-auto hidden items-center gap-1 text-[11px] text-muted-foreground sm:inline-flex">
-          <Kbd>⌘</Kbd>
-          <Kbd>↵</Kbd>
+          <Kbd>↵</Kbd> send · <Kbd>Shift</Kbd><Kbd>↵</Kbd> new line
         </span>
         {showStop ? (
           <Tooltip>
@@ -162,19 +180,24 @@ function MessageComposer({
 }
 
 function Outcome({ run }: { run: Api.ApiRun }) {
-  if (run.status === "succeeded" && run.pullRequestUrl) {
+  const urls = pullRequests(run);
+  if (run.status === "succeeded" && urls.length > 0) {
     return (
-      <div className="flex items-center gap-3 rounded-xl border bg-card px-4 py-3">
-        <span className="flex size-8 items-center justify-center rounded-lg bg-success/15 text-success">
-          <GitPullRequestIcon className="size-4" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium">Pull request opened</div>
-          <div className="truncate text-xs text-muted-foreground">{run.pullRequestUrl.replace("https://github.com/", "")}</div>
-        </div>
-        <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
-          Review <ExternalLinkIcon />
-        </Button>
+      <div className="space-y-2">
+        {urls.map((url) => (
+          <div key={url} className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
+            <span className="flex size-8 items-center justify-center rounded-lg bg-success/15 text-success">
+              <GitPullRequestIcon className="size-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium">Pull request</div>
+              <div className="truncate text-xs text-muted-foreground">{url.replace("https://github.com/", "")}</div>
+            </div>
+            <Button variant="outline" size="sm" nativeButton={false} render={<a href={url} target="_blank" rel="noreferrer" />}>
+              Review <ExternalLinkIcon />
+            </Button>
+          </div>
+        ))}
       </div>
     );
   }
@@ -183,7 +206,7 @@ function Outcome({ run }: { run: Api.ApiRun }) {
   }
   if (run.status === "failed") {
     return (
-      <div className="flex items-start gap-2.5 rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
+      <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
         <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
         <div className="min-w-0">
           <div className="font-medium text-destructive">Run failed</div>
@@ -237,8 +260,11 @@ function SidePanel({
             aria-selected={tab === t.id}
             onClick={() => onTab(t.id)}
             className={cn(
-              "relative inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs transition-colors [&_svg]:size-3.5",
-              tab === t.id ? "bg-accent font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+              "relative inline-flex h-full items-center gap-1.5 px-2.5 text-xs transition-colors [&_svg]:size-3.5",
+              // Underlined like the tabs on a Railway service panel.
+              tab === t.id
+                ? "font-medium text-foreground after:absolute after:inset-x-2.5 after:-bottom-px after:h-0.5 after:rounded-full after:bg-foreground"
+                : "text-muted-foreground hover:text-foreground",
             )}
           >
             {t.icon}
@@ -269,7 +295,10 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const [focus, setFocus] = useState<{ path: string; n: number }>();
   const [cancelling, startCancel] = useTransition();
   const [sending, setSending] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const active = isActive(run.status);
+  const activity = useMemo(() => agentActivity(events, active), [events, active]);
+  const agentWorking = activity === "working";
   // A finished run's sandbox is stopped after a few idle minutes; keep the label honest.
   const sandboxUp = run.sandboxState === "running" || run.sandboxState === "stopping";
   const now = useNow(active);
@@ -285,11 +314,10 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     let after = events.at(-1)?.id ?? "0";
     let diffAt = diff?.updatedAt.getTime() ?? 0;
     let title = run.title;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
-      timer = undefined;
-      const result = await runInBrowser(api.runEvents(run.id, after));
-      if (stopped) return;
+      const result = await runInBrowser(api.runEvents(run.id, after), { timeoutMs: POLL_TIMEOUT_MS });
+      if (stopped) return false as const;
+      setReconnecting(result._tag === "Left");
       let delay = POLL_MS;
       if (result._tag === "Right") {
         const page = result.right;
@@ -304,8 +332,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
           router.refresh();
         }
         if (page.diffUpdatedAt && page.diffUpdatedAt.getTime() !== diffAt) {
-          const fresh = await runInBrowser(api.runDiff(run.id));
-          if (stopped) return;
+          const fresh = await runInBrowser(api.runDiff(run.id), { timeoutMs: POLL_TIMEOUT_MS });
+          if (stopped) return false as const;
           if (fresh._tag === "Right") {
             diffAt = fresh.right.updatedAt.getTime();
             setDiff(fresh.right);
@@ -314,21 +342,24 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         if (page.hasMore) delay = 0;
         else if (!isActive(page.run.status)) {
           if (isActive(run.status)) router.refresh();
-          if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return;
+          if (page.run.sandboxState !== "running" && page.run.sandboxState !== "stopping") return false as const;
           delay = previewing.current ? PREVIEW_POLL_MS : SANDBOX_POLL_MS;
         }
       }
-      timer = setTimeout(tick, delay);
+      return delay;
     };
-    pollNow.current = () => {
-      if (timer === undefined) return;
-      clearTimeout(timer);
-      void tick();
-    };
-    timer = setTimeout(tick, initial.hasMore ? 0 : active ? POLL_MS : SANDBOX_POLL_MS);
+    const poll = startPolling({
+      tick,
+      delay: initial.hasMore ? 0 : active ? POLL_MS : SANDBOX_POLL_MS,
+      retryDelay: POLL_MS,
+      onError: () => setReconnecting(true),
+    });
+    pollNow.current = poll.now;
+    window.addEventListener("online", poll.now);
     return () => {
       stopped = true;
-      clearTimeout(timer);
+      poll.stop();
+      window.removeEventListener("online", poll.now);
       pollNow.current = () => {};
     };
     // Restart only when the run, its liveness or its sandbox changes; cursors are tracked inside.
@@ -342,8 +373,8 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
     else router.refresh();
   }, [awaiting]);
 
-  // Follow the run as it works; scrolling up pauses that until you come back down.
-  const follow = useFollow(events.length, active);
+  // Follow new activity and loaded history; scrolling up pauses until you come back down.
+  const follow = useFollow(events.length);
 
   // A live run opens with its flow map beside it, where there is room.
   useEffect(() => {
@@ -353,7 +384,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
   const blocks = useMemo(() => toBlocks(events), [events]);
   const files = useDiffFiles(diff);
   const totals = diffTotals(files);
-  const question = active ? openQuestion(blocks) : undefined;
+  const question = agentWorking ? openQuestion(blocks) : undefined;
 
   const openDiff = (path?: string) => {
     setPanel("diff");
@@ -382,9 +413,9 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
       else setRun(result.right);
     });
 
-  const send = async (text: string) => {
+  const send = async (text: string, images?: readonly Api.ImageUpload[]) => {
     setSending(true);
-    const result = await runInBrowser(api.sendMessage(run.id, text));
+    const result = await runInBrowser(api.sendMessage(run.id, text, images));
     setSending(false);
     if (result._tag === "Left") {
       toast.error(result.left.message);
@@ -408,7 +439,11 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         ? "Stopping the agent"
         : question
           ? "Waiting for your answer"
-          : `Working for ${elapsed}`;
+          : activity === "waiting_ci"
+            ? "Agent idle · waiting for CI"
+            : !agentWorking
+              ? "Agent idle"
+              : `Working for ${elapsed}`;
 
   return (
     <>
@@ -455,11 +490,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 ) : null}
               </Button>
             ) : null}
-            {run.pullRequestUrl ? (
-              <Button variant="outline" size="sm" nativeButton={false} render={<a href={run.pullRequestUrl} target="_blank" rel="noreferrer" />}>
-                <GitPullRequestIcon /> <span className="hidden sm:inline">Pull request</span>
-              </Button>
-            ) : null}
+            <RunPullRequests run={run} onLinked={setRun} />
             {active ? (
               <Button variant="ghost" size="sm" onClick={cancel} disabled={cancelling || run.status === "cancelling"}>
                 {cancelling ? <Spinner /> : <SquareIcon className="fill-current" />} Stop
@@ -478,35 +509,50 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
         <Badge variant="outline" className="hidden shrink-0 font-normal text-muted-foreground sm:inline-flex">
           {run.repo}
         </Badge>
-        <StatusLabel status={run.status} awaiting={run.awaitingInput} className="shrink-0" />
+        <StatusLabel status={run.status} awaiting={agentWorking && run.awaitingInput} idle={!agentWorking} className="shrink-0" />
         <SandboxLabel state={run.sandboxState} className="hidden shrink-0 md:inline-flex" />
       </PageHeader>
+
+      {reconnecting ? (
+        <div role="status" className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+          <Spinner className="size-3.5" />
+          <span>Reconnecting to the factory. Activity will catch up automatically.</span>
+          <Button variant="ghost" size="sm" className="ml-auto" onClick={() => pollNow.current()}>
+            Retry now
+          </Button>
+        </div>
+      ) : null}
 
       <div className="flex flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex-1 px-4 pt-8 pb-6">
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
               <div className="flex flex-col items-end gap-1.5">
-                <div className="max-w-[85%] rounded-2xl rounded-br-md border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
+                <div className="max-w-[85%] rounded-lg rounded-br-sm border bg-secondary px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap">
                   {run.task}
+                  <AttachedImages runId={run.id} images={run.images ?? []} />
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground" suppressHydrationWarning>
+                <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] text-muted-foreground">
                   <span>{run.repo}</span>
                   <span>·</span>
                   <span>{Api.AGENT_LABELS[run.agent]}</span>
                   <span>·</span>
+                  <span>{run.model ?? "Default model"}</span>
+                  <span>·</span>
+                  <span>{run.reasoningEffort ? `${Api.REASONING_EFFORT_LABELS[run.reasoningEffort]} effort` : "Default effort"}</span>
+                  <span>·</span>
                   <GitBranchIcon className="size-3" />
                   <span>{run.branch ? `${run.baseBranch} ← ${run.branch}` : run.baseBranch}</span>
                   <span>·</span>
-                  <span>{ago(run.createdAt)}</span>
+                  <span suppressHydrationWarning>{ago(run.createdAt)}</span>
                 </div>
               </div>
 
-              <RunActivity blocks={blocks} live={active} onAnswer={send} sending={sending} focusAgent={focusAgent} />
+              <RunActivity runId={run.id} blocks={blocks} live={agentWorking} onAnswer={send} sending={sending} focusAgent={focusAgent} />
 
               {active ? (
                 <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
-                  {question ? <CircleDotIcon className="size-3.5 text-warning" /> : <Spinner className="size-3.5" />}
+                  {question ? <CircleDotIcon className="size-3.5 text-warning" /> : !agentWorking && run.status === "running" ? <ClockIcon className="size-3.5" /> : <Spinner className="size-3.5" />}
                   <span suppressHydrationWarning>{liveLabel}</span>
                 </div>
               ) : run.startedAt ? (
@@ -544,6 +590,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
             <MessageComposer
               question={!!question}
               live={active}
+              working={agentWorking}
               hint={sandboxHint(run.sandboxState)}
               disabled={run.status === "cancelling"}
               sending={sending}
@@ -551,11 +598,6 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
               onSend={send}
               onStop={cancel}
             />
-            {!active ? (
-              <p className="mx-auto mt-2 max-w-3xl px-1 text-center text-[11px] text-muted-foreground/80">
-                Runs are deleted after {Api.RUN_RETENTION_DAYS} days without activity, along with their sandbox.
-              </p>
-            ) : null}
           </div>
         </div>
 
@@ -570,7 +612,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
             {panel === "preview" ? (
               <PreviewPane run={run} enabled={initial.previewsEnabled} />
             ) : panel === "flow" ? (
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="canvas-dots flex-1 overflow-y-auto p-4">
                 <RunFlow
                   events={events}
                   live={active}

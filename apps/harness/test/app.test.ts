@@ -1,6 +1,7 @@
 import { HttpApp } from "@effect/platform";
 import { SqlClient } from "@effect/sql";
 import {
+  Api,
   decrypt,
   GitHubError,
   GitHubUserApi,
@@ -18,6 +19,7 @@ import { TestDbLive, testDatabaseUrl } from "../../../packages/core/test/db.js";
 import { app, originCheck } from "../src/app.js";
 import { HarnessConfig } from "../src/config.js";
 import { RailwayApi, RailwayError } from "../src/railway.js";
+import { PullRequestStatuses } from "../src/pull-requests.js";
 import { TitleError, TitleModel, type TitleProvider } from "../src/titles.js";
 
 const ORIGIN = "https://factory.example";
@@ -29,7 +31,11 @@ const PREVIEW_KEY = "p".repeat(40);
  * `envApp` stands for a GitHub App configured with environment variables; with
  * it off, the App is whatever the setup page stored (read through InstanceSettings).
  */
-const github = { login: "shixzie", repos: [] as GitHubRepo[], envApp: true, manifestOwner: "shixzie" };
+const github = {
+  login: "shixzie", repos: [] as GitHubRepo[], envApp: true, manifestOwner: "shixzie",
+  prs: new Map<string, { state: "open" | "closed"; merged: boolean; draft?: boolean }>(),
+  prCalls: [] as Array<{ token: string; repo: string; number: number }>,
+};
 const GitHubTest = Layer.effect(
   GitHubUserApi,
   Effect.map(InstanceSettings, (settings) => ({
@@ -46,6 +52,13 @@ const GitHubTest = Layer.effect(
     viewer: () => Effect.succeed({ id: 99, login: github.login, name: null, avatar_url: "" }),
     installations: () => Effect.succeed([{ id: 1, account: { login: "shixzie" } }]),
     installationRepos: () => Effect.succeed(github.repos),
+    pullRequest: (token: string, repo: string, number: number) => Effect.suspend(() => {
+      github.prCalls.push({ token, repo, number });
+      const pr = github.prs.get(`${repo}/${number}`);
+      return pr
+        ? Effect.succeed({ ...pr, number, html_url: `https://github.com/${repo}/pull/${number}`, head: { sha: "abc" } })
+        : Effect.fail(new GitHubError({ status: 404, message: "Not found" }));
+    }),
     createRepo: () => Effect.fail(new GitHubError({ status: 422, message: "name already exists" })),
     convertManifest: (code: string) =>
       code === "manifest-code"
@@ -87,7 +100,7 @@ const TitleTest = Layer.succeed(TitleModel, {
     }),
 });
 
-const TestLayer = Layer.mergeAll(
+const TestLayer = PullRequestStatuses.Live.pipe(Layer.provideMerge(Layer.mergeAll(
   GitHubTest,
   RailwayTest,
   TitleTest,
@@ -102,7 +115,7 @@ const TestLayer = Layer.mergeAll(
       { name: "node-base", logins: ["*"] },
     ],
   }),
-).pipe(
+)),
   Layer.provideMerge(InstanceSettings.Live),
   Layer.provideMerge(Layer.mergeAll(Store.Live, Layer.succeed(TokenCipher, TokenCipher.fromKey(key)))),
   Layer.provideMerge(TestDbLive),
@@ -328,7 +341,109 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     expect(detail.run).toMatchObject({ sandboxState: "none" });
   });
 
-  it("continues a finished run when the user writes to it", async () => {
+  it("stores pasted images for tasks and follow-ups and only serves them to the run owner", async () => {
+    const owner = await signIn("image-owner", 981);
+    const other = await signIn("image-other", 982);
+    const image = {
+      name: "screenshot.png", mediaType: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aC2kAAAAASUVORK5CYII=",
+    };
+    await run(Effect.flatMap(Store, (s) => s.setSandboxSnapshot(owner.user.id, "node-base")));
+    const previousRepos = github.repos;
+    github.repos = [{ id: 1, full_name: "image/repo", name: "repo", private: true, default_branch: "main", html_url: "h" }];
+    try {
+      const res = await post("/api/runs", owner.cookie, { installationId: 1, repo: "image/repo", task: "", images: [image] });
+      expect(res.status).toBe(201);
+      const created = await json(res);
+      expect(created).toMatchObject({ task: "Please use the attached images.", images: [{ id: expect.any(String), name: image.name, mediaType: image.mediaType }] });
+      expect(JSON.stringify(created)).not.toContain(image.data);
+      const path = `/api/runs/${created.id}/images/${created.images[0].id}`;
+      const download = await request(path, { headers: { cookie: owner.cookie } });
+      expect(download.status).toBe(200);
+      expect(download.headers.get("content-type")).toBe("image/png");
+      expect(Buffer.from(await download.arrayBuffer()).toString("base64")).toBe(image.data);
+      expect((await request(path)).status).toBe(401);
+      expect((await request(path, { headers: { cookie: other.cookie } })).status).toBe(404);
+      const otherRun = await run(Effect.flatMap(Store, (s) => s.enqueueRun({
+        user_id: owner.user.id, installation_id: 1, repo_full_name: "image/repo", base_branch: "main", task: "other",
+      })));
+      expect((await request(`/api/runs/${otherRun.id}/images/${created.images[0].id}`, { headers: { cookie: owner.cookie } })).status).toBe(404);
+
+      expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "", images: [image] })).status).toBe(201);
+      let page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(page.events).toEqual([expect.objectContaining({ message: "Please use the attached images.", data: { images: [{ id: expect.any(String), name: image.name, mediaType: image.mediaType }] } })]);
+      expect(JSON.stringify(page)).not.toContain(image.data);
+      await run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'succeeded' where id = ${created.id}`));
+      expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "next", images: [image] })).status).toBe(201);
+      page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(page.run.status).toBe("queued");
+      expect(page.events).toHaveLength(2);
+      expect(await run(Effect.flatMap(Store, (s) => s.listRunImages(created.id)))).toHaveLength(3);
+
+      for (const images of [
+        [{ ...image, data: "not base64" }],
+        [{ ...image, mediaType: "image/jpeg" }],
+        [{ ...image, mediaType: "image/svg+xml" }],
+        Array.from({ length: Api.MAX_IMAGES + 1 }, () => image),
+      ]) {
+        expect((await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "bad image", images })).status).toBe(400);
+        expect((await post("/api/runs", owner.cookie, { installationId: 1, repo: "image/repo", task: "bad image", images })).status).toBe(400);
+      }
+      expect(await run(Effect.flatMap(Store, (s) => s.listRunImages(created.id)))).toHaveLength(3);
+    } finally {
+      github.repos = previousRepos;
+    }
+  });
+
+  it("lets only the owner settle an idle thread and persists its settlement", async () => {
+    const owner = await signIn("settler", 101);
+    const other = await signIn("other-settler", 102);
+    const created = await run(Effect.gen(function* () {
+      const store = yield* Store;
+      const r = yield* store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "finished task" });
+      yield* store.updateRun(r.id, { pull_request_url: "https://github.com/o/r/pull/404" });
+      yield* Effect.flatMap(SqlClient.SqlClient, (sql) => sql`update runs set status = 'succeeded' where id = ${r.id}`);
+      return r;
+    }));
+    expect((await post(`/api/runs/${created.id}/settle`, "")).status).toBe(401);
+    expect((await post(`/api/runs/${created.id}/settle`, other.cookie)).status).toBe(404);
+    expect((await post("/api/runs/not-a-uuid/settle", owner.cookie)).status).toBe(400);
+
+    const res = await post(`/api/runs/${created.id}/settle`, owner.cookie);
+    expect(res.status).toBe(200);
+    const settled = await json(res);
+    expect(settled).toMatchObject({
+      id: created.id, status: "succeeded", settledAt: expect.any(String),
+      pullRequestUrl: "https://github.com/o/r/pull/404", pullRequestUrls: ["https://github.com/o/r/pull/404"],
+    });
+    expect((await json(post(`/api/runs/${created.id}/settle`, owner.cookie))).settledAt).toBe(settled.settledAt);
+    const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+    expect(detail.run.settledAt).toBe(settled.settledAt);
+    expect(detail.events).toEqual([]);
+    const listed = await json(request("/api/runs", { headers: { cookie: owner.cookie } }));
+    expect(listed.find((r: { id: string }) => r.id === created.id).settledAt).toBe(settled.settledAt);
+    const page = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+    expect(page.run.settledAt).toBe(settled.settledAt);
+  });
+
+  it("rejects settlement of queued, working, stopping, or awaiting-input threads", async () => {
+    const owner = await signIn("active-settler", 103);
+    const created = await run(Effect.flatMap(Store, (store) =>
+      store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "unfinished" }),
+    ));
+    for (const status of ["queued", "running", "cancelling", "succeeded"] as const) {
+      await run(Effect.flatMap(SqlClient.SqlClient, (sql) =>
+        sql`update runs set status = ${status}, awaiting_input = ${status === "succeeded"} where id = ${created.id}`,
+      ));
+      const res = await post(`/api/runs/${created.id}/settle`, owner.cookie);
+      expect(res.status).toBe(409);
+      expect(await json(res)).toMatchObject({ code: "bad_request", error: expect.stringContaining("before settling") });
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run).toMatchObject({ status, awaitingInput: status === "succeeded", settledAt: null });
+    }
+  });
+
+  it("continues and reopens a settled run when the user writes to it", async () => {
     const owner = await signIn("continuer", 4);
     const created = await run(
       Effect.gen(function* () {
@@ -339,6 +454,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
         return r;
       }),
     );
+    expect((await post(`/api/runs/${created.id}/settle`, owner.cookie)).status).toBe(200);
     const noKey = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
     expect(noKey.status).toBe(400);
     expect((await json(noKey)).code).toBe("api_key_required");
@@ -346,7 +462,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     await send("PUT", "/api/settings/keys/anthropic", owner.cookie, { key: "sk-ant-" + "c".repeat(30) });
     const sent = await post(`/api/runs/${created.id}/messages`, owner.cookie, { text: "Now add tests" });
     expect(sent.status).toBe(201);
-    expect(await json(sent)).toMatchObject({ status: "queued", sandboxState: "stopped", lastActivityAt: expect.any(String) });
+    expect(await json(sent)).toMatchObject({ status: "queued", sandboxState: "stopped", lastActivityAt: expect.any(String), settledAt: null });
     const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
     expect(detail.events.map((e: { kind: string; message: string }) => `${e.kind}:${e.message}`)).toEqual(["user_message:Now add tests"]);
     await send("DELETE", "/api/settings/keys/anthropic", owner.cookie);
@@ -484,6 +600,60 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect(await runTitle(second.id)).toBeNull();
     });
 
+    it("links multiple PRs without replacing the runner's PR, and restricts access to the owner", async () => {
+      const owner = await signIn("pr-owner", 123);
+      const other = await signIn("pr-other", 124);
+      const created = await run(Effect.flatMap(Store, (store) =>
+        store.enqueueRun({ user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "x" }),
+      ));
+      const path = `/api/runs/${created.id}/pull-requests`;
+      const first = "https://github.com/o/r/pull/1";
+      const second = "https://github.com/o/r/pull/2";
+      await run(Effect.flatMap(Store, (store) => store.updateRun(created.id, { pull_request_url: first })));
+      expect((await post(path, other.cookie, { url: second })).status).toBe(404);
+      for (const url of ["javascript:alert(1)", "https://github.com.evil/o/r/pull/2", "https://github.com/o/r/issues/2", "https://github.com/o/r/pull/0"]) {
+        expect((await post(path, owner.cookie, { url })).status).toBe(400);
+      }
+      const linked = await post(path, owner.cookie, { url: "  https://github.com/O/R/pull/2/  " });
+      expect(linked.status).toBe(200);
+      expect(await json(linked)).toMatchObject({ pullRequestUrl: first, pullRequestUrls: [first, second] });
+      expect(await json(await post(path, owner.cookie, { url: second }))).toMatchObject({ pullRequestUrls: [first, second] });
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run.pullRequestUrls).toEqual([first, second]);
+    });
+
+    it("returns cached PR states consistently in the sidebar, conversation, and event updates", async () => {
+      const owner = await signIn("pr-states-owner", 125);
+      const created = await run(Effect.gen(function* () {
+        const store = yield* Store;
+        const created = yield* store.enqueueRun({
+          user_id: owner.user.id, repo_full_name: "o/r", installation_id: 1, base_branch: "main", task: "PR states",
+        });
+        for (const number of [201, 202, 203, 204, 205]) {
+          yield* store.linkPullRequest(created.id, `https://github.com/o/linked/pull/${number}`);
+        }
+        return created;
+      }));
+      github.prs.set("o/linked/201", { state: "open", merged: false });
+      github.prs.set("o/linked/202", { state: "open", merged: false, draft: true });
+      github.prs.set("o/linked/203", { state: "closed", merged: false });
+      github.prs.set("o/linked/204", { state: "closed", merged: true });
+      const before = github.prCalls.length;
+      const expected = ["open", "draft", "closed", "merged", "unknown"].map((state, i) => ({
+        url: `https://github.com/o/linked/pull/${201 + i}`, state,
+      }));
+      const listed = await json(request("/api/runs", { headers: { cookie: owner.cookie } }));
+      expect(listed[0].pullRequests).toEqual(expected);
+      const detail = await json(request(`/api/runs/${created.id}`, { headers: { cookie: owner.cookie } }));
+      expect(detail.run.pullRequests).toEqual(expected);
+      const events = await json(request(`/api/runs/${created.id}/events`, { headers: { cookie: owner.cookie } }));
+      expect(events.run.pullRequests).toEqual(expected);
+      expect((await json(post(`/api/runs/${created.id}/cancel`, owner.cookie))).pullRequests).toEqual(expected);
+      expect(github.prCalls.slice(before)).toEqual([201, 202, 203, 204, 205].map((number) => ({
+        token: "ghu_t", repo: "o/linked", number,
+      })));
+    });
+
     it("lets the owner rename a run, and keeps that name", async () => {
       const owner = await signIn("namer", 23);
       const other = await signIn("not-namer", 24);
@@ -507,6 +677,27 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
   });
 
   describe("agents and snapshots", () => {
+    it("saves model and effort, returns them in run details, and rejects invalid options", async () => {
+      const { cookie } = await signIn("model-picker", 31);
+      github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-api03-" + "a".repeat(30) });
+      const body = { installationId: 1, repo: "shixzie/demo", task: "x" };
+      const created = await post("/api/runs", cookie, { ...body, model: "opus", reasoningEffort: "high" });
+      expect(created.status).toBe(201);
+      const selected = await json(created);
+      expect(selected).toMatchObject({ model: "opus", reasoningEffort: "high" });
+      const detail = await json(request(`/api/runs/${selected.id}`, { headers: { cookie } }));
+      expect(detail.run).toMatchObject({ model: "opus", reasoningEffort: "high" });
+      const defaults = await json(post("/api/runs", cookie, body));
+      expect(defaults).toMatchObject({ model: null, reasoningEffort: null });
+      for (const options of [
+        { reasoningEffort: "invalid" }, { reasoningEffort: "ultra" },
+        { model: "" }, { model: "--help" }, { model: "a\nb" }, { model: "a".repeat(201) },
+      ]) {
+        expect((await post("/api/runs", cookie, { ...body, ...options })).status).toBe(400);
+      }
+    });
+
     it("needs the chosen agent's own key", async () => {
       const { cookie } = await signIn("codexer", 11);
       github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];

@@ -3,7 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Either, Layer, Option, Redacted } from "effect";
 import { createVerify, generateKeyPairSync, randomBytes } from "node:crypto";
 import { TokenCipher } from "../src/crypto.js";
-import { createAppJwt } from "../src/github/app.js";
+import { createAppJwt, GitHubAppApi } from "../src/github/app.js";
 import { appManifest, manifestFormUrl } from "../src/github/manifest.js";
 import { authorizeUrl, GitHubUserApi, parseTokenResponse } from "../src/github/oauth.js";
 import { InstanceSettings } from "../src/instance.js";
@@ -72,6 +72,68 @@ const memorySettings = (rows = new Map<string, unknown>()) =>
     } as unknown as StoreService),
   );
 
+describe("GitHub pull request reconciliation", () => {
+  it.effect("limits lookup to the repository owner, source branch, target branch and open state", () => {
+    const client = HttpClient.make((req, url) => Effect.sync(() => {
+      expect(req.method).toBe("GET");
+      expect(url.pathname).toBe("/repos/acme/demo/pulls");
+      expect(url.searchParams.get("state")).toBe("open");
+      expect(url.searchParams.get("head")).toBe("acme:factory/run-1");
+      expect(url.searchParams.get("base")).toBe("release/next");
+      expect(req.headers.authorization).toBe("Bearer repo-token");
+      return HttpClientResponse.fromWeb(req, Response.json([{ number: 9, html_url: "https://github.com/acme/demo/pull/9" }]));
+    }));
+    const layer = GitHubAppApi.Live.pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+      Layer.provide(InstanceSettings.Live),
+      Layer.provide(memorySettings()),
+      Layer.provide(Layer.setConfigProvider(ConfigProvider.fromJson({}))),
+    );
+    return Effect.gen(function* () {
+      const github = yield* GitHubAppApi;
+      const found = yield* github.findOpenPullRequest(Redacted.make("repo-token"), "acme/demo", { head: "factory/run-1", base: "release/next" });
+      expect(found).toEqual(Option.some({ number: 9, html_url: "https://github.com/acme/demo/pull/9" }));
+    }).pipe(Effect.provide(layer));
+  });
+});
+
+describe("GitHubAppApi pull requests", () => {
+  const api = (response: Response, requests: Request[] = []) => GitHubAppApi.Live.pipe(
+    Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make((req) => Effect.sync(() => {
+      requests.push(new Request(req.url, { method: req.method, headers: req.headers }));
+      return HttpClientResponse.fromWeb(req, response.clone());
+    })))),
+    Layer.provide(InstanceSettings.Live),
+    Layer.provide(memorySettings()),
+    Layer.provide(Layer.setConfigProvider(ConfigProvider.fromJson({}))),
+  );
+
+  it.effect("reads the PR merge flag and head with the installation token", () =>
+    Effect.gen(function* () {
+      for (const merged of [false, true]) {
+        const requests: Request[] = [];
+        const pr = { number: 7, html_url: "https://github.com/o/r/pull/7", state: "closed", merged, head: { sha: "a".repeat(40) } };
+        const result = yield* Effect.flatMap(GitHubAppApi, (github) => github.pullRequest(Redacted.make("repo-token"), "o/r", 7)).pipe(
+          Effect.provide(api(Response.json({ ...pr, extra: "ignored" }), requests)),
+        );
+        expect(result).toEqual(pr);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]!.method).toBe("GET");
+        expect(requests[0]!.url).toBe("https://api.github.com/repos/o/r/pulls/7");
+        expect(requests[0]!.headers.get("authorization")).toBe("Bearer repo-token");
+      }
+    }),
+  );
+
+  it.effect("propagates unreadable PR state instead of treating it as merged", () =>
+    Effect.gen(function* () {
+      const github = yield* GitHubAppApi;
+      const result = yield* Effect.either(github.pullRequest(Redacted.make("repo-token"), "o/r", 7));
+      expect(result).toMatchObject({ _tag: "Left", left: { status: 403 } });
+    }).pipe(Effect.provide(api(Response.json({ message: "Forbidden" }, { status: 403 })))),
+  );
+});
+
 describe("GitHub App manifest", () => {
   it("points GitHub back at the factory and asks for what runs need", () => {
     const manifest = appManifest("https://f.example", "Factory on Rails 0a1b2c");
@@ -84,7 +146,7 @@ describe("GitHub App manifest", () => {
       hook_attributes: { active: false },
     });
     expect(Object.keys(manifest.default_permissions).sort()).toEqual(
-      ["administration", "contents", "metadata", "pull_requests", "workflows"],
+      ["actions", "administration", "checks", "contents", "metadata", "pull_requests", "statuses", "workflows"],
     );
   });
 
@@ -223,6 +285,22 @@ describe("GitHubUserApi", () => {
         api({ "POST /user/repos": Response.json({ message: "name already exists on this account" }, { status: 422 }) }),
       ),
     ),
+  );
+
+  it.effect("reads draft and merge state with the signed-in user's token", () =>
+    Effect.gen(function* () {
+      const gh = yield* GitHubUserApi;
+      expect(yield* gh.pullRequest("ghu_pr_reader", "o/r", 8)).toEqual({
+        number: 8, html_url: "https://github.com/o/r/pull/8", state: "open", merged: false, draft: true, head: { sha: "abc" },
+      });
+      expect(requests.at(-1)?.url).toBe("https://api.github.com/repos/o/r/pulls/8");
+      expect(requests.at(-1)?.headers.get("authorization")).toBe("Bearer ghu_pr_reader");
+      expect(yield* Effect.flip(gh.pullRequest("ghu_pr_reader", "o/private", 9))).toMatchObject({ status: 404 });
+    }).pipe(Effect.provide(api({
+      "GET /repos/o/r/pulls/8": Response.json({
+        number: 8, html_url: "https://github.com/o/r/pull/8", state: "open", merged: false, draft: true, head: { sha: "abc" },
+      }),
+    }))),
   );
 
   it.effect("exchanges the OAuth code and fails on GitHub's 200-with-error answers", () =>

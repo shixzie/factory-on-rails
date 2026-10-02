@@ -57,18 +57,32 @@ export const api = {
     ),
   createRun: (body: Api.CreateRunBody) => call(json("POST", "/api/runs", body), Api.ApiRun),
   runDiff: (id: string) => call(HttpClientRequest.get(`/api/runs/${encodeURIComponent(id)}/diff`), Api.ApiRunDiff),
-  sendMessage: (id: string, text: string) =>
-    call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text }), Api.ApiRun),
+  sendMessage: (id: string, text: string, images?: readonly Api.ImageUpload[]) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/messages`, { text, images }), Api.ApiRun),
   openPreview: (id: string, body: Api.OpenPreviewBody) =>
     call(json("POST", `/api/runs/${encodeURIComponent(id)}/previews`, body), Api.PreviewLink),
+  linkPullRequest: (id: string, url: string) =>
+    call(json("POST", `/api/runs/${encodeURIComponent(id)}/pull-requests`, { url }), Api.ApiRun),
   renameRun: (id: string, title: string) =>
     call(json("PATCH", `/api/runs/${encodeURIComponent(id)}`, { title }), Api.ApiRun),
+  settleRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/settle`), Api.ApiRun),
   cancelRun: (id: string) => call(HttpClientRequest.post(`/api/runs/${encodeURIComponent(id)}/cancel`), Api.ApiRun),
   keys: call(HttpClientRequest.get("/api/settings/keys"), Schema.Array(Api.ApiKeySlot)),
   saveKey: (provider: string, key: string) =>
     call(json("PUT", `/api/settings/keys/${encodeURIComponent(provider)}`, { key }), Schema.Array(Api.ApiKeySlot)),
   deleteKey: (provider: string) =>
     call(HttpClientRequest.del(`/api/settings/keys/${encodeURIComponent(provider)}`), Schema.Array(Api.ApiKeySlot)),
+  mcpServers: call(HttpClientRequest.get("/api/settings/mcp"), Schema.Array(Api.ApiMcpServer)),
+  createMcpServer: (body: Api.SaveMcpServerBody) =>
+    call(json("POST", "/api/settings/mcp", body), Schema.Array(Api.ApiMcpServer)),
+  saveMcpServer: (id: string, body: Api.SaveMcpServerBody) =>
+    call(json("PUT", `/api/settings/mcp/${encodeURIComponent(id)}`, body), Schema.Array(Api.ApiMcpServer)),
+  deleteMcpServer: (id: string) =>
+    call(HttpClientRequest.del(`/api/settings/mcp/${encodeURIComponent(id)}`), Schema.Array(Api.ApiMcpServer)),
+  authenticateMcpServer: (id: string) =>
+    call(HttpClientRequest.post(`/api/settings/mcp/${encodeURIComponent(id)}/oauth`), Api.McpOAuthLink),
+  disconnectMcpServer: (id: string) =>
+    call(HttpClientRequest.del(`/api/settings/mcp/${encodeURIComponent(id)}/auth`), Schema.Array(Api.ApiMcpServer)),
   snapshot: call(HttpClientRequest.get("/api/settings/snapshot"), Api.SnapshotSettings),
   saveSnapshot: (snapshot: string | null) => call(json("PUT", "/api/settings/snapshot", { snapshot }), Api.SnapshotSettings),
   setup: call(HttpClientRequest.get("/api/setup"), Api.SetupStatus),
@@ -95,5 +109,16 @@ export const clientLayer = (baseUrl: string, headers: Record<string, string> = {
 /** Runs an API call from the browser against this origin. */
 export const runInBrowser = <A>(
   effect: Effect.Effect<A, ApiRequestError, HttpClient.HttpClient>,
+  options?: { readonly timeoutMs: number },
 ): Promise<Either.Either<A, ApiRequestError>> =>
-  Effect.runPromise(effect.pipe(Effect.either, Effect.provide(clientLayer(window.location.origin))));
+  Effect.runPromise(
+    (options
+      ? effect.pipe(
+          Effect.timeoutFail({
+            duration: options.timeoutMs,
+            onTimeout: () => new ApiRequestError({ status: 0, code: "network", message: "The factory is taking too long to respond." }),
+          }),
+        )
+      : effect
+    ).pipe(Effect.either, Effect.provide(clientLayer(window.location.origin))),
+  );

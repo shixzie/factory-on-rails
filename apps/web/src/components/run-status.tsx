@@ -10,18 +10,19 @@ const LABEL: Record<Api.RunStatus, string> = {
   cancelled: "Cancelled",
 };
 
+/** Tinted chips, the way Railway badges a deployment (ACTIVE, DEPLOYING, FAILED). */
 const TONE: Record<Api.RunStatus, string> = {
-  queued: "text-muted-foreground",
-  running: "text-sky-600 dark:text-sky-400",
-  cancelling: "text-warning",
-  succeeded: "text-success",
-  failed: "text-destructive",
-  cancelled: "text-muted-foreground",
+  queued: "bg-muted text-muted-foreground",
+  running: "bg-info/15 text-info",
+  cancelling: "bg-warning/15 text-warning",
+  succeeded: "bg-success/15 text-success",
+  failed: "bg-destructive/15 text-destructive",
+  cancelled: "bg-muted text-muted-foreground",
 };
 
 const DOT: Record<Api.RunStatus, string> = {
   queued: "bg-muted-foreground/50",
-  running: "bg-sky-500 animate-pulse",
+  running: "bg-info animate-pulse",
   cancelling: "bg-warning animate-pulse",
   succeeded: "bg-success",
   failed: "bg-destructive",
@@ -33,26 +34,33 @@ export const isActive = (status: Api.RunStatus) => status === "queued" || status
 /** A live run whose agent asked a question and is waiting for the user. */
 const needsInput = (status: Api.RunStatus, awaiting?: boolean) => !!awaiting && status === "running";
 
-export function StatusDot({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+export function StatusDot({ status, awaiting, idle, className }: { status: Api.RunStatus; awaiting?: boolean; idle?: boolean; className?: string }) {
   return (
     <span
       aria-hidden
       className={cn(
         "inline-block size-1.5 shrink-0 rounded-full",
-        needsInput(status, awaiting) ? "bg-warning animate-pulse" : DOT[status],
+        needsInput(status, awaiting) ? "bg-warning animate-pulse" : idle && status === "running" ? "bg-muted-foreground/50" : DOT[status],
         className,
       )}
     />
   );
 }
 
-/** A dot and a word, colored by state, the way t3code labels a thread. */
-export function StatusLabel({ status, awaiting, className }: { status: Api.RunStatus; awaiting?: boolean; className?: string }) {
+/** A dot and a word on a chip tinted by state. */
+export function StatusLabel({ status, awaiting, idle, className }: { status: Api.RunStatus; awaiting?: boolean; idle?: boolean; className?: string }) {
   const input = needsInput(status, awaiting);
+  const resting = idle && status === "running";
   return (
-    <span className={cn("inline-flex items-center gap-1.5 text-xs font-medium", input ? "text-warning" : TONE[status], className)}>
-      <StatusDot status={status} awaiting={awaiting} />
-      {input ? "Needs input" : LABEL[status]}
+    <span
+      className={cn(
+        "inline-flex h-5 items-center gap-1.5 rounded-sm px-1.5 text-[11px] font-medium tracking-wide uppercase",
+        input ? "bg-warning/15 text-warning" : resting ? "bg-muted text-muted-foreground" : TONE[status],
+        className,
+      )}
+    >
+      <StatusDot status={status} awaiting={awaiting} idle={idle} />
+      {input ? "Needs input" : resting ? "Idle" : LABEL[status]}
     </span>
   );
 }

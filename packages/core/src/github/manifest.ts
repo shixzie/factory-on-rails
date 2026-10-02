@@ -32,6 +32,9 @@ export function appManifest(publicUrl: string, name: string) {
       workflows: "write",
       administration: "write",
       metadata: "read",
+      checks: "read",
+      statuses: "read",
+      actions: "read",
     },
     default_events: [],
   };

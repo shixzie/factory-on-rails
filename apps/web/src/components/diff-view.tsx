@@ -1,15 +1,15 @@
 "use client";
 
 import { ChevronRightIcon, FileCodeIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import type { Api } from "@/lib/api";
 import { diffTotals, parseDiff, type DiffFile, type DiffLine } from "@/lib/diff";
 import { ago } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const LINE_TONE: Record<DiffLine["type"], string> = {
-  add: "bg-success/10 text-foreground",
-  del: "bg-destructive/10 text-foreground",
+  add: "bg-success/10 text-foreground dark:bg-success/15",
+  del: "bg-destructive/10 text-foreground dark:bg-destructive/15",
   ctx: "text-foreground/80",
   note: "text-muted-foreground italic",
 };
@@ -181,23 +181,31 @@ export function DiffPane({
 
 /** The files a turn changed, as a compact list under the thread; each opens the diff panel at that file. */
 export function ChangedFiles({ files, onOpen }: { files: DiffFile[]; onOpen: (path?: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
   const totals = diffTotals(files);
   if (files.length === 0) return null;
   return (
-    <div className="rounded-xl border bg-card/40">
-      <button
-        type="button"
-        onClick={() => onOpen()}
-        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-xs font-medium text-muted-foreground hover:text-foreground"
-      >
-        <FileCodeIcon className="size-3.5" />
-        <span>
-          {files.length} {files.length === 1 ? "file" : "files"} changed
-        </span>
-        <DiffStat additions={totals.additions} deletions={totals.deletions} />
-        <span className="ml-auto">View diff</span>
-      </button>
-      <div className="border-t px-1.5 py-1.5">
+    <div className="rounded-lg border bg-card/40">
+      <div className="flex items-center text-xs font-medium text-muted-foreground">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+          aria-controls={listId}
+          className="flex min-w-0 flex-1 items-center gap-2 px-3.5 py-2.5 text-left hover:text-foreground"
+        >
+          <ChevronRightIcon className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} />
+          <span>
+            {files.length} {files.length === 1 ? "file" : "files"} changed
+          </span>
+          <DiffStat additions={totals.additions} deletions={totals.deletions} />
+        </button>
+        <button type="button" onClick={() => onOpen()} className="shrink-0 px-3.5 py-2.5 hover:text-foreground">
+          View diff
+        </button>
+      </div>
+      <div id={listId} hidden={!open} className="max-h-[min(15rem,30dvh)] overflow-y-auto overscroll-contain border-t px-1.5 py-1.5">
         {files.map((file) => (
           <button
             key={file.path}

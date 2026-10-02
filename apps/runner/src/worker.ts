@@ -5,6 +5,7 @@ import {
   DEFAULT_AGENT,
   isAgentId,
   MODEL_PROVIDERS,
+  resolveMcpServers,
   snapshotsFor,
   Store,
   TokenCipher,
@@ -13,6 +14,7 @@ import {
   type RunSandbox,
 } from "@factory/core";
 import { Duration, Effect, FiberSet, Option, Queue, Schedule, Stream } from "effect";
+import { randomUUID } from "node:crypto";
 import { RunnerConfig } from "./config.js";
 import { executeRun } from "./execute.js";
 import { SCRUB_SCRIPT, withHome } from "./plan.js";
@@ -65,22 +67,25 @@ export const handleRun = (run: RunRow) =>
       Effect.gen(function* () {
         yield* log.error(error);
         yield* log.flush;
-        yield* store.finishRun(run.id, "failed", error);
+        yield* store.finishRun(run.id, "failed", error, run.claimed_by ?? undefined);
       });
 
     const { snapshot, error: snapshotError } = yield* userSnapshot(run.user_id);
-    if (snapshotError) return yield* fail(snapshotError);
+    if (snapshotError && !run.recovering) return yield* fail(snapshotError);
     const keyEnv = yield* userKeyEnv(run.user_id, agent).pipe(
       Effect.tapErrorCause((cause) => Effect.logError("Could not decrypt API keys", cause)),
       Effect.orElseSucceed((): Record<string, string> => ({})),
     );
     // A snapshot can carry the agent's own sign-in, so it may stand in for a key.
-    if (Object.keys(keyEnv).length === 0 && !snapshot) return yield* fail(noKey(agent));
-    Object.values(keyEnv).forEach(log.addSecret);
+    if (Object.keys(keyEnv).length === 0 && !snapshot && !run.recovering) return yield* fail(noKey(agent));
+    Object.values(keyEnv).forEach((value) => log.addSecret(value));
     if (Object.keys(keyEnv).length === 0) yield* log.info(`No key saved for ${AGENTS[agent].label}, so it uses the sign-in in snapshot ${snapshot}`);
+
+    const mcpContext = yield* Effect.context<Effect.Effect.Context<ReturnType<typeof resolveMcpServers>>>();
 
     const outcome = yield* executeRun(run, {
       log,
+      loadMcpServers: resolveMcpServers(run.user_id).pipe(Effect.provide(mcpContext)),
       // The user's own keys win over any platform-level passthrough of the same name.
       agent: {
         id: agent,
@@ -95,16 +100,21 @@ export const handleRun = (run: RunRow) =>
       heartbeatEvery: config.heartbeatInterval,
     });
     yield* log.flush;
-    yield* store.finishRun(run.id, outcome.status, outcome.status === "failed" ? outcome.error : undefined);
+    if (outcome.status === "recovering") {
+      // Avoid a tight claim/release loop while an upstream service is down.
+      yield* Effect.sleep(config.pollInterval);
+      if (run.claimed_by) yield* store.releaseRun(run.id, run.claimed_by);
+      return;
+    }
+    yield* store.finishRun(run.id, outcome.status, outcome.status === "failed" ? outcome.error : undefined, run.claimed_by ?? undefined);
     yield* Effect.logInfo(`Run ${outcome.status}`);
   }).pipe(
     Effect.scoped,
-    // A stopping runner (redeploy, scale down) interrupts its runs: the agent is
-    // killed and the run is marked failed, not left hanging. Its sandbox is kept,
-    // so a message picks the run up again where it stopped.
+    // Scope finalizers detach before giving the claim back. A replacement can
+    // reattach to the same commands without creating a new conversation turn.
     Effect.onInterrupt(() =>
       Effect.flatMap(Store, (store) =>
-        store.finishRun(run.id, "failed", "The runner stopped before this run finished. Send a message to pick it up again."),
+        run.claimed_by ? store.releaseRun(run.id, run.claimed_by) : Effect.void,
       ).pipe(Effect.ignore),
     ),
     Effect.catchAllCause((cause) => Effect.logError("Run crashed", cause)),
@@ -112,14 +122,13 @@ export const handleRun = (run: RunRow) =>
   );
 
 /**
- * Fails runs whose runner died. Their sandboxes stay, and are stopped like any
- * other idle sandbox (see stopIdleSandboxes).
+ * Releases runs whose runner died so another runner can reconnect to them.
  */
 export const reap = Effect.gen(function* () {
   const config = yield* RunnerConfig;
   const store = yield* Store;
   for (const stale of yield* store.reapStaleRuns(config.staleRunSeconds)) {
-    yield* Effect.logWarning(`Reaped stale run ${stale.id}`);
+    yield* Effect.logWarning(`Recovering stale run ${stale.id}`);
   }
 });
 
@@ -230,7 +239,7 @@ export const keepPreviewedSandboxesAlive = (last: Map<string, number>, now = Dat
     }
   });
 
-/** Claims and runs queued runs until interrupted; interrupting it stops every run in flight. */
+/** Claims queued runs until interrupted; shutdown detaches commands and releases their claims. */
 export const runner = Effect.gen(function* () {
   const config = yield* RunnerConfig;
   const store = yield* Store;
@@ -272,7 +281,7 @@ export const runner = Effect.gen(function* () {
   yield* Effect.forever(
     Effect.gen(function* () {
       yield* slots.take(1);
-      const next = yield* store.claimNextRun(config.workerId).pipe(
+      const next = yield* store.claimNextRun(`${config.workerId}:${randomUUID()}`).pipe(
         Effect.tapErrorCause((cause) => Effect.logError("Could not claim a run", cause)),
         Effect.orElseSucceed(() => Option.none<RunRow>()),
       );

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { SqlError } from "@effect/sql";
+import { type RunEvent } from "@factory/core";
+import { Deferred, Duration, Effect, Fiber } from "effect";
 import { makeRunLog, redact } from "../src/run-log.js";
-import { recordingStore } from "./stubs.js";
+import { recordingStore, stubStore } from "./stubs.js";
 
 describe("redact", () => {
   it("scrubs every occurrence of every secret", () => {
@@ -14,9 +16,88 @@ describe("redact", () => {
   it("leaves messages without secrets alone", () => {
     expect(redact("all good", ["sk-ant-secret-value"])).toBe("all good");
   });
+
+  it("matches literal secrets once, including overlaps and short credentials", () => {
+    expect(redact("token.with[syntax] and token", ["token", "token.with[syntax]", "a"])).toBe("[redacted] [redacted]nd [redacted]");
+  });
 });
 
 describe("makeRunLog", () => {
+  it.effect("redacts arbitrary MCP credentials in text and nested structured events", () => Effect.gen(function* () {
+    const store = recordingStore();
+    const secret = 'key-"quoted"\\line\nsecond-line';
+    yield* Effect.gen(function* () {
+      const log = yield* makeRunLog("run-1");
+      log.addSecret(secret, { allowShort: true });
+      log.addSecret("pin7", { allowShort: true });
+      log.push("tool_result", `raw ${secret}; encoded ${JSON.stringify(secret)}; pin7`, {
+        _replayKey: "1:agent:0",
+        result: { token: secret, values: [secret, "pin7"], count: 2, ok: true, empty: null },
+      });
+    }).pipe(Effect.scoped, Effect.provide(store.layer));
+    expect(store.events).toEqual([{
+      kind: "tool_result", message: 'raw [redacted]; encoded "[redacted]"; [redacted]',
+      data: { _replayKey: "1:agent:0", result: { token: "[redacted]", values: ["[redacted]", "[redacted]"], count: 2, ok: true, empty: null } },
+    }]);
+  }));
+
+  it.effect("retains failed writes for retry and reports durable flush errors", () => Effect.gen(function* () {
+    const stored: RunEvent[] = [];
+    const unavailable = new SqlError.SqlError({ message: "database restarting", cause: new Error("connection reset") });
+    let online = false;
+    const layer = stubStore({
+      appendEvents: (_id, batch) => Effect.suspend(() => online
+        ? Effect.sync(() => { stored.push(...batch); })
+        : Effect.fail(unavailable)),
+    });
+    yield* Effect.gen(function* () {
+      const log = yield* makeRunLog("run-1", { flushEvery: Duration.hours(1) });
+      log.push("message", "before deploy", { _replayKey: "1:agent:0" });
+      const failed = yield* Effect.either(log.flushDurable!);
+      expect(failed).toMatchObject({ _tag: "Left", left: unavailable });
+      log.push("message", "while reconnecting", { _replayKey: "1:agent:1" });
+      online = true;
+      yield* log.flushDurable!;
+      yield* log.flushDurable!;
+    }).pipe(Effect.scoped, Effect.provide(layer));
+    expect(stored.map((event) => event.message)).toEqual(["before deploy", "while reconnecting"]);
+  }));
+
+  it.effect("restores an in-flight failed batch ahead of new output without overlapping inserts", () => Effect.gen(function* () {
+    const started = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const stored: RunEvent[] = [];
+    let attempts = 0;
+    let active = 0;
+    let mostActive = 0;
+    const layer = stubStore({
+      appendEvents: (_id, batch) => Effect.gen(function* () {
+        active++;
+        mostActive = Math.max(mostActive, active);
+        if (++attempts === 1) {
+          yield* Deferred.succeed(started, undefined);
+          yield* Deferred.await(release);
+          return yield* new SqlError.SqlError({ message: "database restarting", cause: new Error("connection reset") });
+        }
+        stored.push(...batch);
+      }).pipe(Effect.ensuring(Effect.sync(() => { active--; }))),
+    });
+    yield* Effect.gen(function* () {
+      const log = yield* makeRunLog("run-1", { flushEvery: Duration.hours(1) });
+      log.push("stdout", "first");
+      const flushing = yield* Effect.fork(Effect.either(log.flushDurable!));
+      yield* Deferred.await(started);
+      log.push("stdout", "second");
+      const queued = yield* Effect.fork(Effect.either(log.flushDurable!));
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(flushing);
+      yield* Fiber.join(queued);
+      yield* log.flushDurable!;
+    }).pipe(Effect.scoped, Effect.provide(layer));
+    expect(stored.map((event) => event.message)).toEqual(["first", "second"]);
+    expect(mostActive).toBe(1);
+  }));
+
   it.effect("stores redacted events when its scope closes", () =>
     Effect.gen(function* () {
       const store = recordingStore();

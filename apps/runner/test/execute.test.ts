@@ -1,8 +1,11 @@
-import { PREVIEW_AGENT_SCRIPT, verifyPreviewGrant, type RunRow } from "@factory/core";
+import { GitHubError, PREVIEW_AGENT_SCRIPT, readCiChecks, type CiCheck, type PullRequestState, verifyPreviewGrant, type RunExecution, type RunRow } from "@factory/core";
+import { HttpClient, HttpClientResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Redacted } from "effect";
+import { Duration, Effect, Fiber, Layer, TestClock, Option, Redacted } from "effect";
+import { ExecInterruptedError } from "railway";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
+import { imagePath, withImages } from "../src/images.js";
 import {
   HAS_SESSION_MARKER,
   MAX_DIFF_BYTES,
@@ -13,6 +16,7 @@ import {
   UP_TO_DATE_MARKER,
 } from "../src/plan.js";
 import { makeRunLog } from "../src/run-log.js";
+import { SandboxError } from "../src/sandbox.js";
 import { fakeGitHub, fakeSandboxes, recordingStore } from "./stubs.js";
 
 const run = {
@@ -31,6 +35,9 @@ const run = {
 } as RunRow;
 
 const PR = "https://github.com/shixzie/demo/pull/1";
+const prState = (patch: Partial<PullRequestState> = {}): PullRequestState => ({
+  number: 1, html_url: PR, state: "open", merged: false, head: { sha: "a".repeat(40) }, ...patch,
+});
 
 /** The same run on its next turn, after the user sent `message` (event id 5). */
 const followUp = (patch: Partial<RunRow>) => ({ ...run, turns: 2, branch: "factory/run-0123abcd", pull_request_url: PR, ...patch }) as RunRow;
@@ -55,18 +62,26 @@ const execute = (
     turn = run,
     prOpen = false,
     grantedPermissions,
-  }: { turn?: RunRow; prOpen?: boolean; grantedPermissions?: string[] } = {},
+    ciChecks,
+    pullRequest,
+  }: {
+    turn?: RunRow;
+    prOpen?: boolean;
+    grantedPermissions?: string[];
+    ciChecks?: (sha: string) => Effect.Effect<ReadonlyArray<CiCheck>, GitHubError>;
+    pullRequest?: (number: number) => Effect.Effect<PullRequestState, GitHubError>;
+  } = {},
 ) => {
   const github: unknown[][] = [];
   return Effect.gen(function* () {
-    const log = yield* makeRunLog(run.id);
+    const log = yield* makeRunLog(run.id, { flushEvery: Duration.hours(1) });
     log.addSecret(agent.env.ANTHROPIC_API_KEY!);
-    const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ...extra });
+    const outcome = yield* executeRun(turn, { log, agent, git: { authorName: "A", authorEmail: "a@x" }, harnessUrl: Option.none(), ciDiscoveryGrace: "0 seconds", ...extra });
     yield* log.flush;
     return { outcome, github, events: store.events.map((e) => `${e.kind}:${e.message}`) };
   }).pipe(
     Effect.scoped,
-    Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { grantedPermissions, prOpen }))),
+    Effect.provide(Layer.mergeAll(sandboxes.layer, store.layer, fakeGitHub(github, { grantedPermissions, prOpen, ciChecks, pullRequest }))),
   );
 };
 
@@ -77,6 +92,588 @@ const PREVIEW_KEY = "s".repeat(40);
 const preview = Option.some({ tunnelUrl: "wss://tunnel.preview.example/connect", signingKey: Redacted.make(PREVIEW_KEY) });
 
 describe("executeRun", () => {
+  for (const origin of ["new", "kept", "restored"] as const) {
+    it.effect(`loads authenticated MCP tools outside the repository in a ${origin} sandbox`, () => Effect.gen(function* () {
+      const token = "mcp-bearer-secret";
+      const envSecret = 'mcp-"env"-secret';
+      const sandboxes = fakeSandboxes({ "run-agent": { stdout: `using ${token} and ${envSecret}` } }, {
+        alive: ["sbx_live"], checkpoints: { cp_1: "saved-sandbox" },
+      });
+      sandboxes.state.files["/workspace/.factory/mcp.json"] = '{"mcpServers":{"removed":{}}}';
+      const turn = origin === "new" ? run : followUp(origin === "kept"
+        ? { sandbox_state: "running", sandbox_id: "sbx_live" }
+        : { sandbox_state: "stopped", sandbox_checkpoint_id: "cp_1", sandbox_checkpoint_name: "saved-sandbox" });
+      let loads = 0;
+      const { outcome, events } = yield* execute(sandboxes, recordingStore(), {
+        loadMcpServers: Effect.sync(() => {
+          loads++;
+          return { servers: [
+            { name: "remote", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: `Bearer ${token}` } },
+            { name: "local", transport: "stdio" as const, command: "node", args: ["server.mjs"], env: { API_KEY: envSecret } },
+          ], warnings: ["MCP needs-login requires authentication. Reconnect in Settings."] };
+        }),
+      }, { turn });
+      expect(outcome.status).toBe("succeeded");
+      expect(loads).toBe(1);
+      const config = JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!);
+      expect(Object.keys(config.mcpServers).sort()).toEqual(["factory", "local", "remote"]);
+      expect(config.mcpServers.remote.headers.Authorization).toBe(`Bearer ${token}`);
+      expect(config.mcpServers.local.env.API_KEY).toBe(envSecret);
+      expect(sandboxes.state.files["/workspace/.factory/codex-config"]).toContain('mcp_servers.remote={url="https://mcp.example.com"');
+      for (const name of ["mcp.json", "codex-config"]) expect(sandboxes.state.modes[`/workspace/.factory/${name}`]).toBe(0o600);
+      expect(Object.keys(sandboxes.state.files).some((path) => path.startsWith("/workspace/repo/"))).toBe(false);
+      expect(events.join("\n")).not.toContain(token);
+      expect(events.join("\n")).not.toContain(envSecret);
+      expect(events).toContain("info:MCP needs-login requires authentication. Reconnect in Settings.");
+    }));
+  }
+
+  describe("deployment recovery", () => {
+    const done = (name: string, stdout = "") => ({ name, result: { exitCode: 0, stdout, timedOut: false } });
+    const prepared: RunExecution = {
+      checkout: "clone",
+      sessions: { network: done("network"), checkout: done("checkout"), prepare: done("prepare") },
+    };
+    const recovery = (execution: RunExecution) => ({ ...run, recovering: true, sandbox_state: "running" as const, sandbox_id: "sbx_live", execution });
+
+    it.effect("clones when a deploy interrupted setup before the first checkout", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = recovery({ checkout: "clone", sessions: { network: done("network") } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.commands.some((c) => c.includes("git clone"))).toBe(true);
+        expect(sandboxes.state.createdWith).toBeUndefined();
+      }),
+    );
+
+    it.effect("keeps the frozen follow-up prompt after its delivery marker was saved", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = { ...recovery({ ...prepared, prompt: { text: "Also add the license", commitMessage: "Add license", deliveredMessageId: "5" } }), turns: 2, delivered_message_id: "5" };
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Also add the license");
+      }),
+    );
+
+    it.effect("reattaches to the saved agent without overwriting its task or restarting previews", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({ "run-agent": { stdout: "existing-mcp-secret" } }, { alive: ["sbx_live"] });
+        const previousConfig = '{"mcpServers":{"existing":{"type":"http","url":"https://mcp.example.com"}}}';
+        sandboxes.state.files["/workspace/.factory/mcp.json"] = previousConfig;
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: { name: "live-agent", startedAt: Date.now() } } });
+        const { outcome, events } = yield* execute(sandboxes, recordingStore(), {
+          preview,
+          loadMcpServers: Effect.succeed({ servers: [{ name: "existing", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: "Bearer existing-mcp-secret" } }], warnings: [] }),
+        }, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.attachments).toEqual(["live-agent"]);
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBeUndefined();
+        expect(sandboxes.state.files[PREVIEW_AGENT_FILE]).toBeUndefined();
+        expect(sandboxes.state.commands.some((c) => c.includes("setup-agent"))).toBe(false);
+        expect(sandboxes.state.files["/workspace/.factory/mcp.json"]).toBe(previousConfig);
+        expect(events.join("\n")).not.toContain("existing-mcp-secret");
+      }),
+    );
+
+    it.effect("continues publication after a deploy without running the agent or pushing twice", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: done("agent"), publish: done("publish") } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.commands.some((c) => c.includes("run-agent") || c.includes("git push"))).toBe(false);
+      }),
+    );
+
+    it.effect("reattaches to a CI repair without repeating the initial agent, push or prompt", () =>
+      Effect.gen(function* () {
+        let head = "a".repeat(40);
+        const sandboxes = fakeSandboxes({
+          "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: head = "b".repeat(40) })),
+        }, { alive: ["sbx_live"] });
+        sandboxes.state.files["/workspace/TASK.md"] = "Fix the original CI failure";
+        const turn = {
+          ...recovery({
+            ...prepared,
+            ci: { cycle: 0, startedAt: 0, pullRequestUrl: PR, deliveredMessageId: "0" },
+            sessions: {
+              ...prepared.sessions,
+              agent: done("agent"),
+              publish: done("publish"),
+              "ci:0:head": done("head", head),
+              "ci:0:agent": { name: "live-ci-repair", startedAt: 0 },
+            },
+          }),
+          pull_request_url: PR,
+        };
+        const { outcome } = yield* execute(sandboxes, recordingStore(), { preview }, {
+          turn,
+          prOpen: true,
+          pullRequest: () => Effect.succeed(prState({ head: { sha: head } })),
+          ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : "passed", url: null }]),
+        });
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(sandboxes.state.attachments).toEqual(["live-ci-repair"]);
+        expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(1);
+        expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(1);
+        expect(sandboxes.state.commands.filter((c) => c.endsWith("\ngit rev-parse HEAD"))).toHaveLength(1);
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Fix the original CI failure");
+        expect(sandboxes.state.files[PREVIEW_AGENT_FILE]).toBeUndefined();
+        expect(sandboxes.state.createdWith).toBeUndefined();
+      }),
+    );
+
+    for (const publication of ["running", "completed"] as const) {
+      it.effect(`settles a ${publication} CI publication before checking the previous green commit`, () =>
+        Effect.gen(function* () {
+          let head = "a".repeat(40);
+          const sandboxes = fakeSandboxes({
+            "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: head = "b".repeat(40) })),
+          }, { alive: ["sbx_live"] });
+          const turn = {
+            ...recovery({
+              ...prepared,
+              ci: { cycle: 0, startedAt: 0, pullRequestUrl: PR, deliveredMessageId: "0" },
+              sessions: {
+                ...prepared.sessions,
+                agent: done("agent"),
+                publish: done("publish"),
+                "ci:0:head": done("head", head),
+                "ci:0:agent": done("ci-repair"),
+                "ci:0:publish": publication === "running" ? { name: "ci-publish", startedAt: 0 } : done("ci-publish"),
+              },
+            }),
+            pull_request_url: PR,
+          };
+          const { outcome, github } = yield* execute(sandboxes, recordingStore(), {}, {
+            turn,
+            prOpen: true,
+            pullRequest: () => Effect.succeed(prState({ head: { sha: head } })),
+            ciChecks: () => Effect.succeed([{ name: "Tests", state: "passed", url: null }]),
+          });
+          expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+          expect(sandboxes.state.attachments).toEqual(publication === "running" ? ["ci-publish"] : []);
+          expect(sandboxes.state.commands.some((c) => c.includes("run-agent"))).toBe(false);
+          expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(publication === "running" ? 1 : 0);
+          expect(github.filter((call) => call[0] === "ciChecks")).toEqual([["ciChecks", "b".repeat(40)]]);
+        }),
+      );
+    }
+
+    for (const completion of ["merged", "passed"] as const) {
+      it.effect(`stops a saved CI repair and requeues its messages when the PR ${completion} before reconnecting`, () =>
+        Effect.gen(function* () {
+          const sandboxes = fakeSandboxes({}, { alive: ["sbx_live"] });
+          sandboxes.state.files["/workspace/TASK.md"] = "Fix the original CI failure";
+          const store = withMessage();
+          const turn = {
+            ...recovery({
+              ...prepared,
+              ci: { cycle: 0, startedAt: 0, pullRequestUrl: PR, deliveredMessageId: "0" },
+              sessions: {
+                ...prepared.sessions,
+                agent: done("agent"),
+                publish: done("publish"),
+                "ci:0:head": done("head", "a".repeat(40)),
+                "ci:0:agent": { name: "live-ci-repair", startedAt: 0 },
+              },
+            }),
+            pull_request_url: PR,
+            delivered_message_id: "5",
+          };
+          const { outcome } = yield* execute(sandboxes, store, {}, {
+            turn,
+            prOpen: true,
+            pullRequest: () => Effect.succeed(prState({ merged: completion === "merged" })),
+            ciChecks: () => Effect.succeed([{ name: "Tests", state: completion === "passed" ? "passed" : "failed", url: null }]),
+          });
+          expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+          expect(sandboxes.state.stoppedSessions).toEqual(["live-ci-repair"]);
+          expect(sandboxes.state.attachments).toEqual([]);
+          expect(sandboxes.state.commands.some((c) => c.includes("run-agent") || c.includes("git push"))).toBe(false);
+          expect(sandboxes.state.files["/workspace/TASK.md"]).toBe("Fix the original CI failure");
+          expect(store.updates.filter((patch) => "delivered_message_id" in patch).at(-1)).toEqual({ delivered_message_id: "0" });
+          expect(sandboxes.state.destroyed).toBe(false);
+        }),
+      );
+    }
+
+    it.effect("fails clearly when Railway no longer retains the saved command", () =>
+      Effect.gen(function* () {
+        const cause = new ExecInterruptedError({ closeCode: 1008, reason: "Session not found", stdout: "", stderr: "" });
+        const sandboxes = fakeSandboxes({ "run-agent": Effect.fail(new SandboxError({ message: "Saved command session no longer exists", cause })) }, { alive: ["sbx_live"] });
+        const turn = recovery({ ...prepared, sessions: { ...prepared.sessions, agent: { name: "lost-agent" } } });
+        const { outcome } = yield* execute(sandboxes, recordingStore(), {}, { turn });
+        expect(outcome).toEqual({ status: "failed", error: "Saved command session no longer exists" });
+        expect(sandboxes.state.destroyed).toBe(false);
+      }),
+    );
+  });
+
+  it.effect("waits for pending CI and checks the published commit again", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.sync(() => [{ name: "CI", state: ++polls === 1 ? "pending" : "passed", url: null }]),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(polls).toBe(1);
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("1 second");
+      const { outcome, github } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "ciChecks")).toEqual([["ciChecks", "a".repeat(40)], ["ciChecks", "a".repeat(40)]]);
+    }),
+  );
+
+  it.effect("finishes when real CI passes even if unused app suites stay queued", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const client = HttpClient.make((req) => Effect.sync(() => {
+        const path = new URL(req.url).pathname;
+        let body: unknown;
+        if (path.endsWith("check-runs")) {
+          polls++;
+          body = { check_runs: [{ name: "Tests", status: polls === 1 ? "in_progress" : "completed", conclusion: polls === 1 ? null : "success", html_url: null }] };
+        } else if (path.endsWith("check-suites")) {
+          body = { check_suites: [{ id: 7, status: "queued", conclusion: null, latest_check_runs_count: 0 }] };
+        } else if (path.endsWith("actions/runs")) {
+          body = { workflow_runs: [] };
+        } else {
+          body = { statuses: [] };
+        }
+        return HttpClientResponse.fromWeb(req, Response.json(body));
+      }));
+      const sandboxes = fakeSandboxes();
+      const fiber = yield* Effect.fork(execute(sandboxes, recordingStore(), {}, {
+        ciChecks: (sha) => readCiChecks(client, Redacted.make("token"), run.repo_full_name, sha),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(polls).toBe(1);
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("46 seconds");
+      const { outcome, events } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(polls).toBe(2);
+      expect(events).toContain(`info:CI passed for ${"a".repeat(40)}`);
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(1);
+    }),
+  );
+
+  it.effect("resumes the agent on CI failure, pushes the fix, and verifies the new commit", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      let loads = 0;
+      const seen: string[][] = [];
+      const sandboxes = fakeSandboxes({
+        "run-agent": Effect.sync(() => {
+          seen.push(Object.keys(JSON.parse(sandboxes.state.files["/workspace/.factory/mcp.json"]!).mcpServers).sort());
+          return {};
+        }),
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
+      });
+      const { outcome, github } = yield* execute(sandboxes, recordingStore(), {
+        loadMcpServers: Effect.sync(() => ({ servers: ++loads === 1
+          ? [{ name: "removed", transport: "http" as const, url: "https://mcp.example.com", headers: {} }]
+          : [{ name: "fresh", transport: "http" as const, url: "https://mcp.example.com", headers: { Authorization: "Bearer refreshed-token" } }], warnings: [] })),
+      }, {
+        ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : "passed", url: "https://github.com/shixzie/demo/actions/runs/1" }]),
+        pullRequest: () => Effect.succeed(prState({ head: { sha: (heads === 1 ? "a" : "b").repeat(40) } })),
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "ciChecks")).toEqual([["ciChecks", "a".repeat(40)], ["ciChecks", "a".repeat(40)], ["ciChecks", "b".repeat(40)]]);
+      expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(2);
+      const agents = sandboxes.state.commands.flatMap((c, i) => c.includes("run-agent") ? [i] : []);
+      expect(agents).toHaveLength(2);
+      expect(sandboxes.state.envs[agents[1]!]).toMatchObject({ FACTORY_CONTINUE: "1" });
+      expect(sandboxes.state.files["/workspace/TASK.md"]).toContain("https://github.com/shixzie/demo/actions/runs/1");
+      expect(loads).toBe(2);
+      expect(seen).toEqual([["factory", "removed"], ["factory", "fresh"]]);
+      expect(sandboxes.state.files["/workspace/.factory/mcp.json"]).toContain("Bearer refreshed-token");
+    }),
+  );
+
+  it.effect("gives the initial agent and successive CI repairs distinct replay keys", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      const message = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Checking the changes." }] } });
+      const sandboxes = fakeSandboxes({
+        "run-agent": { stdout: `${message}\n` },
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: String.fromCharCode(97 + heads++).repeat(40) })),
+      });
+      const store = recordingStore();
+      const { outcome } = yield* execute(sandboxes, store, {}, {
+        pullRequest: () => Effect.succeed(prState({ head: { sha: String.fromCharCode(96 + heads).repeat(40) } })),
+        ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("c") ? "passed" : "failed", url: null }]),
+      });
+      expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+      expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(3);
+      const messages = store.events.filter((event) => event.kind === "message");
+      expect(messages.map((event) => event.message)).toEqual(Array(3).fill("Checking the changes."));
+      expect(messages.map((event) => event.data?._replayKey)).toEqual(["1:agent:0", "1:ci:0:agent:0", "1:ci:1:agent:0"]);
+    }),
+  );
+
+  it.effect("refreshes the repaired PR before CI passes and then finishes without more agent work", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      let descriptions = 0;
+      let repairedPolls = 0;
+      const sandboxes = fakeSandboxes({
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
+        "describe-pr": Effect.sync(() => { descriptions++; return {}; }),
+        "cat /workspace/.factory/pull-request.md": { stdout: "Fix the tests\n\nCorrect the failing behavior." },
+      });
+      const { outcome, events } = yield* execute(sandboxes, recordingStore(), { agent: { ...agent, describeCommand: "describe-pr" } }, {
+        prOpen: true,
+        pullRequest: () => Effect.succeed(prState({ head: { sha: (heads === 1 ? "a" : "b").repeat(40) } })),
+        ciChecks: (sha) => Effect.sync(() => {
+          if (sha.startsWith("a")) return [{ name: "Tests", state: "failed", url: null }];
+          expect(descriptions).toBe(++repairedPolls === 1 ? 1 : 2);
+          return [{ name: "Tests", state: repairedPolls < 3 ? "pending" : "passed", url: null }];
+        }),
+        turn: followUp({}),
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(descriptions).toBe(2);
+      expect(events.at(-1)).toBe(`info:CI passed for ${"b".repeat(40)}`);
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(2);
+    }),
+  );
+
+  it.effect("does not start another description when the repaired commit is already green", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      const sandboxes = fakeSandboxes({
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
+        "cat /workspace/.factory/pull-request.md": { stdout: "Fix the tests\n\nCorrect the failing behavior." },
+      });
+      const { outcome, events } = yield* execute(sandboxes, recordingStore(), { agent: { ...agent, describeCommand: "describe-pr" } }, {
+        pullRequest: () => Effect.succeed(prState({ head: { sha: (heads === 1 ? "a" : "b").repeat(40) } })),
+        ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : "passed", url: null }]),
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(sandboxes.state.commands.filter((c) => c.includes("describe-pr"))).toHaveLength(1);
+      expect(events.at(-1)).toBe(`info:CI passed for ${"b".repeat(40)}`);
+    }),
+  );
+
+  it.effect("interrupts a repaired PR description when its new commit becomes green", () =>
+    Effect.gen(function* () {
+      let heads = 0;
+      let descriptions = 0;
+      let complete = false;
+      let interrupted = false;
+      const sandboxes = fakeSandboxes({
+        "\ngit rev-parse HEAD": Effect.sync(() => ({ stdout: (++heads === 1 ? "a" : "b").repeat(40) })),
+        "describe-pr": Effect.suspend(() => ++descriptions === 1
+          ? Effect.succeed({})
+          : Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => { interrupted = true; })))),
+        "cat /workspace/.factory/pull-request.md": { stdout: "Fix the tests\n\nCorrect the failing behavior." },
+      });
+      const fiber = yield* Effect.fork(execute(sandboxes, recordingStore(), { agent: { ...agent, describeCommand: "describe-pr" } }, {
+        pullRequest: () => Effect.succeed(prState({ head: { sha: (heads === 1 ? "a" : "b").repeat(40) } })),
+        ciChecks: (sha) => Effect.succeed([{ name: "Tests", state: sha.startsWith("a") ? "failed" : complete ? "passed" : "pending", url: null }]),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(descriptions).toBe(2);
+      complete = true;
+      yield* TestClock.adjust("1 second");
+      const { outcome, github } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(interrupted).toBe(true);
+      expect(github.filter((c) => c[0] === "createPullRequest")).toHaveLength(1);
+      expect(github.some((c) => c[0] === "updatePullRequest")).toBe(false);
+    }),
+  );
+
+  it.effect("finishes when the current PR merges while CI is pending", () =>
+    Effect.gen(function* () {
+      let merged = false;
+      const sandboxes = fakeSandboxes();
+      const fiber = yield* Effect.fork(execute(sandboxes, recordingStore(), {}, {
+        pullRequest: () => Effect.succeed(prState({ state: merged ? "closed" : "open", merged })),
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "pending", url: null }]),
+      }));
+      yield* TestClock.adjust("14 seconds");
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      merged = true;
+      yield* TestClock.adjust("1 second");
+      const { outcome, events, github } = yield* Fiber.join(fiber);
+      expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+      expect(events).toContain(`info:Pull request merged: ${PR}`);
+      expect(events.some((e) => e.includes("CI passed"))).toBe(false);
+      expect(github.filter((c) => c[0] === "ciChecks")).toHaveLength(1);
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(1);
+    }),
+  );
+
+  for (const completion of ["merged", "passed"] as const) {
+    it.effect(`interrupts an automated CI repair when the published PR is ${completion}`, () =>
+      Effect.gen(function* () {
+        let complete = false;
+        let turns = 0;
+        let interrupted = false;
+        const sandboxes = fakeSandboxes({
+          "run-agent": Effect.suspend(() => ++turns === 1
+            ? Effect.succeed({})
+            : Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => { interrupted = true; })))),
+        });
+        const fiber = yield* Effect.fork(execute(sandboxes, recordingStore(), {}, {
+          pullRequest: () => Effect.succeed(prState({ merged: complete && completion === "merged" })),
+          ciChecks: () => Effect.succeed([{ name: "Tests", state: complete && completion === "passed" ? "passed" : "failed", url: null }]),
+        }));
+        yield* TestClock.adjust("14 seconds");
+        expect(turns).toBe(2);
+        expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+        complete = true;
+        yield* TestClock.adjust("1 second");
+        const { outcome, events } = yield* Fiber.join(fiber);
+        expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
+        expect(interrupted).toBe(true);
+        expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(1);
+        expect(events).toContain(completion === "merged" ? `info:Pull request merged: ${PR}` : `info:CI passed for ${"a".repeat(40)}`);
+      }),
+    );
+  }
+
+  it.effect("rechecks a finished repair before pushing when the PR merged between polls", () =>
+    Effect.gen(function* () {
+      let turns = 0;
+      const sandboxes = fakeSandboxes({ "run-agent": Effect.sync(() => { turns++; return {}; }) });
+      const { outcome } = yield* execute(sandboxes, recordingStore(), {}, {
+        pullRequest: () => Effect.succeed(prState({ merged: turns === 2 })),
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "failed", url: null }]),
+      });
+      expect(outcome.status).toBe("succeeded");
+      expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(1);
+    }),
+  );
+
+  it.effect("leaves user messages queued when CI completion interrupts their automated repair", () =>
+    Effect.gen(function* () {
+      let complete = false;
+      let turns = 0;
+      const store = recordingStore();
+      const sandboxes = fakeSandboxes({ "run-agent": Effect.suspend(() => ++turns === 1 ? Effect.succeed({}) : Effect.never) });
+      const fiber = yield* Effect.fork(execute(sandboxes, store, {}, {
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: complete ? "passed" : "failed", url: null }]),
+      }));
+      yield* TestClock.adjust("1 second");
+      store.userMessages.push({ id: "5", run_id: run.id, at: new Date(0), kind: "user_message", message: "Also add a license", data: null });
+      yield* TestClock.adjust("13 seconds");
+      expect(store.updates).toContainEqual({ delivered_message_id: "5" });
+      complete = true;
+      yield* TestClock.adjust("1 second");
+      expect((yield* Fiber.join(fiber)).outcome.status).toBe("succeeded");
+      expect(store.updates.filter((patch) => "delivered_message_id" in patch)).toEqual([
+        { delivered_message_id: "5" }, { delivered_message_id: "0" },
+      ]);
+      expect(sandboxes.state.commands.filter((c) => c.includes("git push"))).toHaveLength(1);
+    }),
+  );
+
+  it.effect("does not treat a closed, unmerged PR or green checks on an outdated head as completion", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {}, {
+        pullRequest: () => Effect.succeed(prState({ state: "closed", head: { sha: "b".repeat(40) } })),
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "passed", url: null }]),
+      }));
+      yield* TestClock.adjust("60 seconds");
+      expect((yield* Fiber.join(fiber)).outcome).toMatchObject({ status: "failed", error: expect.stringContaining("CI has not been verified green") });
+    }),
+  );
+
+  it.effect("fails honestly when CI is broken and the agent leaves no fixes", () =>
+    Effect.gen(function* () {
+      let pushes = 0;
+      const sandboxes = fakeSandboxes({ "git push": Effect.sync(() => ({ stdout: ++pushes === 1 ? "" : UP_TO_DATE_MARKER })) });
+      const { outcome } = yield* execute(sandboxes, recordingStore(), {}, {
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "failed", url: null }]),
+      });
+      expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("no fixes to push") });
+    }),
+  );
+
+  it.effect("does not skip CI when a follow-up has no new changes", () =>
+    Effect.gen(function* () {
+      const sandboxes = fakeSandboxes({ "git push": { stdout: UP_TO_DATE_MARKER } });
+      const { outcome } = yield* execute(sandboxes, recordingStore(), {}, {
+        turn: followUp({}), prOpen: true,
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "failed", url: null }]),
+      });
+      expect(outcome.status).toBe("failed");
+      expect(sandboxes.state.commands.filter((c) => c.includes("run-agent"))).toHaveLength(2);
+    }),
+  );
+
+  it.effect("allows time for checks to appear before reporting no CI", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), { ciDiscoveryGrace: "60 seconds", agent: { ...agent, timeoutSec: 120 } }, {
+        ciChecks: () => Effect.succeed([]),
+      }));
+      yield* TestClock.adjust("59 seconds");
+      expect(Option.isNone(yield* Fiber.poll(fiber))).toBe(true);
+      yield* TestClock.adjust("1 second");
+      const { outcome, events } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(events.some((e) => e.includes("No CI checks were reported"))).toBe(true);
+      expect(events.some((e) => e.includes("CI passed"))).toBe(false);
+    }),
+  );
+
+  it.effect("can cancel a run while CI is pending", () =>
+    Effect.gen(function* () {
+      let cancelling = false;
+      const store = recordingStore(() => cancelling ? "cancelling" : "running");
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), store, {}, {
+        ciChecks: () => Effect.sync(() => {
+          cancelling = true;
+          return [{ name: "Tests", state: "pending", url: null }];
+        }),
+      }));
+      yield* TestClock.adjust("10 seconds");
+      expect((yield* Fiber.join(fiber)).outcome.status).toBe("cancelled");
+    }),
+  );
+
+  it.effect("refreshes installation credentials during a long CI wait", () =>
+    Effect.gen(function* () {
+      let polls = 0;
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {
+        agent: { ...agent, timeoutSec: 3600 }, ciPollEvery: "45 minutes", heartbeatEvery: "50 minutes",
+      }, {
+        ciChecks: () => Effect.sync(() => [{ name: "Tests", state: ++polls === 1 ? "pending" : "passed", url: null }]),
+      }));
+      yield* TestClock.adjust("45 minutes");
+      const { outcome, github } = yield* Fiber.join(fiber);
+      expect(outcome.status).toBe("succeeded");
+      expect(github.filter((c) => c[0] === "installationToken")).toHaveLength(2);
+    }),
+  );
+
+  it.effect("never marks unreadable CI as successful", () =>
+    Effect.gen(function* () {
+      const { outcome } = yield* execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.fail(new GitHubError({ status: 403, message: "CI access denied" })),
+      });
+      expect(outcome).toEqual({ status: "failed", error: "CI access denied" });
+    }),
+  );
+
+  it.effect("times out pending CI without reporting success", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.fork(execute(fakeSandboxes(), recordingStore(), {}, {
+        ciChecks: () => Effect.succeed([{ name: "Tests", state: "pending", url: null }]),
+      }));
+      yield* TestClock.adjust("60 seconds");
+      const { outcome } = yield* Fiber.join(fiber);
+      expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("CI has not been verified green") });
+    }),
+  );
+
   it.effect("starts the sandbox's preview agent with this run's tunnel grant before the agent works", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
@@ -110,6 +707,24 @@ describe("executeRun", () => {
     }),
   );
 
+  it.effect("passes saved model and effort to the agent on initial and later turns", () =>
+    Effect.gen(function* () {
+      for (const turn of [
+        { ...run, model: "custom-model", reasoning_effort: "high" as const },
+        followUp({ model: "custom-model", reasoning_effort: "high" }),
+      ]) {
+        const sandboxes = fakeSandboxes();
+        yield* execute(sandboxes, withMessage(), {}, { turn });
+        const agentIndex = sandboxes.state.commands.findIndex((c) => c.includes("run-agent"));
+        expect(sandboxes.state.envs[agentIndex]).toMatchObject({
+          FACTORY_MODEL: "custom-model",
+          FACTORY_REASONING_EFFORT: "high",
+          FACTORY_CODEX_EFFORT: 'model_reasoning_effort="high"',
+        });
+      }
+    }),
+  );
+
   it.effect("runs the agent, pushes and opens a PR, and keeps the sandbox for the next turn", () =>
     Effect.gen(function* () {
       const sandboxes = fakeSandboxes();
@@ -122,7 +737,7 @@ describe("executeRun", () => {
         42,
         {
           repositories: ["demo"],
-          permissions: { contents: "write", pull_requests: "write", metadata: "read", workflows: "write" },
+          permissions: { contents: "write", pull_requests: "write", metadata: "read", checks: "read", statuses: "read", actions: "read", workflows: "write" },
         },
       ]);
       expect(sandboxes.state.createdWith).toEqual({ ANTHROPIC_API_KEY: "sk-ant-user-key", IS_SANDBOX: "1" });
@@ -144,6 +759,7 @@ describe("executeRun", () => {
         "run-agent",
         "set -eu",
         "set -eu",
+        "git rev-parse HEAD",
       ]);
       expect(sandboxes.state.commands[4]).toContain("git diff --cached");
       expect(Object.keys(sandboxes.state.files)).toEqual(
@@ -156,7 +772,7 @@ describe("executeRun", () => {
       });
       expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
       expect(sandboxes.state.files["/workspace/TASK.md"]).toBe(run.task);
-      expect(store.updates).toEqual([
+      expect(store.updates.map((patch) => { const { execution, ...rest } = patch as Record<string, unknown>; return rest; }).filter((patch) => Object.keys(patch).length > 0)).toEqual([
         {
           sandbox_id: "sbx_1",
           branch: "factory/run-0123abcd",
@@ -216,12 +832,12 @@ describe("executeRun", () => {
       const sandboxes = fakeSandboxes();
       const store = recordingStore();
       const { outcome, github, events } = yield* execute(sandboxes, store, {}, {
-        grantedPermissions: ["contents", "pull_requests", "metadata"],
+        grantedPermissions: ["contents", "pull_requests", "metadata", "checks", "statuses", "actions"],
       });
       expect(outcome.status).toBe("succeeded");
       expect(github.filter((c) => c[0] === "installationToken").map((c) => Object.keys((c[2] as { permissions: object }).permissions))).toEqual([
-        ["contents", "pull_requests", "metadata", "workflows"],
-        ["contents", "pull_requests", "metadata"],
+        ["contents", "pull_requests", "metadata", "checks", "statuses", "actions", "workflows"],
+        ["contents", "pull_requests", "metadata", "checks", "statuses", "actions"],
       ]);
       expect(events).toContain(
         "info:The GitHub App has no Workflows permission, so this run can't change files in .github/workflows",
@@ -295,7 +911,7 @@ describe("executeRun", () => {
           "stdout:plain text\n",
         ]),
       );
-      expect(store.events.find((e) => e.kind === "tool_call")!.data).toEqual({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
+      expect(store.events.find((e) => e.kind === "tool_call")!.data).toMatchObject({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
       expect(store.diffs).toEqual([{ patch, truncated: false }]);
     }),
   );
@@ -381,6 +997,129 @@ describe("executeRun", () => {
     }),
   );
 
+  describe("image attachments", () => {
+    const image = { id: "aabbccdd-0000-4000-8000-000000000000", name: "Design.png", mediaType: "image/png" as const };
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff]);
+    const storedImage = { id: image.id, run_id: run.id, name: image.name, media_type: image.mediaType, data: bytes.toString("base64") };
+
+    for (const id of ["claude", "codex"] as const) {
+      it.effect(`makes original images available before starting ${id}`, () =>
+        Effect.gen(function* () {
+          const store = recordingStore();
+          store.images.push(storedImage);
+          const sandboxes = fakeSandboxes({
+            "run-agent": () => Effect.sync(() => {
+              expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+              return {};
+            }),
+          });
+          const { outcome, events } = yield* execute(sandboxes, store, { agent: { ...agent, id } }, { turn: { ...run, images: [image] } });
+          expect(outcome.status).toBe("succeeded");
+          expect(sandboxes.state.files["/workspace/TASK.md"]).toBe(withImages(run.task, [image]));
+          expect(events.join("\n")).not.toContain(storedImage.data);
+        }),
+      );
+    }
+
+    it.effect("recreates original and follow-up images when restoring or replacing a sandbox", () =>
+      Effect.gen(function* () {
+        const laterImage = { ...image, id: "11223344-0000-4000-8000-000000000000" };
+        for (const restored of [true, false]) {
+          const store = withMessage();
+          store.userMessages[0]!.data = { images: [laterImage] };
+          store.images.push(storedImage, { ...storedImage, id: laterImage.id });
+          const sandboxes = fakeSandboxes({}, restored ? { checkpoints: { cp_9: "run-x" } } : { failRestore: "checkpoint missing" });
+          const turn = followUp({ images: [image], sandbox_state: "stopped", sandbox_checkpoint_id: "cp_9", sandbox_checkpoint_name: "run-x" });
+          const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+          expect(outcome.status).toBe("succeeded");
+          expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+          expect(sandboxes.state.binaryFiles[imagePath(laterImage)]).toEqual(bytes);
+          const prompt = sandboxes.state.files["/workspace/TASK.md"]!;
+          expect(prompt).toContain(withImages(run.task, [image]));
+          expect(prompt).toContain(withImages("Also add a license", [laterImage]));
+          expect(store.updates).toContainEqual({ delivered_message_id: "5" });
+        }
+      }),
+    );
+
+    it.effect("restores images before reconnecting to an interrupted agent", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        store.images.push(storedImage);
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.sync(() => {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+            return {};
+          }),
+        }, { alive: ["sbx_live"] });
+        const turn: RunRow = { ...run, images: [image], recovering: true, sandbox_id: "sbx_live", sandbox_state: "running", execution: { checkout: "resume", sessions: { agent: { name: "live-agent", startedAt: Date.now() } } } };
+        const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+        expect(outcome.status).toBe("succeeded");
+        expect(sandboxes.state.attachments).toContain("live-agent");
+        expect(sandboxes.state.files["/workspace/TASK.md"]).toBeUndefined();
+      }),
+    );
+
+    it.effect("stops before the agent or delivery marker when an original or pending image is missing", () =>
+      Effect.gen(function* () {
+        for (const followup of [false, true]) {
+          const store = recordingStore();
+          if (followup) {
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "Use this", data: { images: [image] } });
+          }
+          const sandboxes = fakeSandboxes();
+          const turn = followup ? followUp({}) : { ...run, images: [image] };
+          const { outcome } = yield* execute(sandboxes, store, {}, { turn });
+          expect(outcome.status).toBe("failed");
+          expect(sandboxes.state.commands.some((command) => command.includes("run-agent"))).toBe(false);
+          expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+        }
+      }),
+    );
+
+    it.live("uploads newly received images before handing their message to the live agent", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.gen(function* () {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toBeUndefined();
+            store.images.push(storedImage);
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "", data: { images: [image] } });
+            yield* Effect.sleep("100 millis");
+            return {};
+          }),
+          "FACTORY_MESSAGE": () => Effect.sync(() => {
+            expect(sandboxes.state.binaryFiles[imagePath(image)]).toEqual(bytes);
+            expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+            return {};
+          }),
+        });
+        yield* execute(sandboxes, store, { inboxEvery: "10 millis" });
+        const delivered = sandboxes.state.commands.findIndex((command) => command.includes("FACTORY_MESSAGE"));
+        expect(delivered).toBeGreaterThan(0);
+        expect(JSON.parse(sandboxes.state.envs[delivered]!.FACTORY_MESSAGE!).text).toBe(withImages("", [image]));
+        expect(store.updates).toContainEqual({ delivered_message_id: "7" });
+      }),
+    );
+
+    it.live("keeps an image message pending when its upload fails", () =>
+      Effect.gen(function* () {
+        const store = recordingStore();
+        const sandboxes = fakeSandboxes({
+          "run-agent": () => Effect.gen(function* () {
+            store.images.push(storedImage);
+            store.userMessages.push({ id: "7", run_id: run.id, at: new Date(0), kind: "user_message", message: "Use this", data: { images: [image] } });
+            yield* Effect.sleep("50 millis");
+            return {};
+          }),
+        }, { failWrite: "/images/" });
+        yield* execute(sandboxes, store, { inboxEvery: "10 millis" });
+        expect(sandboxes.state.commands.some((command) => command.includes("FACTORY_MESSAGE"))).toBe(false);
+        expect(store.updates).not.toContainEqual({ delivered_message_id: "7" });
+      }),
+    );
+  });
+
   describe("a later turn", () => {
     it.effect("continues the agent's session in the sandbox the last turn left running", () =>
       Effect.gen(function* () {
@@ -398,6 +1137,7 @@ describe("executeRun", () => {
           "run-agent",
           "set -eu",
           "set -eu",
+          "git rev-parse HEAD",
         ]);
         expect(sandboxes.state.commands[1]).toContain("git remote set-url origin https://github.com/shixzie/demo.git");
         expect(sandboxes.state.commands[1]).not.toContain("git clone");
@@ -407,7 +1147,7 @@ describe("executeRun", () => {
         expect(sandboxes.state.files["/workspace/COMMIT_MSG"]).toMatch(/^Also add a license\n/);
         expect(store.updates).toContainEqual({ delivered_message_id: "5" });
         // The PR from the first turn is still open, so the push lands there.
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "findOpenPullRequest", "pullRequest", "ciChecks"]);
         expect(events).toContain(`info:Pushed the changes to ${PR}`);
         expect(store.updates).not.toContainEqual({ pull_request_url: expect.anything() });
         expect(sandboxes.state.destroyed).toBe(false);
@@ -427,7 +1167,7 @@ describe("executeRun", () => {
         expect(sandboxes.state.deletedCheckpoints).toEqual(["cp_9"]);
         expect(store.updates[0]).toMatchObject({ sandbox_id: "sbx_restored", sandbox_state: "running", sandbox_checkpoint_id: null });
         expect(events).toContain("info:No new changes this turn");
-        expect(github.map((c) => c[0])).toEqual(["installationToken"]);
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "pullRequest", "ciChecks"]);
         // No session to continue (the agent never ran here), so it gets the whole story.
         expect(sandboxes.state.envs[3]).not.toHaveProperty("FACTORY_CONTINUE");
         const task = sandboxes.state.files["/workspace/TASK.md"]!;
@@ -486,9 +1226,12 @@ describe("executeRun", () => {
         expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
         const lines = firstLines(sandboxes.state.commands);
         // After the push (the last "set -eu"), before the PR.
-        expect(lines.slice(-3)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
-        expect(sandboxes.state.commands.at(-2)).toContain("\ndescribe-pr");
-        expect(sandboxes.state.envs.at(-2)).toEqual({
+        expect(lines.slice(-4, -1)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
+        expect(sandboxes.state.commands.at(-3)).toContain("\ndescribe-pr");
+        expect(sandboxes.state.envs.at(-3)).toEqual({
+          FACTORY_MODEL: "",
+          FACTORY_REASONING_EFFORT: "",
+          FACTORY_CODEX_EFFORT: "",
           FACTORY_DESCRIBE_FILE: "/workspace/.factory/describe-prompt.md",
           FACTORY_PR_FILE: "/workspace/.factory/pull-request.md",
         });
@@ -540,8 +1283,8 @@ describe("executeRun", () => {
 
         expect(outcome).toEqual({ status: "succeeded", pullRequestUrl: PR });
         expect(sandboxes.state.files["/workspace/.factory/describe-prompt.md"]).toContain("already has a pull request");
-        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "updatePullRequest"]);
-        expect(github[2]).toEqual([
+        expect(github.map((c) => c[0])).toEqual(["installationToken", "createPullRequest", "findOpenPullRequest", "updatePullRequest", "pullRequest", "ciChecks"]);
+        expect(github[3]).toEqual([
           "updatePullRequest",
           "ghs_repo_token",
           "shixzie/demo",

@@ -373,7 +373,7 @@ const NodeCard = memo(function NodeCard({
         <span
           key={ping}
           aria-hidden
-          className="flow-ring pointer-events-none absolute -inset-px rounded-xl border-2"
+          className="flow-ring pointer-events-none absolute -inset-px rounded-lg border-2"
           style={{ borderColor: accent }}
         />
       ) : null}
@@ -402,7 +402,7 @@ const NodeCard = memo(function NodeCard({
     </>
   );
   const className =
-    "flow-pop relative flex size-full items-center gap-2 rounded-xl border bg-card px-2 shadow-sm outline-none transition-colors dark:shadow-none focus-visible:ring-2 focus-visible:ring-ring";
+    "flow-pop relative flex size-full items-center gap-2 rounded-lg border bg-card px-2 shadow-sm outline-none transition-colors dark:shadow-none focus-visible:ring-2 focus-visible:ring-ring";
   if (href)
     return (
       <a href={href} target="_blank" rel="noreferrer" aria-label={label} className={cn(className, "hover:bg-accent")}>
@@ -549,16 +549,16 @@ export function RunFlow({
         />
       );
     } else if (id === "main") {
-      const working = (live || replaying) && !(awaiting && !replaying);
+      const working = model.main.active && !(awaiting && !replaying);
       card = (
         <NodeCard
           icon={<BotIcon />}
           title="Agent"
-          subtitle={model.main.current ?? (live || replaying ? "Thinking…" : "Finished")}
+          subtitle={model.main.current ?? (model.main.active ? "Thinking…" : "Idle")}
           accent="var(--primary)"
           live={working}
           ping={ping}
-          label={`Agent: ${model.main.current ?? "idle"}`}
+          label={`Agent: ${model.main.current ?? (model.main.active ? "thinking" : "idle")}`}
         />
       );
     } else if (id === "workspace") {
