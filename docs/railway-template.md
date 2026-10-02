@@ -25,6 +25,14 @@ between services, the public domain, and a generated encryption key.
 
 ## Create it
 
+Shortcut: [railway-template.compose.yml](railway-template.compose.yml) holds
+the four services below as a Docker Compose file. Drag it onto an empty
+Railway project, deploy, check each service against the tables below, then
+Project Settings → **Generate Template from Project**, and continue at step 4.
+Railway's Compose import doesn't cover every setting (source repo,
+healthcheck, public domain), so the tables stay the reference. Or build it by
+hand:
+
 1. Railway → your workspace → **Templates** → **New Template**
    (https://railway.com/workspace/templates).
 2. Add the four services below (`+ Add` in the top right). For the three app
