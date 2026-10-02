@@ -2,7 +2,8 @@
 
 import { ChevronRightIcon, FileCodeIcon } from "lucide-react";
 import { useEffect, useId, useMemo, useState } from "react";
-import type { Api } from "@/lib/api";
+import { FilePreview } from "@/components/media-preview";
+import { Api } from "@/lib/api";
 import { diffTotals, parseDiff, type DiffFile, type DiffLine } from "@/lib/diff";
 import { ago } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -61,7 +62,9 @@ const STATUS_TONE: Record<DiffFile["status"], string> = {
   renamed: "text-info",
 };
 
-function FileDiff({ file, open, onToggle }: { file: DiffFile; open: boolean; onToggle: () => void }) {
+function FileDiff({ runId, file, live, open, onToggle }: { runId: string; file: DiffFile; live: boolean; open: boolean; onToggle: () => void }) {
+  const mediaType = Api.mediaTypeForPath(file.path);
+  const preview = mediaType && (file.oldSha || file.newSha) ? <FilePreview runId={runId} file={file} mediaType={mediaType} live={live} /> : null;
   return (
     <div id={`diff-${file.path}`} className="scroll-mt-2 overflow-hidden rounded-lg border bg-card">
       <button
@@ -80,20 +83,23 @@ function FileDiff({ file, open, onToggle }: { file: DiffFile; open: boolean; onT
         <DiffStat additions={file.additions} deletions={file.deletions} />
       </button>
       {open ? (
-        file.binary ? (
-          <div className="px-3 py-2 text-xs text-muted-foreground">Binary file</div>
-        ) : file.hunks.length === 0 ? (
-          <div className="px-3 py-2 text-xs text-muted-foreground">No content changes</div>
-        ) : (
-          <div className="overflow-x-auto bg-code py-1">
-            {file.hunks.map((hunk, i) => (
-              <div key={i}>
-                <div className="px-3 py-1 font-mono text-[11px] text-info/80">{hunk.header}</div>
-                <DiffLines lines={hunk.lines} />
-              </div>
-            ))}
-          </div>
-        )
+        <>
+          {preview}
+          {file.binary ? (
+            preview ? null : <div className="px-3 py-2 text-xs text-muted-foreground">Binary file</div>
+          ) : file.hunks.length === 0 ? (
+            preview ? null : <div className="px-3 py-2 text-xs text-muted-foreground">No content changes</div>
+          ) : (
+            <div className={cn("overflow-x-auto bg-code py-1", preview && "border-t")}>
+              {file.hunks.map((hunk, i) => (
+                <div key={i}>
+                  <div className="px-3 py-1 font-mono text-[11px] text-info/80">{hunk.header}</div>
+                  <DiffLines lines={hunk.lines} />
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       ) : null}
     </div>
   );
@@ -108,11 +114,13 @@ export function useDiffFiles(diff: Api.ApiRunDiff | null) {
  * the run's side panel). `focus` scrolls to a file.
  */
 export function DiffPane({
+  runId,
   diff,
   files,
   live,
   focus,
 }: {
+  runId: string;
   diff: Api.ApiRunDiff | null;
   files: DiffFile[];
   live: boolean;
@@ -160,7 +168,9 @@ export function DiffPane({
             {files.map((file) => (
               <FileDiff
                 key={file.path}
+                runId={runId}
                 file={file}
+                live={live}
                 open={!closed.has(file.path)}
                 onToggle={() =>
                   setClosed((c) => {

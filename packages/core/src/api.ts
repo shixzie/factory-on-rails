@@ -50,6 +50,49 @@ export const ImageAttachment = Schema.Struct({ id: Schema.UUID, name: Schema.Str
 export type ImageAttachment = typeof ImageAttachment.Type;
 const ImageUploads = Schema.Array(ImageUpload).pipe(Schema.maxItems(MAX_IMAGES));
 
+/**
+ * Files the run page previews (images, video, PDF), by extension. The runner
+ * copies them out of the sandbox as the agent changes or views them, so they
+ * still show after the sandbox stops.
+ */
+export const MediaType = Schema.Literal(
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/x-icon", "image/svg+xml",
+  "video/mp4", "video/webm", "video/quicktime", "application/pdf",
+);
+export type MediaType = typeof MediaType.Type;
+export const isMediaType = Schema.is(MediaType);
+export const MEDIA_TYPES = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  svg: "image/svg+xml",
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  pdf: "application/pdf",
+} as const satisfies Record<string, MediaType>;
+export const mediaTypeForPath = (path: string): MediaType | undefined => {
+  const extension = /\.([a-z0-9]+)$/i.exec(path)?.[1]?.toLowerCase();
+  return extension && Object.hasOwn(MEDIA_TYPES, extension) ? MEDIA_TYPES[extension as keyof typeof MEDIA_TYPES] : undefined;
+};
+export const mediaKind = (type: MediaType): "image" | "video" | "pdf" =>
+  type === "application/pdf" ? "pdf" : type.startsWith("video/") ? "video" : "image";
+/** Larger files are listed in the diff without a preview. */
+export const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+/** What one run may keep in previews, so a run full of build output can't fill Postgres. */
+export const MAX_RUN_MEDIA_BYTES = 200 * 1024 * 1024;
+/** Media is addressed by its git blob id, which the diff carries with `--full-index`. */
+export const BlobSha = Schema.String.pipe(Schema.pattern(/^[0-9a-f]{40}$/));
+/** A previewable file a tool result showed the agent (a screenshot, an image it read). */
+export const MediaRef = Schema.Struct({ sha: BlobSha, mediaType: MediaType });
+export type MediaRef = typeof MediaRef.Type;
+
 export const ApiUser = Schema.Struct({
   login: Schema.String,
   name: Schema.NullOr(Schema.String),

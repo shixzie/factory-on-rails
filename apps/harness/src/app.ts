@@ -33,6 +33,7 @@ import { appInstallUrl, setupRoutes } from "./setup.js";
 import { generateRunTitle } from "./titles.js";
 import { mcpRoutes } from "./mcp.js";
 import { validateImages } from "./images.js";
+import { byteRange, mediaHeaders } from "./media.js";
 
 /**
  * The harness is the web app's API and auth backend. Pages live in apps/web,
@@ -400,6 +401,30 @@ const routes = HttpRouter.empty.pipe(
         contentType: image.value.media_type,
         headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
       });
+    }),
+  ),
+
+  HttpRouter.get(
+    "/api/runs/:id/media/:sha",
+    Effect.gen(function* () {
+      const { run } = yield* ownedRun;
+      const { sha } = yield* HttpRouter.schemaPathParams(Schema.Struct({ sha: Api.BlobSha }));
+      const media = yield* (yield* Store).getMedia(run.id, sha);
+      if (Option.isNone(media)) return yield* fail(404, "not_found", "Preview not found.");
+      const { data, media_type: contentType } = media.value;
+      const headers = mediaHeaders(contentType);
+      const range = byteRange((yield* HttpServerRequest.HttpServerRequest).headers.range, data.byteLength);
+      if (range === "unsatisfiable") {
+        return HttpServerResponse.empty({ status: 416, headers: { ...headers, "content-range": `bytes */${data.byteLength}` } });
+      }
+      if (range) {
+        return HttpServerResponse.uint8Array(data.subarray(range.start, range.end + 1), {
+          status: 206,
+          contentType,
+          headers: { ...headers, "content-range": `bytes ${range.start}-${range.end}/${data.byteLength}` },
+        });
+      }
+      return HttpServerResponse.uint8Array(data, { contentType, headers });
     }),
   ),
 

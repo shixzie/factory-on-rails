@@ -6,9 +6,11 @@ import { ExecInterruptedError } from "railway";
 import { ASK_USER_TOOL } from "../src/agent-stream.js";
 import { executeRun, type ExecuteOptions } from "../src/execute.js";
 import { imagePath, withImages } from "../src/images.js";
+import { gitBlobSha } from "../src/media.js";
 import {
   HAS_SESSION_MARKER,
   MAX_DIFF_BYTES,
+  MEDIA_DIR,
   NO_CHANGES_MARKER,
   PREVIEW_AGENT_FILE,
   PREVIEW_TOKEN_FILE,
@@ -913,6 +915,53 @@ describe("executeRun", () => {
       );
       expect(store.events.find((e) => e.kind === "tool_call")!.data).toMatchObject({ id: "t1", name: "Write", input: { file_path: "README.md", content: "# Hi" } });
       expect(store.diffs).toEqual([{ patch, truncated: false }]);
+    }),
+  );
+
+  it.effect("copies images in the diff and images tool results showed the agent into previews", () =>
+    Effect.gen(function* () {
+      const screenshot = Buffer.from("screenshot pixels");
+      const stream = [
+        { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "mcp__playwright__screenshot", input: {} }] } },
+        {
+          type: "user",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: "t1",
+              content: [{ type: "text", text: "Took a screenshot" }, { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot.toString("base64") } }],
+            }],
+          },
+        },
+      ].map((m) => JSON.stringify(m)).join("\n");
+      const logo = Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>");
+      const huge = "f".repeat(40);
+      const raw = [
+        `:000000 100644 ${"0".repeat(40)} ${gitBlobSha(logo)} A`, "public/logo.svg",
+        `:100644 100644 ${"1".repeat(40)} ${"2".repeat(40)} M`, "src/app.ts",
+        `:000000 100644 ${"0".repeat(40)} ${huge} A`, "demo.mp4",
+        "",
+      ].join("\0");
+      const sandboxes = fakeSandboxes({
+        "run-agent": { stdout: stream },
+        "--raw -z": { stdout: raw },
+        "git cat-file": { stdout: `${gitBlobSha(logo)} ${logo.byteLength}\n${huge} ${100 * 1024 * 1024}\n` },
+        "git diff --cached": { stdout: "diff --git a/public/logo.svg b/public/logo.svg\n" },
+      });
+      sandboxes.state.binaryFiles[`${MEDIA_DIR}/${gitBlobSha(logo)}`] = logo;
+      const store = recordingStore();
+      yield* execute(sandboxes, store);
+
+      expect(store.media.get(gitBlobSha(screenshot))).toEqual({ media_type: "image/png", data: screenshot });
+      expect(store.media.get(gitBlobSha(logo))).toEqual({ media_type: "image/svg+xml", data: logo });
+      expect(store.media.has(huge)).toBe(false);
+      const result = store.events.find((e) => e.kind === "tool_result")!;
+      expect(result).toMatchObject({ message: "Took a screenshot\n[image]", data: { media: [{ sha: gitBlobSha(screenshot), mediaType: "image/png" }] } });
+      expect(JSON.stringify(store.events)).not.toContain(screenshot.toString("base64"));
+      // Only the two previewable files are asked for, and only once though the diff is taken again at the end.
+      const extracts = sandboxes.state.commands.filter((c) => c.includes("git cat-file"));
+      expect(extracts).toHaveLength(1);
+      expect(extracts[0]).toContain(`for sha in ${gitBlobSha(logo)} ${huge}; do`);
     }),
   );
 

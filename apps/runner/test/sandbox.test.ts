@@ -25,7 +25,7 @@ const scriptedSandbox = (outcomes: Array<"ok" | Error>) => {
         outcome === "ok" ? Promise.resolve({ exitCode: 0, stdout: "", timedOut: false }) : Promise.reject(outcome);
       return handle(result);
     },
-    files: { write: async () => undefined },
+    files: { read: async () => new Uint8Array(), write: async () => undefined },
   };
   return { sandbox, calls };
 };
@@ -40,7 +40,7 @@ describe("wrapSandbox", () => {
       const sandbox: SandboxLike = {
         id: "sbx",
         exec: () => handle(Promise.resolve({ exitCode: 0, stdout: "", timedOut: false })),
-        files: { write: async (...args) => { uploaded.push(args); } },
+        files: { read: async () => new Uint8Array(), write: async (...args) => { uploaded.push(args); } },
       };
       const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff]);
       yield* wrapSandbox(sandbox).writeFile("/workspace/.factory/images/image.png", bytes, 0o600);
@@ -58,7 +58,7 @@ describe("wrapSandbox", () => {
           options.onStderr?.("warn");
           return handle(Promise.resolve({ exitCode: 0, stdout: "hello", timedOut: false }));
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const result = yield* wrapSandbox(sandbox).exec("echo hello", { onOutput: (s, c) => chunks.push(`${s}:${c}`) });
       expect(result).toEqual({ exitCode: 0, stdout: "hello", timedOut: false });
@@ -78,7 +78,7 @@ describe("wrapSandbox", () => {
             kill: async () => void signals.push("TERM"),
           });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(wrapSandbox(sandbox).exec("sleep 1000"));
       yield* Deferred.await(started);
@@ -92,7 +92,7 @@ describe("wrapSandbox", () => {
       const sandbox: SandboxLike = {
         id: "sbx",
         exec: () => handle(Promise.reject(new Error("socket closed"))),
-        files: { write: async () => Promise.reject(new Error("disk full")) },
+        files: { read: async () => new Uint8Array(), write: async () => Promise.reject(new Error("disk full")) },
       };
       const execError = yield* Effect.flip(wrapSandbox(sandbox).exec("true"));
       expect(execError._tag).toBe("SandboxError");
@@ -125,7 +125,7 @@ describe("wrapSandbox", () => {
           kill: async () => void actions.push("kill"),
           detach: async () => { actions.push("detach"); return "durable-command"; },
         }),
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const error = yield* Effect.flip(wrapSandbox(sandbox).exec("work", {
         onSession: () => Effect.fail(new SandboxError({ message: "database unavailable" })),
@@ -147,7 +147,7 @@ describe("wrapSandbox", () => {
             kill: async () => void actions.push("kill"),
             detach: async () => { actions.push("detach"); return "durable-command"; },
           }),
-          files: { write: async () => undefined },
+          files: { read: async () => new Uint8Array(), write: async () => undefined },
         };
         const fiber = yield* Effect.fork(wrapSandbox(sandbox).exec("work", {
           onSession: () => Deferred.succeed(saved, undefined).pipe(Effect.asVoid),
@@ -173,7 +173,7 @@ describe("wrapSandbox", () => {
             detach: async () => { actions.push("detach"); return "durable-command"; },
           });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(wrapSandbox(sandbox).exec("work", { detachOnInterrupt: () => true }));
       yield* Deferred.await(started);
@@ -193,7 +193,7 @@ describe("wrapSandbox", () => {
           kill: async () => void actions.push("kill"),
           detach: async () => { actions.push("detach"); return "durable-command"; },
         }),
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(wrapSandbox(sandbox).exec("work", {
         onSession: () => Deferred.succeed(saving, undefined).pipe(
@@ -221,7 +221,7 @@ describe("wrapSandbox", () => {
           calls.push({ target, options });
           return handle(Promise.resolve({ exitCode: 0, stdout: "retained", timedOut: false }));
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       yield* wrapSandbox(sandbox).exec("must not run", { sessionName: "saved", cwd: "/workspace", env: { KEY: "value" } });
       expect(calls).toEqual([{ target: { sessionName: "saved" }, options: {
@@ -244,7 +244,7 @@ describe("wrapSandbox", () => {
             ? Promise.reject(disconnected("before "))
             : Promise.resolve({ exitCode: 0, stdout: "after", timedOut: false }));
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const result = yield* wrapSandbox(sandbox, Schedule.recurs(2)).exec("expensive work", {
         onSession: (name) => Effect.sync(() => { saved.push(name); }),
@@ -269,7 +269,7 @@ describe("wrapSandbox", () => {
             detach: async () => { actions.push("detach"); return "saved"; },
           });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const error = yield* Effect.flip(wrapSandbox(sandbox, Schedule.recurs(2)).exec("must not run", { sessionName: "saved" }));
       expect(error.sessionName).toBe("saved");
@@ -298,7 +298,7 @@ describe("wrapSandbox", () => {
           targets.push(target);
           return handle(Promise.reject(disconnected()), { sessionName: Promise.reject(disconnected()) });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const error = yield* Effect.flip(wrapSandbox(sandbox, Schedule.recurs(2)).exec("expensive work"));
       expect(error.sessionName).toBeUndefined();
@@ -321,7 +321,7 @@ describe("wrapSandbox", () => {
           Deferred.unsafeDone(started, Effect.void);
           return handle(Promise.reject(disconnected()), { kill: async () => void actions.push("kill") });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(wrapSandbox(sandbox, Schedule.spaced("1 second")).exec("work", {
         timeoutSec: 3,
@@ -350,7 +350,7 @@ describe("wrapSandbox", () => {
             detach: async () => { actions.push("detach"); return "saved"; },
           });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(wrapSandbox(sandbox).stopSession("saved"));
       yield* Deferred.await(signalled);
@@ -374,7 +374,7 @@ describe("wrapSandbox", () => {
             kill: async () => void actions.push("kill"),
           });
         },
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const result = yield* wrapSandbox(sandbox).exec("must not run", { sessionName: "saved", timeoutSec: 0 });
       expect(result.timedOut).toBe(true);
@@ -395,7 +395,7 @@ describe("wrapSandbox", () => {
           kill: async () => { Deferred.unsafeDone(signalled, Effect.void); return true; },
           detach: async () => { actions.push("detach"); return "saved"; },
         }),
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const fiber = yield* Effect.fork(Effect.flip(wrapSandbox(sandbox).stopSession("saved")));
       yield* Deferred.await(signalled);
@@ -411,7 +411,7 @@ describe("wrapSandbox", () => {
         const sandbox: SandboxLike = {
           id: "sbx",
           exec: () => handle(Promise.reject(new ExecInterruptedError({ closeCode: 1008, reason, stdout: "", stderr: "" }))),
-          files: { write: async () => undefined },
+          files: { read: async () => new Uint8Array(), write: async () => undefined },
         };
         const result = yield* Effect.either(wrapSandbox(sandbox).stopSession("saved"));
         expect(result._tag).toBe(reason === "Permission denied" ? "Left" : "Right");
@@ -426,7 +426,7 @@ describe("wrapSandbox", () => {
         exec: () => handle(Promise.resolve({ exitCode: 0, stdout: "file contents", timedOut: false }), {
           sessionName: Promise.reject(new Error("Server did not return a durable session for this exec.")),
         }),
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       expect((yield* wrapSandbox(sandbox).exec("cat file")).stdout).toBe("file contents");
       const error = yield* Effect.flip(wrapSandbox(sandbox).exec("tracked work", { onSession: () => Effect.void }));
@@ -439,7 +439,7 @@ describe("wrapSandbox", () => {
       const sandbox: SandboxLike = {
         id: "sbx",
         exec: () => handle(Promise.reject(new RailwayConnectionError({ message: "gateway unavailable" }))),
-        files: { write: async () => undefined },
+        files: { read: async () => new Uint8Array(), write: async () => undefined },
       };
       const error = yield* Effect.flip(wrapSandbox(sandbox).exec("must not run", { sessionName: "saved", timeoutSec: 0 }));
       expect(error.cause).toBeInstanceOf(RailwayConnectionError);

@@ -20,6 +20,9 @@ export interface DiffFile {
   oldPath?: string;
   status: "added" | "deleted" | "modified" | "renamed";
   binary: boolean;
+  /** Full blob ids of both sides (diffs taken with `--full-index`), which address the file's preview. */
+  oldSha?: string;
+  newSha?: string;
   additions: number;
   deletions: number;
   hunks: DiffHunk[];
@@ -60,7 +63,14 @@ export function parseDiff(patch: string): DiffFile[] {
         file.oldPath = unquote(line.slice(12));
       } else if (line.startsWith("rename to ")) file.path = unquote(line.slice(10));
       else if (line.startsWith("Binary files ") || line === "GIT binary patch") file.binary = true;
-      else if (line.startsWith("+++ ") && line !== "+++ /dev/null") file.path = stripPrefix(line.slice(4));
+      else if (line.startsWith("index ")) {
+        const ids = /^index ([0-9a-f]{40})\.\.([0-9a-f]{40})\b/.exec(line);
+        if (ids) {
+          if (!/^0+$/.test(ids[1]!)) file.oldSha = ids[1];
+          if (!/^0+$/.test(ids[2]!)) file.newSha = ids[2];
+        }
+      }
+      else if (line.startsWith("+++ ") && line !== "+++ /dev/null") file.path = stripPrefix(line.slice(4).replace(/\t$/, ""));
     }
 
     const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);

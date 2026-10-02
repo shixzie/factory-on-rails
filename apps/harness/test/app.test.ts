@@ -395,6 +395,44 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
     }
   });
 
+  it("serves a run's previews to its owner only, with ranges for video and no script for SVG", async () => {
+    const owner = await signIn("media-owner", 983);
+    const other = await signIn("media-other", 984);
+    const created = await run(Effect.flatMap(Store, (s) => s.enqueueRun({
+      user_id: owner.user.id, installation_id: 1, repo_full_name: "media/repo", base_branch: "main", task: "draw",
+    })));
+    const video = { sha: "a".repeat(40), media_type: "video/mp4" as const, data: new TextEncoder().encode("0123456789") };
+    const svg = { sha: "b".repeat(40), media_type: "image/svg+xml" as const, data: new TextEncoder().encode("<svg xmlns='http://www.w3.org/2000/svg'/>") };
+    const pdf = { sha: "c".repeat(40), media_type: "application/pdf" as const, data: new TextEncoder().encode("%PDF-1.7") };
+    await run(Effect.flatMap(Store, (s) => Effect.forEach([video, svg, pdf, { ...video, data: new Uint8Array([1]) }], (m) => s.saveMedia(created.id, m))));
+    expect(await run(Effect.flatMap(Store, (s) => s.listMedia(created.id)))).toHaveLength(3);
+    const path = (sha: string) => `/api/runs/${created.id}/media/${sha}`;
+
+    const whole = await request(path(video.sha), { headers: { cookie: owner.cookie } });
+    expect(whole.status).toBe(200);
+    expect(whole.headers.get("content-type")).toBe("video/mp4");
+    expect(whole.headers.get("accept-ranges")).toBe("bytes");
+    expect(await whole.text()).toBe("0123456789");
+    const part = await request(path(video.sha), { headers: { cookie: owner.cookie, range: "bytes=2-4" } });
+    expect(part.status).toBe(206);
+    expect(part.headers.get("content-range")).toBe("bytes 2-4/10");
+    expect(await part.text()).toBe("234");
+    expect(await (await request(path(video.sha), { headers: { cookie: owner.cookie, range: "bytes=-3" } })).text()).toBe("789");
+    expect((await request(path(video.sha), { headers: { cookie: owner.cookie, range: "bytes=10-" } })).status).toBe(416);
+
+    const drawing = await request(path(svg.sha), { headers: { cookie: owner.cookie } });
+    expect(drawing.headers.get("content-type")).toBe("image/svg+xml");
+    expect(drawing.headers.get("content-security-policy")).toContain("sandbox");
+    const document = await request(path(pdf.sha), { headers: { cookie: owner.cookie } });
+    expect(document.headers.get("content-type")).toBe("application/pdf");
+    expect(document.headers.get("x-content-type-options")).toBe("nosniff");
+
+    expect((await request(path(video.sha))).status).toBe(401);
+    expect((await request(path(video.sha), { headers: { cookie: other.cookie } })).status).toBe(404);
+    expect((await request(path("d".repeat(40)), { headers: { cookie: owner.cookie } })).status).toBe(404);
+    expect((await request(path("not-a-sha"), { headers: { cookie: owner.cookie } })).status).toBe(400);
+  });
+
   it("lets only the owner settle an idle thread and persists its settlement", async () => {
     const owner = await signIn("settler", 101);
     const other = await signIn("other-settler", 102);

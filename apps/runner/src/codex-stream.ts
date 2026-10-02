@@ -1,5 +1,5 @@
 import type { RunEvent } from "@factory/core";
-import { truncateStrings, truncateText } from "./agent-stream.js";
+import { truncateStrings, truncateText, withMedia, type AgentEvent } from "./agent-stream.js";
 
 /**
  * Turns Codex's `codex exec --json` output into the same run events Claude
@@ -76,7 +76,7 @@ export function makeCodexParser(now: () => number = Date.now) {
     data: { toolUseId: id, isError },
   });
 
-  const item = (phase: "started" | "updated" | "completed", it: Json): RunEvent[] => {
+  const item = (phase: "started" | "updated" | "completed", it: Json): AgentEvent[] => {
     const id = str(it.id);
     const done = phase === "completed";
     const failed = it.status === "failed" || it.status === "declined";
@@ -106,7 +106,8 @@ export function makeCodexParser(now: () => number = Date.now) {
         const events = called.has(id) ? [] : [call(id, `mcp__${str(it.server)}__${str(it.tool)}`, isObject(it.arguments) ? it.arguments : {})];
         if (!done) return events;
         const error = isObject(it.error) ? str(it.error.message) : "";
-        return [...events, result(id, error || mcpResultText(it.result), failed || !!error)];
+        const media = isObject(it.result) ? it.result.content : undefined;
+        return [...events, withMedia(result(id, error || mcpResultText(it.result), failed || !!error), media)];
       }
       case "web_search": {
         // The query can be filled in only once the search has run.
@@ -153,7 +154,7 @@ export function makeCodexParser(now: () => number = Date.now) {
    * (possibly none), or `undefined` when it is not Codex JSON and should be
    * kept as plain output.
    */
-  return (line: string): RunEvent[] | undefined => {
+  return (line: string): AgentEvent[] | undefined => {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) return undefined;
     let msg: unknown;

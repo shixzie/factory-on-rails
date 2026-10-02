@@ -149,3 +149,21 @@ describe("toBlocks", () => {
     expect(task.result?.text).toBe("Found it.");
   });
 });
+
+describe("tool result media", () => {
+  it("keeps the previews a tool result points at and drops anything malformed", () => {
+    const shot = { sha: "a".repeat(40), mediaType: "image/png" };
+    const blocks = toBlocks([
+      ev("tool_call", "mcp__playwright__screenshot", { id: "s1", name: "mcp__playwright__screenshot", input: {} }),
+      ev("tool_result", "[image]", { toolUseId: "s1", isError: false, media: [shot, { sha: "nope", mediaType: "image/png" }, { sha: "b".repeat(40), mediaType: "text/html" }] }),
+      ev("tool_call", "Read", { id: "r1", name: "Read", input: { file_path: "/workspace/repo/a.ts" } }),
+      ev("tool_result", "code", { toolUseId: "r1", isError: false }),
+    ]);
+    const [work] = blocks;
+    if (work?.type !== "work") throw new Error("expected work");
+    const [screenshot, read] = work.items;
+    expect(screenshot).toMatchObject({ result: { text: "[image]", media: [shot] } });
+    expect(read).toMatchObject({ result: { text: "code" } });
+    expect(read?.type === "tool" && read.result && "media" in read.result).toBe(false);
+  });
+});

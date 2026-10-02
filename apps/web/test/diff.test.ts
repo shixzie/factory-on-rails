@@ -66,6 +66,31 @@ describe("parseDiff", () => {
   it("returns nothing for an empty patch", () => {
     expect(parseDiff("")).toEqual([]);
   });
+
+  it("keeps full blob ids (the preview's address) and paths git ends with a tab", () => {
+    const [changed, added, short] = parseDiff([
+      "diff --git a/hero.png b/hero.png",
+      `index ${"a".repeat(40)}..${"b".repeat(40)} 100644`,
+      "Binary files a/hero.png and b/hero.png differ",
+      "diff --git a/my logo.svg b/my logo.svg",
+      "new file mode 100644",
+      `index ${"0".repeat(40)}..${"c".repeat(40)}`,
+      "--- /dev/null",
+      "+++ b/my logo.svg\t",
+      "@@ -0,0 +1 @@",
+      "+<svg/>",
+      "diff --git a/old.png b/old.png",
+      "index abc1234..def5678 100644",
+      "Binary files a/old.png and b/old.png differ",
+      "",
+    ].join("\n"));
+    expect(changed).toMatchObject({ path: "hero.png", oldSha: "a".repeat(40), newSha: "b".repeat(40), binary: true });
+    expect(added).toMatchObject({ path: "my logo.svg", newSha: "c".repeat(40) });
+    expect(added!.oldSha).toBeUndefined();
+    // Diffs stored before --full-index have short ids, which address nothing.
+    expect(short!.oldSha).toBeUndefined();
+    expect(short!.newSha).toBeUndefined();
+  });
 });
 
 describe("replacementLines", () => {
