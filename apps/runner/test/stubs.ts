@@ -20,6 +20,8 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
   /** Messages the user "sent"; the runner reads them with listUserMessages. */
   const userMessages: RunEventRow[] = [];
   const images: ImageRow[] = [];
+  /** Previews the run stored, by blob id. */
+  const media = new Map<string, { media_type: string; data: Uint8Array }>();
   const layer = stubStore({
     appendEvents: (_runId, batch) => Effect.sync(() => void events.push(...batch)),
     updateRun: (_runId, patch) => Effect.sync(() => void updates.push(structuredClone(patch))),
@@ -28,8 +30,10 @@ export const recordingStore = (status: () => RunStatus = () => "running") => {
     listUserMessages: (_runId, afterId) => Effect.sync(() => userMessages.filter((m) => Number(m.id) > afterId)),
     listRunImages: () => Effect.sync(() => images),
     saveDiff: (_runId, patch, truncated) => Effect.sync(() => void diffs.push({ patch, truncated })),
+    saveMedia: (_runId, m) => Effect.sync(() => void (media.has(m.sha) || media.set(m.sha, { media_type: m.media_type, data: m.data }))),
+    listMedia: () => Effect.sync(() => [...media].map(([sha, m]) => ({ sha, size: m.data.byteLength }))),
   });
-  return { events, updates, diffs, userMessages, images, layer };
+  return { events, updates, diffs, userMessages, images, media, layer };
 };
 
 /**
@@ -201,6 +205,12 @@ export const fakeSandboxes = (
         else state.binaryFiles[path] = content;
         state.modes[path] = mode;
       }),
+    readFile: (path, maxBytes) => {
+      const content = state.binaryFiles[path] ?? (state.files[path] === undefined ? undefined : new TextEncoder().encode(state.files[path]));
+      return content === undefined
+        ? Effect.fail(new SandboxError({ message: `Could not read ${path}` }))
+        : Effect.succeed(content.subarray(0, maxBytes));
+    },
   });
   let created = 0;
   let checkpointed = 0;

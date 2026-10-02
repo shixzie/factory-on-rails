@@ -37,6 +37,8 @@ export interface SandboxHandle {
   readonly stopSession: (sessionName: string) => Effect.Effect<void, SandboxError>;
   /** `mode` defaults to 0644; secrets go in with 0600. */
   readonly writeFile: (path: string, content: string | Uint8Array, mode?: number) => Effect.Effect<void, SandboxError>;
+  /** Reads at most `maxBytes` of a file. */
+  readonly readFile: (path: string, maxBytes: number) => Effect.Effect<Uint8Array, SandboxError>;
 }
 
 /** A saved copy of a sandbox's disk, which a new sandbox can boot from. */
@@ -201,7 +203,10 @@ const attempt = <A>(context: string, f: () => Promise<A>) =>
 export interface SandboxLike {
   readonly id: string;
   exec(command: ExecTarget, options: RailwayExecOptions): SandboxExecHandle;
-  readonly files: { write(path: string, content: string | Uint8Array, options?: { mode?: number }): Promise<unknown> };
+  readonly files: {
+    write(path: string, content: string | Uint8Array, options?: { mode?: number }): Promise<unknown>;
+    read(path: string, options: { format: "bytes"; length?: number }): Promise<Uint8Array>;
+  };
 }
 
 interface SandboxExecHandle extends PromiseLike<ExecResult> {
@@ -354,4 +359,5 @@ export const wrapSandbox = (
     attempt(`Could not write ${path}`, () => sandbox.files.write(path, content, mode === undefined ? undefined : { mode })).pipe(
       Effect.asVoid,
     ),
+  readFile: (path, maxBytes) => attempt(`Could not read ${path}`, () => sandbox.files.read(path, { format: "bytes", length: maxBytes })),
 });

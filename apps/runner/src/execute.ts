@@ -1,11 +1,12 @@
 import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Store, tunnelGrant, type AgentId, type CiCheck, type ResolvedMcpServer, type RunExecution, type RunRow } from "@factory/core";
-import { Cause, Clock, Data, Duration, Effect, Exit, Option, Redacted, Schedule } from "effect";
+import { Cause, Clock, Data, Duration, Effect, Exit, Option, Queue, Redacted, Schedule } from "effect";
 import { RailwayConnectionError, RailwayGraphQLError } from "railway";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
 import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
 import { makeCodexParser } from "./codex-stream.js";
 import type { AgentCommands, PreviewSettings } from "./config.js";
 import { materializeImage, messageImages, withImages } from "./images.js";
+import { makeMediaCapture, type MediaBlob } from "./media.js";
 import {
   AGENT_RAN_FILE,
   CODEX_AUTH_SCRIPT,
@@ -407,19 +408,36 @@ const work = (
       }
     }).pipe(Effect.catchAllCause((cause) => Effect.logWarning("Could not deliver messages to the agent", cause)));
 
-    // Stores the run's diff when it changed, so the page can show files as they change.
+    // Stores the run's diff when it changed, so the page can show files as they
+    // change, then copies out the images, videos and PDFs in it for previews.
+    const media = yield* makeMediaCapture(run.id, sandbox);
     let lastPatch = "";
-    const snapshotDiff = Effect.gen(function* () {
+    const saveDiff = Effect.gen(function* () {
       const result = yield* sandbox.exec(withHome(diffScript()), { timeoutSec: 60 });
-      if (result.exitCode !== 0) return;
+      if (result.exitCode !== 0) return undefined;
       const { patch, truncated } = capPatch(log.redact(result.stdout));
-      if (patch === lastPatch) return;
+      if (patch === lastPatch) return false;
       lastPatch = patch;
       yield* store.saveDiff(run.id, patch, truncated);
+      return true;
     }).pipe(
       Effect.timeout("90 seconds"),
-      Effect.catchAllCause((cause) => Effect.logWarning("Could not record the run's diff", cause)),
+      Effect.catchAllCause((cause) => Effect.as(Effect.logWarning("Could not record the run's diff", cause), undefined)),
     );
+    const snapshotDiff = Effect.gen(function* () {
+      const changed = yield* saveDiff;
+      if (changed === undefined) return;
+      yield* media.copyChanged(changed).pipe(
+        Effect.timeout("3 minutes"),
+        Effect.catchAllCause((cause) => Effect.logWarning("Could not copy the run's previews", cause)),
+      );
+    });
+    // Screenshots and images tool results showed the agent, stored as they arrive.
+    const toolMedia = yield* Queue.unbounded<ReadonlyArray<MediaBlob>>();
+    const saveToolMedia = (blobs: ReadonlyArray<MediaBlob>) =>
+      media.save(blobs).pipe(Effect.catchAllCause((cause) => Effect.logWarning("Could not store a tool result's image", cause)));
+    const toolMediaLoop = Effect.forever(Effect.flatMap(Queue.take(toolMedia), saveToolMedia));
+    const drainToolMedia = Effect.flatMap(Queue.takeAll(toolMedia), (batches) => Effect.forEach(batches, saveToolMedia, { discard: true }));
 
     const inboxLoop = Effect.forever(Effect.zipRight(Effect.sleep(inboxEvery), syncInbox));
     const diffLoop = Effect.gen(function* () {
@@ -465,6 +483,7 @@ const work = (
               asking.delete(String(e.data?.toolUseId));
               filesMayHaveChanged = true;
             }
+            if (e.media?.length) Queue.unsafeOffer(toolMedia, e.media);
             log.push(e.kind, e.message, { ...e.data, _replayKey: `${run.turns}:${key}:${eventSequence++}` });
           },
           output: log.push,
@@ -475,6 +494,7 @@ const work = (
 
       yield* Effect.forkScoped(inboxLoop);
       yield* Effect.forkScoped(diffLoop);
+      yield* Effect.forkScoped(toolMediaLoop);
       yield* step(key, execution.sessions[key] ? "Reconnecting to the agent" : resume ? "Continuing the agent's session" : "Running the agent", agent.command, {
         cwd: REPO_DIR,
         env: {
@@ -491,7 +511,7 @@ const work = (
     }).pipe(
       Effect.scoped,
       // Whatever happened, record where the files ended up.
-      Effect.onExit((exit) => !Exit.isInterrupted(exit) || shouldStop() ? snapshotDiff : Effect.void),
+      Effect.onExit((exit) => !Exit.isInterrupted(exit) || shouldStop() ? Effect.zipRight(drainToolMedia, snapshotDiff) : Effect.void),
       Effect.onExit((exit) => (!Exit.isInterrupted(exit) || shouldStop()) && awaiting ? store.updateRun(run.id, { awaiting_input: false }).pipe(Effect.ignore) : Effect.void),
     );
 

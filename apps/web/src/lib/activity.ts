@@ -5,7 +5,8 @@
  * the user sent, and the agent's closing result.
  */
 import { eventImages } from "./composer-images";
-import type { ImageAttachment, ApiRunEvent } from "@factory/core/api";
+import { MediaRef, type ImageAttachment, type ApiRunEvent } from "@factory/core/api";
+import { Schema } from "effect";
 
 /** The tool the agent calls to ask the user something (the factory's MCP server in the sandbox). */
 export const ASK_USER_TOOL = "mcp__factory__ask_user";
@@ -26,7 +27,7 @@ export interface ToolCall {
   name: string;
   input: Record<string, unknown>;
   /** Set once the tool has returned. */
-  result?: { text: string; isError: boolean };
+  result?: { text: string; isError: boolean; media?: readonly MediaRef[] };
   /** The subagent (Task) call this one ran under, if any. */
   parentId?: string;
   /** For a subagent call: everything the subagent did, in order. */
@@ -54,6 +55,9 @@ export type Block =
   | { type: "result"; id: string; text: string; isError: boolean; turns?: number; durationMs?: number; costUsd?: number };
 
 const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+const isMediaRef = Schema.is(MediaRef);
+/** Images (and PDFs) a tool result showed the agent, which the runner stored for previews. */
+const resultMedia = (value: unknown): MediaRef[] => (Array.isArray(value) ? value.filter(isMediaRef) : []);
 const num = (v: unknown) => (typeof v === "number" ? v : undefined);
 
 export type AgentActivity = "working" | "idle" | "waiting_ci";
@@ -146,7 +150,8 @@ export function toBlocks(events: ReadonlyArray<ApiRunEvent>): Block[] {
       case "tool_result": {
         const call = calls.get(str(data.toolUseId) ?? "");
         if (call) {
-          call.result = { text: e.message, isError: data.isError === true };
+          const media = resultMedia(data.media);
+          call.result = { text: e.message, isError: data.isError === true, ...(media.length ? { media } : {}) };
           call.doneAt = e.at;
           const stats = typeof data.stats === "object" && data.stats !== null ? (data.stats as Record<string, unknown>) : undefined;
           if (stats) call.stats = { durationMs: num(stats.durationMs), tokens: num(stats.tokens), toolUses: num(stats.toolUses) };

@@ -623,7 +623,7 @@ export function RunView({ initial }: { initial: Api.RunDetail }) {
                 />
               </div>
             ) : (
-              <DiffPane diff={diff} files={files} live={active} focus={focus} />
+              <DiffPane runId={run.id} diff={diff} files={files} live={active} focus={focus} />
             )}
           </SidePanel>
         ) : null}

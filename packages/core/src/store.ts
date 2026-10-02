@@ -1,4 +1,4 @@
-import type { ImageAttachment, ImageMediaType, ImageUpload, ReasoningEffort } from "./api.js";
+import type { ImageAttachment, ImageMediaType, ImageUpload, MediaType, ReasoningEffort } from "./api.js";
 import type { McpOAuthState, McpServerInput, McpServerRow } from "./mcp.js";
 import { randomUUID } from "node:crypto";
 import { SqlClient, SqlError } from "@effect/sql";
@@ -152,6 +152,13 @@ export interface RunDiffRow {
   updated_at: Date;
 }
 
+export interface RunMediaRow {
+  sha: string;
+  media_type: MediaType;
+  size: number;
+  data: Uint8Array;
+}
+
 export interface ApiKeySummary {
   provider: string;
   hint: string;
@@ -253,6 +260,11 @@ export interface StoreService {
   readonly getDiff: (runId: string) => Q<Option.Option<RunDiffRow>>;
   /** When the diff last changed, without loading it (what the run page polls). */
   readonly diffUpdatedAt: (runId: string) => Q<Option.Option<Date>>;
+  /** Stores a previewable file once per run; a blob already stored is left as is. */
+  readonly saveMedia: (runId: string, media: Omit<RunMediaRow, "size">) => Q<void>;
+  /** The blobs a run has stored and their sizes, without the bytes. */
+  readonly listMedia: (runId: string) => Q<ReadonlyArray<Pick<RunMediaRow, "sha" | "size">>>;
+  readonly getMedia: (runId: string, sha: string) => Q<Option.Option<RunMediaRow>>;
   // bring-your-own API keys
   readonly upsertApiKey: (k: { user_id: string; provider: string; key_enc: string; hint: string }) => Q<void>;
   /** What the UI may show: never the key itself. */
@@ -569,6 +581,19 @@ const make = Effect.gen(function* () {
     diffUpdatedAt: (runId) =>
       sql<{ updated_at: Date }>`select updated_at from run_diffs where run_id = ${runId}`.pipe(
         Effect.map((rows) => Option.map(Arr.head(rows), (r) => r.updated_at)),
+      ),
+
+    saveMedia: (runId, media) =>
+      sql`
+        insert into run_media (run_id, sha, media_type, size, data)
+        values (${runId}, ${media.sha}, ${media.media_type}, ${media.data.byteLength}, ${Buffer.from(media.data)})
+        on conflict (run_id, sha) do nothing`.pipe(Effect.asVoid),
+
+    listMedia: (runId) => sql<Pick<RunMediaRow, "sha" | "size">>`select sha, size from run_media where run_id = ${runId}`,
+
+    getMedia: (runId, sha) =>
+      sql<RunMediaRow>`select sha, media_type, size, data from run_media where run_id = ${runId} and sha = ${sha}`.pipe(
+        Effect.map(Arr.head),
       ),
 
     upsertApiKey: (k) =>

@@ -484,6 +484,20 @@ run page while it works.
   staging into a throwaway index so it never touches the agent's own. The
   latest patch (up to 1 MB, cut at a file boundary) replaces the previous one
   in `run_diffs`, and one last snapshot is taken when the agent exits.
+- **Previews.** The diff is taken with `--full-index`, so each file carries
+  its git blob ids. After a snapshot the runner lists the changed images,
+  videos and PDFs (by extension, both before and after each change) and
+  copies their blobs out of the sandbox into `run_media`
+  (`015_run_media.sql`, `apps/runner/src/media.ts`): up to 25 MiB a file and
+  200 MiB a run. Images and PDFs that tool results showed the agent
+  (screenshots from a browser MCP server, images it read) are stored the same
+  way, keyed by the blob id of their bytes, and the `tool_result` event keeps
+  only `data.media` references. The harness serves them at
+  `GET /api/runs/:id/media/:sha` to the run's owner only, with byte ranges for
+  video and a sandboxing CSP so an SVG opened on its own runs no script. The
+  run page shows them in the Diff panel (before and after side by side) and
+  under the tool call that produced them. They outlive the sandbox and are
+  deleted with the run.
 - **Questions.** The sandbox gets a small MCP server (`ask_user`, see
   `apps/runner/src/agent-tools.ts`). When the agent calls it, the run shows
   "Needs input" in the sidebar and a question card (with the agent's
@@ -631,6 +645,7 @@ replace the built-in question tool.
 - `runs`: the queue and the record of each run (status, branch, sandbox id, PR URL, error, heartbeat and owner).
 - `run_events`: append-only log per run: runner steps, command output, and the agent's messages, tool calls and results, plus messages from the user (`003_run_activity.sql`).
 - `run_diffs`: the latest diff of each run's branch against its base commit.
+- `run_media`: previewable files from a run (images, video, PDF), keyed by git blob id (`015_run_media.sql`).
 - `runs` also tracks its sandbox between turns (`004_sandbox_lifecycle.sql`):
   `sandbox_state` (none, running, stopping, stopped, deleted), the checkpoint
   a stopped one boots from, `last_activity_at`, `turns`, and the last user

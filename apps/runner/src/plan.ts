@@ -30,6 +30,8 @@ export const AGENT_RAN_FILE = `${FACTORY_DIR}/agent-ran`;
 export const DESCRIBE_FILE = `${FACTORY_DIR}/describe-prompt.md`;
 /** Where the agent's pull request title and description land. */
 export const PR_FILE = `${FACTORY_DIR}/pull-request.md`;
+/** Where blobs wait for the runner to copy them out as previews (see media.ts); cleared every time. */
+export const MEDIA_DIR = `${FACTORY_DIR}/media`;
 /** Largest diff stored per run; bigger ones are cut at a file boundary. */
 export const MAX_DIFF_BYTES = 1024 * 1024;
 
@@ -177,7 +179,40 @@ export function diffScript(): string {
     `export GIT_INDEX_FILE=${FACTORY_DIR}/diff-index`,
     `cp .git/index "$GIT_INDEX_FILE" 2>/dev/null || git read-tree HEAD`,
     "git add -A",
-    `git diff --cached --no-color --no-ext-diff --no-textconv --find-renames "$(cat ${BASE_SHA_FILE})"`,
+    // Full blob ids let the run page ask for a changed image by the id in the patch.
+    `git diff --cached --no-color --no-ext-diff --no-textconv --find-renames --full-index "$(cat ${BASE_SHA_FILE})"`,
+  ].join("\n");
+}
+
+/**
+ * Lists the files in the last diff snapshot with their blob ids, from the
+ * index `diffScript` left behind, as `git diff --raw -z`.
+ */
+export function changedFilesScript(): string {
+  return [
+    "set -eu",
+    `cd ${REPO_DIR}`,
+    `export GIT_INDEX_FILE=${FACTORY_DIR}/diff-index`,
+    `git diff --cached --raw -z --no-abbrev --find-renames "$(cat ${BASE_SHA_FILE})"`,
+  ].join("\n");
+}
+
+/**
+ * Copies blobs out of git into MEDIA_DIR for the runner to read, skipping any
+ * over `maxBytes`, and prints `<sha> <size>` for each blob that exists.
+ */
+export function extractBlobsScript(shas: ReadonlyArray<string>, maxBytes: number): string {
+  if (shas.some((sha) => !/^[0-9a-f]{40}$/.test(sha))) throw new Error("Invalid blob id");
+  return [
+    "set -eu",
+    `cd ${REPO_DIR}`,
+    `rm -rf ${MEDIA_DIR}`,
+    `mkdir -p ${MEDIA_DIR}`,
+    `for sha in ${shas.join(" ")}; do`,
+    `  size=$(git cat-file -s "$sha" 2>/dev/null) || continue`,
+    `  if [ "$size" -le ${maxBytes} ]; then git cat-file blob "$sha" > ${MEDIA_DIR}/"$sha"; fi`,
+    `  echo "$sha $size"`,
+    "done",
   ].join("\n");
 }
 

@@ -25,6 +25,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AttachedImages } from "@/components/composer-images";
 import { DiffLines, DiffStat } from "@/components/diff-view";
 import { Markdown } from "@/components/markdown";
+import { ToolMedia } from "@/components/media-preview";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { answerText, isSubagentTool, repoPath, type Block, type ToolCall, type WorkItem } from "@/lib/activity";
@@ -135,8 +136,27 @@ function Todos({ todos }: { todos: TodoItem[] }) {
   );
 }
 
-/** One tool call as a single line (verb and target), expanding to its input and output. */
-function ToolLine({ call, live, latestPlan }: { call: ToolCall; live: boolean; latestPlan: boolean }) {
+/**
+ * One tool call as a single line (verb and target), expanding to its input
+ * and output. Images the tool showed the agent (a screenshot, an image it
+ * read) show under the line without opening it.
+ */
+function ToolLine({ runId, call, live, runLive, latestPlan }: { runId: string; call: ToolCall; live: boolean; runLive: boolean; latestPlan: boolean }) {
+  const media = call.result?.media;
+  const line = <ToolLineBody call={call} live={live} latestPlan={latestPlan} />;
+  if (!media?.length) return line;
+  const target = s(call.input.file_path) || s(call.input.path);
+  return (
+    <>
+      {line}
+      <div className="mb-1.5 ml-5.5">
+        <ToolMedia runId={runId} media={media} live={runLive} label={target ? repoPath(target) : `${call.name} result`} />
+      </div>
+    </>
+  );
+}
+
+function ToolLineBody({ call, live, latestPlan }: { call: ToolCall; live: boolean; latestPlan: boolean }) {
   const { input, result } = call;
   const status = !result ? (live && !call.stoppedAt ? "pending" : undefined) : result.isError ? "error" : "done";
   const output = result?.text ? <Pre tone={result.isError ? "error" : undefined}>{result.text}</Pre> : null;
@@ -328,6 +348,7 @@ function OutputBlock({ chunks, open: defaultOpen }: { chunks: Extract<WorkItem, 
 }
 
 interface WorkContext {
+  runId: string;
   /** Whether this stretch of work is still going (the newest one, while the run is live). */
   live: boolean;
   /** Whether the run is live at all; a subagent that never reported back is only still working then. */
@@ -407,7 +428,7 @@ function WorkItems({ items, ctx }: { items: WorkItem[]; ctx: WorkContext }) {
             );
           case "tool":
             if (item.children) return <SubagentCard key={item.id} call={item} ctx={ctx} />;
-            return <ToolLine key={item.id} call={item} live={live} latestPlan={item.id === latestPlanId} />;
+            return <ToolLine key={item.id} runId={ctx.runId} call={item} live={live} runLive={ctx.runLive} latestPlan={item.id === latestPlanId} />;
         }
       })}
     </>
@@ -693,7 +714,7 @@ export function RunActivity({
         switch (block.type) {
           case "work":
             return (
-              <WorkGroup key={block.id} items={block.items} ctx={{ live: live && lastBlock, runLive: live, latestPlanId, lanes, focus: focusAgent }} />
+              <WorkGroup key={block.id} items={block.items} ctx={{ runId, live: live && lastBlock, runLive: live, latestPlanId, lanes, focus: focusAgent }} />
             );
           case "message":
             return <Markdown key={block.id} className="px-1">{block.text}</Markdown>;
