@@ -56,9 +56,7 @@ See [docs/architecture.md](docs/architecture.md) for the design.
 
 ## Host your own
 
-<!-- Deploy button: replace TEMPLATE_CODE with the template's code (docs/railway-template.md, step 5), then uncomment.
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=factory-on-rails)
--->
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RKSPC6?utm_medium=integration&utm_source=button&utm_campaign=factory-on-rails)
 
 Factory on Rails runs entirely on [Railway](https://railway.com). The Railway
 template deploys the web UI, the API, the runner and Postgres, already wired

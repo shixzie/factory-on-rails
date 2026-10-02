@@ -1,5 +1,7 @@
 # The Railway template
 
+Published draft: [railway.com/new/template/RKSPC6](https://railway.com/new/template/RKSPC6).
+
 This is how the "Deploy on Railway" template for Factory on Rails is put
 together, so it can be recreated or updated. Deploying from it is covered in
 the [README](../README.md#host-your-own).
