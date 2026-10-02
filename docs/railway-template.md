@@ -1,5 +1,7 @@
 # The Railway template
 
+The template, published on the Railway marketplace: [railway.com/new/template/factory-on-rails](https://railway.com/new/template/factory-on-rails).
+
 This is how the "Deploy on Railway" template for Factory on Rails is put
 together, so it can be recreated or updated. Deploying from it is covered in
 the [README](../README.md#host-your-own).
@@ -32,11 +34,12 @@ between services, the public domain, and a generated encryption key.
    (the `main` branch). Name them exactly `web`, `harness`, `runner` and
    `Postgres`: the variables below refer to each other by those names.
 3. Fill in each service's **Settings** and **Variables** as listed.
-4. **Create Template**, then on the Templates page open it, copy its URL (it
+4. In the template's details, upload `apps/web/public/logo.svg` as its icon
+   and use the overview text at the end of this page.
+5. **Create Template**, then on the Templates page open it, copy its URL (it
    ends in the template code, for example `/new/template/AbCdEf`), and put the
    code in the README's Deploy button.
-5. Optional: **Publish** it to the marketplace with the overview text at the
-   end of this page, category "AI/ML".
+6. Optional: **Publish** it to the marketplace, category "AI/ML".
 
 ### Postgres
 
@@ -60,12 +63,13 @@ over the private network.
 | Variable | Value | Description |
 |---|---|---|
 | `ALLOWED_GITHUB_LOGINS` | *(empty, required)* | Your GitHub username. Only these accounts can sign in, and the GitHub App must belong to one of them. Comma-separate several; add an organization's name to create the App under it. After setup you can set `*` to let any GitHub account in. |
-| `TOKEN_ENCRYPTION_KEY` | `${{secret(43, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}=` | Encrypts GitHub tokens, users' model keys and the App's credentials. Generated; don't change it after deploy. |
+| `TOKEN_ENCRYPTION_KEY` | `${{secret(43, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}=` | Encrypts GitHub tokens, users' model keys and MCP credentials, and the App's credentials. Generated; don't change it after deploy. |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | |
 | `PUBLIC_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | The address people use. Change it if you add a custom domain. |
 | `PORT` | `8080` | |
 | `HOST` | `::` | Listen on IPv6 so the private network reaches it. |
 | `SANDBOX_SNAPSHOTS` | *(empty, optional)* | Prepared sandbox checkpoints users may start runs from, as `name=login\|login`, comma-separated (see setup.md, step 7). |
+| `PREVIEW_SIGNING_KEY` | `${{secret(64, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}` | Signs preview links and sandbox tunnel grants. Generated, so turning previews on later only needs a domain; unused until then. |
 
 ### web
 
@@ -103,6 +107,7 @@ The worker that drives one sandbox per run. No networking.
 | `HARNESS_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` | Links pull requests back to their run. |
 | `MAX_CONCURRENT_RUNS` | `3` (optional) | Runs at once, one sandbox each. |
 | `SANDBOX_SNAPSHOTS` | `${{harness.SANDBOX_SNAPSHOTS}}` | The same list as the harness; checked again when a run starts. |
+| `PREVIEW_SIGNING_KEY` | `${{harness.PREVIEW_SIGNING_KEY}}` | Same key as the harness. |
 | `SANDBOX_REGION` | *(empty, optional)* | Where sandboxes run, e.g. `us-east4-eqdc4a`. Railway's default is us-west2; put them near the factory's region. |
 
 The template sets no GitHub App or sandbox variables: the setup page creates
@@ -110,11 +115,30 @@ both and stores them in the database, encrypted with `TOKEN_ENCRYPTION_KEY`.
 Setting `GITHUB_APP_*`, `RAILWAY_SANDBOX_TOKEN` and `SANDBOX_ENVIRONMENT_ID`
 by hand still works and takes precedence ([setup.md](setup.md)).
 
-Previews of servers running in sandboxes are left out of the template: they
-need a wildcard custom domain, which a template can't bring. To add them
-later, create a `preview` service (start command
-`node apps/preview/dist/index.js`, healthcheck `/healthz`) and follow
-[setup.md](setup.md), step 8.
+### Previews: not in the template
+
+The preview gateway is left out: it needs a wildcard custom domain, which a
+template can't bring, and without one it won't start. The template generates
+`PREVIEW_SIGNING_KEY` so that adding it later is only the service and the
+domain, as the README's [Previews (optional)](../README.md#previews-optional)
+describes. For reference, the service it adds:
+
+| Setting | Value |
+|---|---|
+| Build command | `pnpm run build` |
+| Start command | `node apps/preview/dist/index.js` |
+| Healthcheck path | `/healthz` |
+| Watch paths | `apps/preview/**`, `packages/core/**`, `pnpm-lock.yaml` |
+| Public networking | the wildcard custom domain, port `8080` |
+| Replicas | 1 (sandboxes' tunnels live in its memory) |
+
+| Variable | Value |
+|---|---|
+| `PORT` | `8080` |
+| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+| `PREVIEW_DOMAIN` | e.g. `preview.example.com` (the wildcard without `*.`) |
+| `PUBLIC_URL` | `https://${{web.RAILWAY_PUBLIC_DOMAIN}}` |
+| `PREVIEW_SIGNING_KEY` | `${{harness.PREVIEW_SIGNING_KEY}}` |
 
 ## Overview text for the marketplace
 
@@ -122,9 +146,13 @@ later, create a `preview` service (start command
 # Deploy and Host Factory on Rails with Railway
 
 Factory on Rails is a self-hosted software factory. Sign in with GitHub, pick
-a repository, describe a change, and a coding agent (Claude Code or Codex) does the work
-in its own Railway sandbox and opens a pull request. You can follow the agent
-live, answer its questions and keep the conversation going.
+a repository, describe a change, and a coding agent (Claude Code or Codex) does
+the work in its own Railway sandbox and opens a pull request. You can follow
+the agent live, answer its questions, attach screenshots and keep the
+conversation going. The agent writes the PR's title and description, waits for
+CI and fixes failing checks itself. Users bring their own tools as MCP
+servers, and with an optional wildcard domain can open the app the agent is
+running in its sandbox, privately.
 
 ## About Hosting Factory on Rails
 
@@ -141,11 +169,12 @@ workspace.
 - Hand small, well-defined changes to a coding agent and review them as PRs
 - Run several agents in parallel, each isolated in its own sandbox
 - Give a team one place to queue agent work against its repositories
+- Let agents keep a PR's CI green without anyone babysitting it
 
 ## Dependencies for Factory on Rails Hosting
 
 - A GitHub account (for the GitHub App and sign-in)
-- A model credential per user: a Claude subscription token, an Anthropic API key, or an OpenAI API key
+- A model credential per user: a Claude subscription token, an Anthropic API key, a ChatGPT sign-in, or an OpenAI API key
 - Railway Sandboxes
 
 ### Deployment Dependencies

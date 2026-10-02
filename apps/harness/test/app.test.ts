@@ -774,6 +774,7 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       expect(await setupStatus()).toEqual({
         githubApp: null,
         sandboxes: { ready: false, fromEnv: false },
+        previews: true,
         owners: ["shixzie"],
         viewer: null,
       });

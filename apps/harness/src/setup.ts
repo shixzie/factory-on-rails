@@ -52,6 +52,7 @@ const status = (viewer: Option.Option<UserRow>) =>
         })),
       ),
       sandboxes: yield* settings.sandboxesReady,
+      previews: Option.isSome(config.preview),
       owners: Option.isNone(app) ? [...namedLogins(config.allowedLogins)] : [],
       viewer: Option.getOrNull(
         Option.map(viewer, (u) => ({ login: u.github_login, admin: isAdmin(config.allowedLogins, owner, u.github_login) })),

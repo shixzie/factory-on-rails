@@ -372,6 +372,8 @@ export const SetupStatus = Schema.Struct({
     }),
   ),
   sandboxes: Schema.Struct({ ready: Schema.Boolean, fromEnv: Schema.Boolean }),
+  /** Optional: previews of sandbox ports are on (PREVIEW_DOMAIN and PREVIEW_SIGNING_KEY on the harness). */
+  previews: Schema.Boolean,
   /** The GitHub accounts named in ALLOWED_GITHUB_LOGINS, shown until the App exists (the App must belong to one). */
   owners: Schema.Array(Schema.String),
   /** The signed-in user, and whether they may finish setup (named in ALLOWED_GITHUB_LOGINS, or the App's owner). */
