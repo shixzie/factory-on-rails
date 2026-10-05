@@ -134,3 +134,7 @@ read needs three more repository permissions (Checks, Commit statuses and
 Actions, all read-only), or runs fail when they look at CI. Add them in the
 App's settings and accept the update on its installation
 ([setup.md, step 1](docs/setup.md#1-create-the-github-app)).
+
+## License
+
+[MIT](LICENSE)
