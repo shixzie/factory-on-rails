@@ -230,7 +230,8 @@ toolchains a repository needs. For Claude Code alone you don't need one: save
 a subscription token in Settings instead.
 
 Railway's standard sandbox image already has git, Node and the common coding
-agents; the runner installs Claude Code, Codex or OpenCode if a snapshot lacks them.
+agents; the runner installs Claude Code, Codex or OpenCode 2 if a snapshot lacks them
+(an OpenCode 1 install is replaced by OpenCode 2).
 
 1. Start a sandbox in `agents` and open a shell in it. `ssh` needs an SSH key
    on your Railway account (Account Settings → SSH Keys); the dashboard's

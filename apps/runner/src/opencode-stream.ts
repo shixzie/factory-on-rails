@@ -1,38 +1,37 @@
 import type { RunEvent } from "@factory/core";
-import { OPENCODE_TOOL_START } from "./agent-tools.js";
+import { OPENCODE_TOOL_START, OPENCODE_TURN_END } from "./agent-tools.js";
 import { truncateStrings, truncateText, withMedia, type AgentEvent } from "./agent-stream.js";
 
 /**
- * Turns OpenCode's `opencode run --format json` output into the same run
+ * Turns OpenCode 2's `opencode run --format json` output into the same run
  * events Claude Code's stream-json becomes (see agent-stream.ts), so the run
  * page, its tool cards and the flow map work the same for every agent.
  *
  * OpenCode prints one JSON event per line, each with the `sessionID` it
  * belongs to and a message `part`: `step_start` and `step_finish` around each
  * model step (the finish carries tokens and cost, and a `reason` other than
- * `tool-calls` when the agent is done), `text`, `reasoning` (with
- * `--thinking`), `tool_use` once a tool has finished or failed, and `error`.
+ * `tool-calls` when the agent is done, though OpenCode 2 exits before it
+ * prints the last one, so the command follows each run with a
+ * `factory_turn_end` line that closes the turn), `text`, `reasoning` (with
+ * `--thinking`), `tool_use` once a tool has finished or failed (`part.id` is
+ * the call, `state.metadata.content` what the model got back), and `error`.
  * OpenCode reports a tool only when it is done, so the factory's plugin (see
- * agent-tools.ts) also prints a `factory_tool_start` line as each one starts;
- * that is how the run page sees a question while it waits for an answer.
- * Lines from subagents' own sessions are skipped, as OpenCode itself does.
+ * agent-tools.ts) records a `factory_tool_start` line as each one starts,
+ * which the command prints too; that is how the run page sees a question
+ * while it waits for an answer. Lines from subagents' own sessions are
+ * skipped, as OpenCode itself does.
  *
  * Each OpenCode tool maps onto the Claude Code tool it stands for:
  *
  * | OpenCode tool        | run event tool_call                              |
  * |----------------------|--------------------------------------------------|
- * | bash                 | `Bash` { command, description }                  |
+ * | shell                | `Bash` { command, description }                  |
  * | read / write / edit  | `Read` / `Write` / `Edit` { file_path, ... }     |
- * | multiedit            | `MultiEdit` { file_path, edits }                 |
- * | apply_patch / patch  | `FileChange` { changes: [{ path, kind }] }       |
- * | grep / glob / list   | `Grep` / `Glob` / `LS`                           |
+ * | patch                | `FileChange` { changes: [{ path, kind }] }       |
+ * | grep / glob          | `Grep` / `Glob`                                  |
  * | webfetch / websearch | `WebFetch` { url } / `WebSearch` { query }       |
- * | todowrite            | `TodoWrite` { todos }                            |
- * | task                 | `Agent` { description, prompt, subagent_type }   |
+ * | subagent             | `Agent` { description, prompt, subagent_type }   |
  * | <server>_<tool>      | `mcp__<server>__<tool>` (ask_user included)      |
- *
- * The schema is `MessageV2.Part` in packages/opencode/src/session/message-v2.ts
- * and the emitter is packages/opencode/src/cli/cmd/run.ts.
  */
 
 type Json = Record<string, unknown>;
@@ -41,7 +40,7 @@ const isObject = (value: unknown): value is Json => typeof value === "object" &&
 const str = (value: unknown) => (typeof value === "string" ? value : "");
 const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
 
-const EVENT_TYPES = new Set(["step_start", "step_finish", "text", "reasoning", "tool_use", "error", OPENCODE_TOOL_START]);
+const EVENT_TYPES = new Set(["step_start", "step_finish", "text", "reasoning", "tool_use", "error", OPENCODE_TOOL_START, OPENCODE_TURN_END]);
 
 const PATCH_KINDS: Record<string, string> = { Add: "add", Update: "update", Delete: "delete" };
 
@@ -52,50 +51,29 @@ export function patchChanges(patch: string): Array<{ path: string; kind: string 
   return changes;
 }
 
-const TODO_STATUS: Record<string, string> = { pending: "pending", in_progress: "in_progress", completed: "completed", cancelled: "completed" };
-
 /** An OpenCode tool call as the Claude Code tool the run page knows. */
 export function toolCall(tool: string, input: Json, mcpServers: ReadonlyArray<string> = []): { name: string; input: Json } {
   switch (tool) {
-    case "bash":
+    case "shell":
       return { name: "Bash", input: { command: str(input.command), ...(input.description ? { description: str(input.description) } : {}) } };
     case "read":
-      return { name: "Read", input: { file_path: str(input.filePath), ...(input.offset !== undefined ? { offset: input.offset } : {}), ...(input.limit !== undefined ? { limit: input.limit } : {}) } };
+      return { name: "Read", input: { file_path: str(input.path), ...(input.offset !== undefined ? { offset: input.offset } : {}), ...(input.limit !== undefined ? { limit: input.limit } : {}) } };
     case "write":
-      return { name: "Write", input: { file_path: str(input.filePath), content: str(input.content) } };
+      return { name: "Write", input: { file_path: str(input.path), content: str(input.content) } };
     case "edit":
-      return { name: "Edit", input: { file_path: str(input.filePath), old_string: str(input.oldString), new_string: str(input.newString), ...(input.replaceAll ? { replace_all: true } : {}) } };
-    case "multiedit":
-      return {
-        name: "MultiEdit",
-        input: {
-          file_path: str(input.filePath),
-          edits: (Array.isArray(input.edits) ? input.edits : []).filter(isObject).map((e) => ({ old_string: str(e.oldString), new_string: str(e.newString) })),
-        },
-      };
-    case "apply_patch":
+      return { name: "Edit", input: { file_path: str(input.path), old_string: str(input.oldString), new_string: str(input.newString), ...(input.replaceAll ? { replace_all: true } : {}) } };
     case "patch":
-      return { name: "FileChange", input: { changes: patchChanges(str(input.patchText ?? input.patch)) } };
+      return { name: "FileChange", input: { changes: patchChanges(str(input.patchText)) } };
     case "grep":
       return { name: "Grep", input: { pattern: str(input.pattern), ...(input.path ? { path: str(input.path) } : {}), ...(input.include ? { glob: str(input.include) } : {}) } };
     case "glob":
       return { name: "Glob", input: { pattern: str(input.pattern), ...(input.path ? { path: str(input.path) } : {}) } };
-    case "list":
-      return { name: "LS", input: { path: str(input.path) } };
     case "webfetch":
       return { name: "WebFetch", input: { url: str(input.url) } };
     case "websearch":
-    case "codesearch":
       return { name: "WebSearch", input: { query: str(input.query) } };
-    case "todowrite":
-      return {
-        name: "TodoWrite",
-        input: {
-          todos: (Array.isArray(input.todos) ? input.todos : []).filter(isObject).map((t) => ({ content: str(t.content), status: TODO_STATUS[str(t.status)] ?? "pending" })),
-        },
-      };
-    case "task":
-      return { name: "Agent", input: { description: str(input.description), prompt: str(input.prompt), ...(input.subagent_type ? { subagent_type: str(input.subagent_type) } : {}) } };
+    case "subagent":
+      return { name: "Agent", input: { description: str(input.description), prompt: str(input.prompt), ...(input.agent ? { subagent_type: str(input.agent) } : {}) } };
     default: {
       // MCP tools are `<server>_<tool>`; the longest matching server name wins.
       const server = [...mcpServers].sort((a, b) => b.length - a.length).find((s) => tool.startsWith(`${s}_`));
@@ -104,11 +82,11 @@ export function toolCall(tool: string, input: Json, mcpServers: ReadonlyArray<st
   }
 }
 
-/** Images and PDFs a tool result carried (an image the agent read), as MCP-shaped blocks for withMedia. */
-function attachmentBlocks(attachments: unknown): Json[] {
-  if (!Array.isArray(attachments)) return [];
-  return attachments.filter(isObject).flatMap((a) => {
-    const m = /^data:([^;,]+);base64,(.*)$/s.exec(str(a.url));
+/** Images and PDFs a tool result gave the model (an image the agent read), as MCP-shaped blocks for withMedia. */
+function contentBlocks(content: unknown): Json[] {
+  if (!Array.isArray(content)) return [];
+  return content.filter(isObject).flatMap((c) => {
+    const m = c.type === "file" ? /^data:([^;,]+);base64,(.*)$/s.exec(str(c.uri)) : null;
     if (!m) return [];
     return [{ type: m[1]!.startsWith("image/") ? "image" : "document", mimeType: m[1], data: m[2] }];
   });
@@ -144,19 +122,24 @@ export function makeOpenCodeParser(options: OpenCodeParserOptions = {}) {
   };
 
   const toolUse = (part: Json): AgentEvent[] => {
-    const id = str(part.callID);
+    const id = str(part.id);
     const state = isObject(part.state) ? part.state : {};
     const input = isObject(state.input) ? state.input : {};
     const events: AgentEvent[] = called.has(id) ? [] : [call(id, str(part.tool), input)];
-    const metadata = isObject(state.metadata) ? state.metadata : {};
     if (state.status === "error") {
-      return [...events, { kind: "tool_result", message: truncateText(str(state.error)), data: { toolUseId: id, isError: true } }];
+      const error = isObject(state.error) ? str(state.error.message) : str(state.error);
+      return [...events, { kind: "tool_result", message: truncateText(error), data: { toolUseId: id, isError: true } }];
     }
-    const exit = typeof metadata.exit === "number" ? metadata.exit : null;
-    let text = str(state.output);
+    const metadata = isObject(state.metadata) ? state.metadata : {};
+    const toolMetadata = isObject(metadata.metadata) ? metadata.metadata : {};
+    const exit = typeof toolMetadata.exit === "number" ? toolMetadata.exit : null;
+    let text = typeof state.output === "string" ? state.output : (Array.isArray(metadata.content) ? metadata.content : [])
+      .filter(isObject)
+      .map((c) => (c.type === "text" ? str(c.text) : ""))
+      .join("");
     if (exit !== null && exit !== 0) text = `${text}${text && !text.endsWith("\n") ? "\n" : ""}Exit code ${exit}`;
     const result: RunEvent = { kind: "tool_result", message: truncateText(text), data: { toolUseId: id, isError: exit !== null && exit !== 0 } };
-    return [...events, withMedia(result, attachmentBlocks(state.attachments))];
+    return [...events, withMedia(result, contentBlocks(metadata.content))];
   };
 
   /**
@@ -174,6 +157,7 @@ export function makeOpenCodeParser(options: OpenCodeParserOptions = {}) {
       return undefined;
     }
     if (!isObject(msg) || typeof msg.type !== "string" || !EVENT_TYPES.has(msg.type)) return undefined;
+    if (msg.type === OPENCODE_TURN_END) return finish();
     // OpenCode only prints its own session's events; the plugin sees subagents' too,
     // which can only start after the agent's own first tool call.
     session ??= str(msg.sessionID) || undefined;
@@ -182,6 +166,19 @@ export function makeOpenCodeParser(options: OpenCodeParserOptions = {}) {
     const events: AgentEvent[] = started ? [] : [{ kind: "info", message: "Agent started (OpenCode)" }];
     started = true;
     return [...events, ...event(msg)];
+  };
+
+  /** The turn's closing result, once: from its last step's finish or the line after the run. */
+  const finish = (): AgentEvent[] => {
+    if (turnStartedAt === undefined) return [];
+    const data: Json = { isError: false, subtype: "success", usage, costUsd: cost, durationMs: now() - turnStartedAt };
+    const result: AgentEvent = { kind: "agent_result", message: lastMessage, data };
+    // The next prompt (a message from the user) starts a new turn.
+    turnStartedAt = undefined;
+    lastMessage = "";
+    usage = { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    cost = 0;
+    return [result];
   };
 
   const event = (msg: Json): AgentEvent[] => {
@@ -216,21 +213,12 @@ export function makeOpenCodeParser(options: OpenCodeParserOptions = {}) {
           cache_creation_input_tokens: usage.cache_creation_input_tokens + num(cache.write),
         };
         cost += num(part.cost);
-        if (part.reason === "tool-calls") return [];
-        const data: Json = { isError: false, subtype: "success", usage, costUsd: cost };
-        if (turnStartedAt !== undefined) data.durationMs = now() - turnStartedAt;
-        const result: AgentEvent = { kind: "agent_result", message: lastMessage, data };
-        // The next prompt (a message from the user) starts a new turn.
-        turnStartedAt = undefined;
-        lastMessage = "";
-        usage = { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
-        cost = 0;
-        return [result];
+        return part.reason === "tool-calls" ? [] : finish();
       }
       case "error": {
         const error = isObject(msg.error) ? msg.error : {};
         const data = isObject(error.data) ? error.data : {};
-        return [{ kind: "error", message: str(data.message) || str(error.name) || "OpenCode stopped with an error" }];
+        return [{ kind: "error", message: str(data.message) || str(error.message) || str(error.name) || str(msg.message) || "OpenCode stopped with an error" }];
       }
       default:
         return [];

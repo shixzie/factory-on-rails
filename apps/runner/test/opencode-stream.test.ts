@@ -12,7 +12,9 @@ const parse = (...lines: (object | string)[]) => {
 };
 const flat = (...lines: (object | string)[]) => parse(...lines).flatMap((e) => e ?? []);
 const ev = (type: string, part: object, sessionID = S) => ({ type, timestamp: 1, sessionID, part });
-const tool = (tool: string, callID: string, state: object, sessionID = S) => ev("tool_use", { type: "tool", tool, callID, state }, sessionID);
+const tool = (tool: string, id: string, state: object, sessionID = S) => ev("tool_use", { type: "tool", tool, id, state }, sessionID);
+/** What OpenCode 2 says the model got back from a tool, and the tool's own metadata. */
+const meta = (text: string, metadata: object = {}) => ({ metadata, content: [{ type: "text", text }] });
 
 describe("OpenCode's JSON events", () => {
   it("keeps lines that aren't OpenCode JSON as plain output", () => {
@@ -20,12 +22,12 @@ describe("OpenCode's JSON events", () => {
   });
 
   it("turns a recorded run into messages, tool calls and a closing result", () => {
-    // Recorded from `opencode run --format json --auto` 1.19.0, trimmed.
+    // Recorded from `opencode run --standalone --format json --auto` 2.0.28, trimmed.
     const events = flat(
       ev("step_start", { type: "step-start" }),
-      tool("read", "call_0", { status: "completed", input: { filePath: "/w/a.txt" }, output: "<path>/w/a.txt</path>\n<content>\n1: hello\n</content>", metadata: { preview: "hello" }, title: "a.txt" }),
-      tool("bash", "call_1", { status: "completed", input: { command: "ls", description: "List files" }, output: "a.txt\n", metadata: { output: "a.txt\n", exit: 0 } }),
-      tool("write", "call_2", { status: "completed", input: { filePath: "/w/b.txt", content: "world" }, output: "Wrote file successfully.", metadata: {} }),
+      tool("read", "call_0", { status: "completed", input: { path: "/w/a.txt" }, output: "<path>/w/a.txt</path>\n<content>\n1: hello\n</content>", metadata: meta("<path>/w/a.txt</path>\n<content>\n1: hello\n</content>"), title: "a.txt" }),
+      tool("shell", "call_1", { status: "completed", input: { command: "ls", description: "List files" }, output: "a.txt\n", metadata: meta("a.txt\n", { exit: 0 }) }),
+      tool("write", "call_2", { status: "completed", input: { path: "/w/b.txt", content: "world" }, output: "Wrote file successfully.", metadata: meta("Wrote file successfully.") }),
       ev("step_finish", { type: "step-finish", reason: "tool-calls", tokens: { total: 11516, input: 9551, output: 129, reasoning: 44, cache: { write: 0, read: 1792 } }, cost: 0.01 }),
       ev("step_start", { type: "step-start" }),
       ev("reasoning", { type: "reasoning", text: "All three done." }),
@@ -56,6 +58,31 @@ describe("OpenCode's JSON events", () => {
     ]);
   });
 
+  it("closes the turn after the run when OpenCode didn't print its last step's finish", () => {
+    // Recorded from 2.0.28: the last step has no step_finish; the command's line follows the run.
+    const events = flat(
+      ev("step_start", {}),
+      tool("glob", "call_g", { status: "completed", input: { pattern: "*.md" }, metadata: meta("README.md") }),
+      ev("step_finish", { reason: "tool-calls", tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 50, write: 0 } }, cost: 0.001 }),
+      ev("step_start", {}),
+      ev("text", { messageID: "msg_2", text: "done" }),
+      { type: "factory_turn_end" },
+      { type: "factory_turn_end" },
+    );
+    expect(events.at(-2)).toEqual({ kind: "message", message: "done", data: null });
+    expect(events.at(-1)).toEqual({
+      kind: "agent_result",
+      message: "done",
+      data: {
+        isError: false,
+        subtype: "success",
+        durationMs: 1000,
+        costUsd: 0.001,
+        usage: { input_tokens: 100, output_tokens: 10, reasoning_tokens: 0, cache_read_input_tokens: 50, cache_creation_input_tokens: 0 },
+      },
+    });
+  });
+
   it("shows a tool as soon as the plugin reports it starting, so a question is visible while it waits", () => {
     // Recorded: the plugin's line for a step's first tool arrives before OpenCode's own step_start.
     const [started, step, done] = parse(
@@ -74,15 +101,15 @@ describe("OpenCode's JSON events", () => {
   it("skips subagents' own tool starts", () => {
     expect(flat(
       ev("step_start", {}),
-      { type: "factory_tool_start", sessionID: "ses_child", callID: "call_c", tool: "bash", args: { command: "ls" } },
+      { type: "factory_tool_start", sessionID: "ses_child", callID: "call_c", tool: "shell", args: { command: "ls" } },
     )).toEqual([{ kind: "info", message: "Agent started (OpenCode)" }]);
   });
 
   it("marks failed tools and failing commands as errors", () => {
     const events = flat(
       ev("step_start", {}),
-      tool("edit", "call_e", { status: "error", input: { filePath: "/w/a.ts", oldString: "a", newString: "b" }, error: "oldString not found in content" }),
-      tool("bash", "call_b", { status: "completed", input: { command: "pnpm test" }, output: "1 failed", metadata: { exit: 1 } }),
+      tool("edit", "call_e", { status: "error", input: { path: "/w/a.ts", oldString: "a", newString: "b" }, error: { message: "oldString not found in content" } }),
+      tool("shell", "call_b", { status: "completed", input: { command: "pnpm test" }, metadata: meta("1 failed", { exit: 1 }) }),
     ).slice(1);
     expect(events).toEqual([
       { kind: "tool_call", message: "Edit", data: { id: "call_e", name: "Edit", input: { file_path: "/w/a.ts", old_string: "a", new_string: "b" } } },
@@ -103,7 +130,7 @@ describe("OpenCode's JSON events", () => {
     const png = Buffer.from("not really a png").toString("base64");
     const [, result] = flat(
       ev("step_start", {}),
-      tool("read", "call_i", { status: "completed", input: { filePath: "/w/shot.png" }, output: "Image read successfully", attachments: [{ type: "file", mime: "image/png", url: `data:image/png;base64,${png}` }] }),
+      tool("read", "call_i", { status: "completed", input: { path: "/w/shot.png" }, output: "Image read successfully", metadata: { metadata: {}, content: [{ type: "text", text: "Image read successfully" }, { type: "file", mime: "image/png", uri: `data:image/png;base64,${png}` }] } }),
     ).slice(1);
     expect(result!.data?.media).toEqual([{ sha: expect.any(String), mediaType: "image/png" }]);
     expect((result as { media?: unknown[] }).media).toHaveLength(1);
@@ -117,17 +144,14 @@ describe("OpenCode tools as the run page knows them", () => {
     expect(toolCall("skill", { name: "x" }, ["docs"])).toEqual({ name: "skill", input: { name: "x" } });
   });
 
-  it("maps plans, subagents, searches and patches", () => {
-    expect(toolCall("todowrite", { todos: [{ content: "a", status: "completed", priority: "high", id: "1" }, { content: "b", status: "cancelled" }, { content: "c", status: "in_progress" }] })).toEqual({
-      name: "TodoWrite",
-      input: { todos: [{ content: "a", status: "completed" }, { content: "b", status: "completed" }, { content: "c", status: "in_progress" }] },
-    });
-    expect(toolCall("task", { description: "Explore", prompt: "Find the router", subagent_type: "explore" })).toEqual({
+  it("maps subagents, searches and patches", () => {
+    expect(toolCall("subagent", { description: "Explore", prompt: "Find the router", agent: "explore" })).toEqual({
       name: "Agent",
       input: { description: "Explore", prompt: "Find the router", subagent_type: "explore" },
     });
     expect(toolCall("grep", { pattern: "foo", include: "*.ts" })).toEqual({ name: "Grep", input: { pattern: "foo", glob: "*.ts" } });
-    expect(toolCall("apply_patch", { patchText: "*** Begin Patch\n*** Add File: a.ts\n+x\n*** Update File: b.ts\n@@\n-y\n+z\n*** Delete File: c.ts\n*** End Patch" })).toEqual({
+    expect(toolCall("glob", { pattern: "*.md" })).toEqual({ name: "Glob", input: { pattern: "*.md" } });
+    expect(toolCall("patch", { patchText: "*** Begin Patch\n*** Add File: a.ts\n+x\n*** Update File: b.ts\n@@\n-y\n+z\n*** Delete File: c.ts\n*** End Patch" })).toEqual({
       name: "FileChange",
       input: { changes: [{ path: "a.ts", kind: "add" }, { path: "b.ts", kind: "update" }, { path: "c.ts", kind: "delete" }] },
     });

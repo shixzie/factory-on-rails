@@ -26,7 +26,7 @@ export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
 export const AGENT_EFFORTS: Record<AgentId, readonly ReasoningEffort[]> = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["low", "medium", "high", "xhigh", "max", "ultra"],
-  // Passed as OpenCode's --variant; which ones a model has depends on its provider.
+  // OpenCode's model variant (provider/model#high); which ones a model has depends on its provider.
   opencode: ["low", "medium", "high", "xhigh", "max"],
 };
 export const ModelId = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._:/@+\[\]-]*$/));

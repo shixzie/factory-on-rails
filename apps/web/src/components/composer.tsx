@@ -116,6 +116,8 @@ export function Composer({
   const blocked = !me.hasApiKey || repos.length === 0;
   const images = useComposerImages(blocked || pending);
   const modelValid = !customModel || Schema.is(Api.ModelId)(model.trim());
+  // OpenCode takes the effort as a variant of the model (`provider/model#high`), so it needs one picked.
+  const effortApplies = agent !== "opencode" || model.trim().length > 0;
   const canSend = !blocked && agentReady && !!selected && (task.trim().length > 0 || images.images.length > 0) && !pending && !images.reading && modelValid;
 
   const submit = () => {
@@ -130,7 +132,7 @@ export function Composer({
           baseBranch: baseBranch.trim() || undefined,
           agent,
           model: model.trim() || null,
-          reasoningEffort: reasoningEffort === "default" ? null : reasoningEffort,
+          reasoningEffort: reasoningEffort === "default" || !effortApplies ? null : reasoningEffort,
         }),
       );
       if (result._tag === "Left") {
@@ -257,7 +259,7 @@ export function Composer({
             placeholder={agent === "opencode" ? "provider/model" : "Enter model ID"}
             className="h-7 w-44 rounded-md border bg-transparent px-2 text-xs outline-none focus:border-ring"
           />}
-          <Select items={efforts} value={reasoningEffort} onValueChange={(v) => v && setReasoningEffort(v as Api.ReasoningEffort | "default")} disabled={blocked || pending}>
+          {effortApplies && <Select items={efforts} value={reasoningEffort} onValueChange={(v) => v && setReasoningEffort(v as Api.ReasoningEffort | "default")} disabled={blocked || pending}>
             <SelectTrigger size="sm" aria-label="Reasoning / thinking effort" className="border-transparent bg-transparent text-xs text-muted-foreground hover:bg-accent dark:bg-transparent">
               <BrainIcon className="size-3.5" />
               <SelectValue />
@@ -265,7 +267,7 @@ export function Composer({
             <SelectContent>
               {efforts.map((item) => <SelectItem key={item.value} value={item.value} className="text-xs">{item.label}</SelectItem>)}
             </SelectContent>
-          </Select>
+          </Select>}
           <ComposerRepoPicker
             repos={repos}
             value={selected}

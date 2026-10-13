@@ -10,7 +10,7 @@ TypeScript with [Effect](https://effect.website).
 While a run works you can follow it live, answer the agent's questions, and
 watch its subagents and the flow of work between them on the Flow map.
 
-- **Claude Code, Codex or OpenCode**, per run, on each user's own credential:
+- **Claude Code, Codex or OpenCode 2**, per run, on each user's own credential:
   a Claude subscription token, an Anthropic API key, a ChatGPT sign-in, an
   OpenAI API key or an OpenCode API key (OpenCode Zen and Go; OpenCode can
   also use the Anthropic and OpenAI keys). The composer also picks the model

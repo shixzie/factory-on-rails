@@ -321,7 +321,7 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    `AGENT_COMMAND` for Claude Code, in headless mode
    (`claude -p … --output-format stream-json`), `CODEX_SETUP_COMMAND` and
    `CODEX_COMMAND` for Codex (`codex exec --json`), or `OPENCODE_SETUP_COMMAND`
-   and `OPENCODE_COMMAND` for OpenCode (`opencode run --format json`), each with the factory's
+   and `OPENCODE_COMMAND` for OpenCode 2 (`opencode run --standalone --format json`), each with the factory's
    ask-the-user tool and inbox hook (see "Agents" below). Any CLI that edits
    files in the working tree works as a command, and plain text output is
    shown as a log.
@@ -417,14 +417,14 @@ same tools and show up the same way on the run page.
 
 | | Claude Code | Codex | OpenCode |
 |---|---|---|---|
-| Command | `claude -p "<task>" --output-format stream-json` | `codex exec --json - < TASK.md` | `opencode run --format json --thinking -- "<task>"` |
+| Command | `claude -p "<task>" --output-format stream-json` | `codex exec --json - < TASK.md` | `opencode run --standalone --format json --thinking < TASK.md` |
 | Next turn | `--continue` | `codex exec resume --last` | `--continue` |
 | Unattended | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` (the Railway sandbox is the boundary) | `--auto` |
-| ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` | `opencode.json` (as `OPENCODE_CONFIG`) with the factory's plugin, `opencode-plugin.mjs` |
-| Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` | `instructions` in `opencode.json` |
+| ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` | `opencode.json` (as `OPENCODE_CONFIG`) with the factory's plugin, the `opencode-plugin` directory |
+| Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` | The plugin's session `context` hook |
 | Output parser | `agent-stream.ts` | `codex-stream.ts` | `opencode-stream.ts` |
 | Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY`, or a ChatGPT sign-in (`CODEX_AUTH_JSON`, written to `~/.codex/auth.json`) | Every one saved of `OPENCODE_API_KEY` (Zen and Go), `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` |
-| Model and effort | `--model`, `--effort` | `--model`, `-c model_reasoning_effort=…` | `--model provider/model`, `--variant` |
+| Model and effort | `--model`, `--effort` | `--model`, `-c model_reasoning_effort=…` | `--model provider/model#effort` |
 
 Codex prints `thread.started`, `turn.*` and `item.*` events. Each item maps
 onto the Claude Code tool it stands for, so the run page, the subagent cards
@@ -436,19 +436,27 @@ becomes `Agent`, and `file_change`, which names the files a patch touched but
 not its lines, becomes `FileChange` (the Diff panel has the lines). Its hooks
 take the same JSON as Claude Code's, so the inbox hook serves both.
 
-OpenCode prints `step_start`, `step_finish`, `text`, `reasoning`, `tool_use`
-and `error` events, each carrying a message part. Its tools map the same way
-(`bash` to `Bash`, `read`/`write`/`edit` to `Read`/`Write`/`Edit`,
-`apply_patch` to `FileChange`, `todowrite` to `TodoWrite`, `task` to
-`Agent`, and MCP tools, which OpenCode names `<server>_<tool>`, to
-`mcp__<server>__<tool>`). OpenCode has plugins rather than hooks, so the
-factory's plugin does the hooks' work: after each tool it appends the user's
-unread messages to the tool's output, and as each tool starts it prints a
-`factory_tool_start` line, because OpenCode reports a tool only once it is
-done and a waiting question would otherwise not show. With no stop hook,
-`OPENCODE_COMMAND` continues the session (`--continue`) with any messages
-still unread when a run ends, and stdin is closed so OpenCode doesn't wait
-on it. Subagents' own steps are not shown, as with Codex.
+The runner installs OpenCode 2 (`@opencode/cli@2`), replacing an OpenCode 1
+a snapshot may have. Each `opencode run` is `--standalone`, on a private
+server that exits with it rather than the shared background service. It
+prints `step_start`, `step_finish`, `text`, `reasoning`, `tool_use` and
+`error` events, each carrying a message part. Its tools map the same way
+(`shell` to `Bash`, `read`/`write`/`edit` to `Read`/`Write`/`Edit`, `patch`
+to `FileChange`, `subagent` to `Agent`, and MCP tools, which OpenCode names
+`<server>_<tool>`, to `mcp__<server>__<tool>`). MCP servers are configured
+with Code Mode off, so each tool is called by its own name. OpenCode has
+plugins rather than hooks, so the factory's plugin does the hooks' work:
+its `context` hook adds the factory's instructions, `execute.after` appends
+the user's unread messages to a tool's result, and `execute.before` records
+a `factory_tool_start` line in `opencode-tools.jsonl`, which the command
+prints beside OpenCode's output (the plugin runs in OpenCode's server, whose
+stdout isn't the run's). OpenCode reports a tool only once it is done, so
+without that line a waiting question would not show. The prompt goes in on
+stdin, and since OpenCode 2 exits before printing its last step's finish,
+the command prints a `factory_turn_end` line after each run to close the
+turn. With no stop hook, `OPENCODE_COMMAND` continues the session
+(`--continue`) with any messages still unread when a run ends. Subagents'
+own steps are not shown, as with Codex.
 
 Unlike the other two, OpenCode gets every credential it can use, not only
 the first: one OpenCode API key covers OpenCode's pay-as-you-go Zen models
@@ -469,8 +477,8 @@ on the user's account and the installed CLI.
 The runner passes them to the agent command as `FACTORY_MODEL` and
 `FACTORY_REASONING_EFFORT` (empty for the default), plus
 `FACTORY_CODEX_EFFORT`, the whole quoted `-c` assignment for Codex or empty.
-OpenCode takes the effort as `--variant`, whose values depend on the model's
-provider. A custom `AGENT_COMMAND`, `CODEX_COMMAND`, `OPENCODE_COMMAND` or describe command must use them
+OpenCode takes the effort as the model's variant (`--model provider/model#high`),
+so it applies only with a model picked; the composer hides it until then. A custom `AGENT_COMMAND`, `CODEX_COMMAND`, `OPENCODE_COMMAND` or describe command must use them
 itself, quoted, as the defaults do.
 
 ### Images
