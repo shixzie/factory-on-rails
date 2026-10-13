@@ -142,7 +142,7 @@ IaC). To restrict it, change that value to a comma-separated list of logins.
 
 There is no platform-wide model API key. The factory is bring-your-own-key:
 each user saves their own key under **Settings** in the web app, and only their
-runs use it. Runs use Claude Code or Codex, picked per run in the composer:
+runs use it. Runs use Claude Code, Codex or OpenCode, picked per run in the composer:
 
 | Agent | Credential in Settings | What it bills |
 |---|---|---|
@@ -150,8 +150,14 @@ runs use it. Runs use Claude Code or Codex, picked per run in the composer:
 | Claude Code | Anthropic API key | Your Anthropic Console account |
 | Codex | OpenAI API key | Your OpenAI Platform account |
 | Codex | ChatGPT device login (`codex login --device-auth`) | Your eligible ChatGPT plan |
+| OpenCode | OpenCode API key ([opencode.ai/auth](https://opencode.ai/auth)) | Your OpenCode account: pay-as-you-go Zen models, and Go models with an OpenCode Go subscription |
+| OpenCode | Anthropic or OpenAI API key (the same ones as above) | That provider's account |
 
-A run gets only its agent's credential. For ChatGPT, run `codex login
+A Claude Code or Codex run gets only its agent's credential. An OpenCode run
+gets every one of its keys you saved, since OpenCode picks a provider per
+model: pick `opencode/…` (Zen), `opencode-go/…` (Go), `anthropic/…` or
+`openai/…` models in the composer, which offers those whose key you saved.
+One OpenCode key covers both Zen and Go. For ChatGPT, run `codex login
 --device-auth` locally, finish the code login, and paste the contents of
 `~/.codex/auth.json` into the ChatGPT subscription field in Settings. With
 both saved, Claude Code gets the
@@ -187,7 +193,7 @@ header if the provider offers one. The callback address is
 **Disconnect** removes Factory's saved authorization. Disconnecting does not
 revoke the grant at the provider; use its account settings to do that.
 
-Saved servers apply to your account's Claude Code and Codex threads. Each new
+Saved servers apply to your account's Claude Code, Codex and OpenCode threads. Each new
 thread and each subsequent agent turn loads your latest enabled servers and
 credentials. Settings do not change a command already running. OAuth access
 tokens are refreshed before a new turn when possible; a long-running agent may
@@ -224,7 +230,7 @@ toolchains a repository needs. For Claude Code alone you don't need one: save
 a subscription token in Settings instead.
 
 Railway's standard sandbox image already has git, Node and the common coding
-agents; the runner installs Claude Code or Codex if a snapshot lacks them.
+agents; the runner installs Claude Code, Codex or OpenCode if a snapshot lacks them.
 
 1. Start a sandbox in `agents` and open a shell in it. `ssh` needs an SSH key
    on your Railway account (Account Settings → SSH Keys); the dashboard's
@@ -242,6 +248,8 @@ agents; the runner installs Claude Code or Codex if a snapshot lacks them.
      prints on any device and enter the code. `codex login status` confirms it.
    - Claude Code with your plan: run `claude`, type `/login`, open the link
      and paste the code back. (Or skip this and use the token in Settings.)
+   - OpenCode with another provider: `opencode auth login` and pick it. (For
+     OpenCode Zen, Go, Anthropic or OpenAI, save the key in Settings instead.)
    - Anything else runs need: toolchains, package caches, global config.
 
    Stay out of `/workspace/repo`, which is where each run clones its

@@ -5,8 +5,15 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import type { ResolvedMcpServer } from "@factory/core";
-import { agentToolEnv, agentToolFiles, deliverMessageScript, SYSTEM_PROMPT } from "../src/agent-tools.js";
-import { DEFAULT_AGENT_COMMAND, DEFAULT_AGENT_DESCRIBE_COMMAND, DEFAULT_CODEX_COMMAND, DEFAULT_CODEX_DESCRIBE_COMMAND } from "../src/config.js";
+import { agentToolEnv, agentToolFiles, deliverMessageScript, describeToolEnv, SYSTEM_PROMPT } from "../src/agent-tools.js";
+import {
+  DEFAULT_AGENT_COMMAND,
+  DEFAULT_AGENT_DESCRIBE_COMMAND,
+  DEFAULT_CODEX_COMMAND,
+  DEFAULT_CODEX_DESCRIBE_COMMAND,
+  DEFAULT_OPENCODE_COMMAND,
+  DEFAULT_OPENCODE_DESCRIBE_COMMAND,
+} from "../src/config.js";
 
 /** Writes the agent tools into a temp dir, as the runner does in the sandbox. */
 function setup(servers: ReadonlyArray<ResolvedMcpServer> = []) {
@@ -58,6 +65,11 @@ describe("agent tools", () => {
     expect(overrides).toContain(`mcp_servers.docs-api={url="https://mcp.example.com/tools",http_headers={"Authorization"=${JSON.stringify(`Bearer ${token}`)},"X-Region"="us-east"}}`);
     expect(overrides).toContain(`mcp_servers.local_tools={command="npx",args=["-y","example-mcp","--path","a path $(echo bad)"],env={"API_KEY"=${JSON.stringify(token)}}}`);
     expect(overrides.join("\n")).not.toContain("https://invalid.example.com");
+
+    const opencode = JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8"));
+    expect(opencode.mcp["docs-api"]).toEqual({ type: "remote", url: "https://mcp.example.com/tools", headers: { Authorization: `Bearer ${token}`, "X-Region": "us-east" }, enabled: true });
+    expect(opencode.mcp.local_tools).toEqual({ type: "local", command: ["npx", "-y", "example-mcp", "--path", "a path $(echo bad)"], environment: { API_KEY: token }, enabled: true });
+    expect(opencode.mcp.factory).toEqual({ type: "local", command: ["node", join(dir, "ask-server.mjs")], enabled: true, timeout: 1_860_000 });
   });
 
   it("gives Codex the MCP server, the hooks and the instructions as one -c override each", async () => {
@@ -104,8 +116,10 @@ describe("agent tools", () => {
   it.each([
     ["claude", DEFAULT_AGENT_COMMAND],
     ["codex", DEFAULT_CODEX_COMMAND],
+    ["opencode", DEFAULT_OPENCODE_COMMAND],
     ["claude", DEFAULT_AGENT_DESCRIBE_COMMAND],
     ["codex", DEFAULT_CODEX_DESCRIBE_COMMAND],
+    ["opencode", DEFAULT_OPENCODE_DESCRIBE_COMMAND],
   ])("passes model and effort as single arguments to %s: %s", async (agent, command) => {
     const { dir, env } = setup();
     const bin = join(dir, "bin");
@@ -131,10 +145,12 @@ if (process.argv.includes("-")) process.stdin.resume();
         if (model) {
           expect(args[args.indexOf("--model") + 1]).toBe(model);
           if (agent === "claude") expect(args[args.indexOf("--effort") + 1]).toBe("high");
+          else if (agent === "opencode") expect(args[args.indexOf("--variant") + 1]).toBe("high");
           else expect(args.filter((_, i) => args[i - 1] === "-c")).toContain('model_reasoning_effort="high"');
         } else {
           expect(args).not.toContain("--model");
           expect(args).not.toContain("--effort");
+          expect(args).not.toContain("--variant");
           expect(args.some((a) => a.startsWith("model_reasoning_effort="))).toBe(false);
         }
       }
@@ -192,6 +208,114 @@ if (process.argv.includes("-")) process.stdin.resume();
       "-",
     ]);
     expect(codex.stdin).toBe("Write the PR");
+  });
+
+  it("runs OpenCode on the task with the factory's config, and continues it while messages are unread", async () => {
+    const { dir, send, env } = setup();
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const calls = join(dir, "calls.jsonl");
+    // A stand-in `opencode` that records each run and, on the first, sends a message as if the user typed it meanwhile.
+    writeFileSync(join(bin, "opencode"), `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.CALLS, JSON.stringify({ args: process.argv.slice(2), config: process.env.OPENCODE_CONFIG }) + "\\n");
+if (process.env.SEND && fs.readFileSync(process.env.CALLS, "utf8").trim().split("\\n").length === 1) {
+  fs.writeFileSync(process.env.SEND, JSON.stringify({ text: "Also update the README" }));
+}
+`, { mode: 0o755 });
+    const task = join(dir, "TASK.md");
+    writeFileSync(task, "- a task that starts with a dash");
+    const invoke = async (extra: Record<string, string> = {}) => {
+      writeFileSync(calls, "");
+      await run("sh", ["-c", DEFAULT_OPENCODE_COMMAND], {
+        env: { ...env, FACTORY_CONTINUE: "", ...extra, PATH: `${bin}:${process.env.PATH}`, FACTORY_TASK_FILE: task, CALLS: calls },
+      });
+      return readFileSync(calls, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { args: string[]; config: string });
+    };
+
+    const [first, ...rest] = await invoke();
+    expect(rest).toEqual([]);
+    expect(first!.args).toEqual(["run", "--format", "json", "--thinking", "--auto", "--", "- a task that starts with a dash"]);
+    expect(first!.config).toBe(join(dir, "opencode.json"));
+
+    const later = await invoke({ FACTORY_CONTINUE: "1" });
+    expect(later[0]!.args.slice(-3)).toEqual(["--continue", "--", "- a task that starts with a dash"]);
+
+    // Unread when the run ends (the stand-in makes no tool calls to hand them over), so the session continues with both.
+    send("0005", "Use pnpm");
+    const [, ...followUps] = await invoke({ SEND: join(dir, "inbox", "0006.json") });
+    expect(followUps).toHaveLength(1);
+    expect(followUps[0]!.args.slice(-3, -1)).toEqual(["--continue", "--"]);
+    expect(followUps[0]!.args.at(-1)).toBe("The user sent a message while you were working:\n\nUse pnpm\n\nAlso update the README\n\nAddress it before you finish.");
+  });
+
+  it("points OpenCode at the instructions and the plugin, which reports tool starts and hands over messages", async () => {
+    const { dir, send } = setup();
+    const config = JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8"));
+    expect(config.instructions).toEqual([join(dir, "system-prompt.md")]);
+    expect(config.plugin).toEqual([`file://${join(dir, "opencode-plugin.mjs")}`]);
+    expect(readFileSync(join(dir, "system-prompt.md"), "utf8")).toBe(SYSTEM_PROMPT);
+
+    const previous = process.env.FACTORY_DIR;
+    process.env.FACTORY_DIR = dir;
+    const writes: string[] = [];
+    const write = process.stdout.write;
+    try {
+      const plugin = await import(`${join(dir, "opencode-plugin.mjs")}?${Date.now()}`);
+      const hooks = await plugin.FactoryPlugin({});
+      process.stdout.write = ((chunk: string) => (writes.push(chunk), true)) as typeof process.stdout.write;
+      await hooks["tool.execute.before"]({ tool: "factory_ask_user", sessionID: "ses_1", callID: "call_1" }, { args: { question: "Postgres?" } });
+      process.stdout.write = write;
+      expect(writes.map((w) => JSON.parse(w))).toEqual([
+        { type: "factory_tool_start", sessionID: "ses_1", callID: "call_1", tool: "factory_ask_user", args: { question: "Postgres?" } },
+      ]);
+
+      const quiet = { title: "", output: "ok", metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "bash", sessionID: "ses_1", callID: "call_2" }, quiet);
+      expect(quiet.output).toBe("ok");
+      send("0007", "Use pnpm, not npm");
+      const told = { title: "", output: "ok", metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "bash", sessionID: "ses_1", callID: "call_3" }, told);
+      expect(told.output).toBe("ok\n\nThe user sent a message while you were working:\n\nUse pnpm, not npm");
+      expect(readdirSync(join(dir, "delivered"))).toEqual(["0007.json"]);
+    } finally {
+      process.stdout.write = write;
+      if (previous === undefined) delete process.env.FACTORY_DIR;
+      else process.env.FACTORY_DIR = previous;
+    }
+  });
+
+  it("asks OpenCode for the pull request in a fork of its session, keeps the reply and deletes the fork", async () => {
+    const { dir } = setup();
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const calls = join(dir, "calls.jsonl");
+    writeFileSync(join(bin, "opencode"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CALLS, JSON.stringify({ args, content: process.env.OPENCODE_CONFIG_CONTENT ?? null }) + "\\n");
+if (args[0] === "run") {
+  const line = (type, part) => console.log(JSON.stringify({ type, sessionID: "ses_fork", part }));
+  line("step_start", {});
+  line("text", { messageID: "msg_1", text: "Let me look at the diff." });
+  line("tool_use", { tool: "bash", callID: "c1", state: { status: "completed", input: { command: "git diff" }, output: "" } });
+  line("text", { messageID: "msg_2", text: "Add OpenCode" });
+  line("text", { messageID: "msg_2", text: "It runs OpenCode." });
+  line("step_finish", { reason: "stop" });
+}
+`, { mode: 0o755 });
+    const prompt = join(dir, "describe-prompt.md");
+    writeFileSync(prompt, "Write the PR");
+    const pr = join(dir, "pull-request.md");
+    await run("sh", ["-c", DEFAULT_OPENCODE_DESCRIBE_COMMAND], { env: {
+      ...process.env, ...describeToolEnv(dir), PATH: `${bin}:${process.env.PATH}`, CALLS: calls,
+      FACTORY_DESCRIBE_FILE: prompt, FACTORY_PR_FILE: pr, FACTORY_MODEL: "", FACTORY_REASONING_EFFORT: "",
+    } });
+    const [describe, remove] = readFileSync(calls, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { args: string[]; content: string | null });
+    expect(describe!.args).toEqual(["run", "--format", "json", "--thinking", "--auto", "--continue", "--fork", "--", "Write the PR"]);
+    expect(JSON.parse(describe!.content!)).toEqual({ permission: { edit: "deny" } });
+    expect(remove!.args).toEqual(["session", "delete", "ses_fork"]);
+    expect(readFileSync(pr, "utf8")).toBe("Add OpenCode\n\nIt runs OpenCode.");
   });
 
   it("points Claude Code at the MCP server and the hooks", () => {

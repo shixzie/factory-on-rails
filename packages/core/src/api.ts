@@ -13,9 +13,9 @@ export const SandboxState = Schema.Literal("none", "running", "stopping", "stopp
 export type SandboxState = typeof SandboxState.Type;
 
 /** The coding agent a run uses; see `AGENTS` in providers.ts. */
-export const AgentId = Schema.Literal("claude", "codex");
+export const AgentId = Schema.Literal("claude", "codex", "opencode");
 export type AgentId = typeof AgentId.Type;
-export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex" };
+export const AGENT_LABELS: Record<AgentId, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
 
 /** Null leaves the agent's own model/effort configuration in control. */
 export const ReasoningEffort = Schema.Literal("low", "medium", "high", "xhigh", "max", "ultra");
@@ -26,6 +26,8 @@ export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
 export const AGENT_EFFORTS: Record<AgentId, readonly ReasoningEffort[]> = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  // Passed as OpenCode's --variant; which ones a model has depends on its provider.
+  opencode: ["low", "medium", "high", "xhigh", "max"],
 };
 export const ModelId = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[a-zA-Z0-9][a-zA-Z0-9._:/@+\[\]-]*$/));
 
@@ -106,6 +108,8 @@ export const ApiAgent = Schema.Struct({
   label: Schema.String,
   /** The user saved a credential for it, or picked a sandbox snapshot that can carry one. */
   ready: Schema.Boolean,
+  /** The user's saved credentials it would use (OpenCode offers models from each). */
+  providers: Schema.optionalWith(Schema.Array(Schema.String), { default: () => [] }),
 });
 export type ApiAgent = typeof ApiAgent.Type;
 
@@ -115,7 +119,7 @@ export const Me = Schema.Struct({
   /** At least one agent is ready, so a run can start. */
   hasApiKey: Schema.Boolean,
   agents: Schema.optionalWith(Schema.Array(ApiAgent), {
-    default: () => [{ id: "claude" as const, label: "Claude Code", ready: false }],
+    default: () => [{ id: "claude" as const, label: "Claude Code", ready: false, providers: [] }],
   }),
   /** The sandbox snapshot the user's runs start from, if they picked one. */
   snapshot: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),

@@ -6,6 +6,7 @@ import { hostname } from "node:os";
 const MODEL_ARGUMENT = '${FACTORY_MODEL:+--model "$FACTORY_MODEL"}';
 const CLAUDE_EFFORT_ARGUMENT = '${FACTORY_REASONING_EFFORT:+--effort "$FACTORY_REASONING_EFFORT"}';
 const CODEX_EFFORT_ARGUMENT = '${FACTORY_CODEX_EFFORT:+-c "$FACTORY_CODEX_EFFORT"}';
+const OPENCODE_EFFORT_ARGUMENT = '${FACTORY_REASONING_EFFORT:+--variant "$FACTORY_REASONING_EFFORT"}';
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
 /**
@@ -51,6 +52,33 @@ export const DEFAULT_CODEX_COMMAND = [
   ].join(" "),
 ].join("\n");
 
+export const DEFAULT_OPENCODE_SETUP = "command -v opencode >/dev/null 2>&1 || npm install -g opencode-ai";
+/** The start of one `opencode run`, printing JSON events with the agent's reasoning. */
+const OPENCODE_RUN = [
+  "opencode run --format json --thinking --auto",
+  MODEL_ARGUMENT,
+  OPENCODE_EFFORT_ARGUMENT,
+];
+/**
+ * OpenCode in non-interactive mode, printing JSON events (see
+ * opencode-stream.ts). The factory's ask-the-user server, instructions and
+ * plugin come from FACTORY_OPENCODE_CONFIG (see agent-tools.ts). `--auto`
+ * approves its permission prompts: the Railway sandbox is the boundary, as
+ * with Claude Code's --dangerously-skip-permissions. stdin is closed, or
+ * OpenCode would wait to read more of the prompt from it, and the prompt
+ * follows `--` so one starting with "-" is never read as a flag. OpenCode has
+ * no stop hook, so while the user's messages are waiting in the inbox it
+ * continues the session with them. On a later turn in the same sandbox it
+ * continues its last session.
+ */
+export const DEFAULT_OPENCODE_COMMAND = [
+  'export OPENCODE_CONFIG="$FACTORY_OPENCODE_CONFIG"',
+  [...OPENCODE_RUN, '${FACTORY_CONTINUE:+--continue} -- "$(cat "$FACTORY_TASK_FILE")" < /dev/null || exit $?'].join(" "),
+  'while next="$(node "$FACTORY_INBOX_HOOK" next < /dev/null)" && [ -n "$next" ]; do',
+  `  ${[...OPENCODE_RUN, '--continue -- "$next" < /dev/null || exit $?'].join(" ")}`,
+  "done",
+].join("\n");
+
 /**
  * Claude Code writing the pull request once the work is pushed (see
  * describePrompt in plan.ts). It continues the run's session, so it knows why
@@ -75,6 +103,20 @@ export const DEFAULT_CODEX_DESCRIBE_COMMAND = [
   '-o "$FACTORY_PR_FILE" - < "$FACTORY_DESCRIBE_FILE"',
 ].join(" ");
 
+/**
+ * The same for OpenCode, in a fork of its last session with file edits
+ * denied. Its reply is the last message's text; the fork is deleted
+ * afterwards, or the next turn's `--continue` would pick it up.
+ */
+export const DEFAULT_OPENCODE_DESCRIBE_COMMAND = [
+  `export OPENCODE_CONFIG_CONTENT='{"permission":{"edit":"deny"}}'`,
+  [...OPENCODE_RUN, '--continue --fork -- "$(cat "$FACTORY_DESCRIBE_FILE")" < /dev/null > "$FACTORY_DIR/describe.jsonl"'].join(" "),
+  'status=$?',
+  'session="$(node "$FACTORY_OPENCODE_REPLY" "$FACTORY_PR_FILE" < "$FACTORY_DIR/describe.jsonl")"',
+  'if [ -n "$session" ]; then opencode session delete "$session" >/dev/null 2>&1 || true; fi',
+  'exit $status',
+].join("\n");
+
 /** How to install and run one agent CLI in a sandbox. */
 export interface AgentCommands {
   readonly setupCommand: string;
@@ -90,7 +132,8 @@ export interface AgentCommands {
 export interface AgentSettings {
   /**
    * Per agent: Claude Code (AGENT_SETUP_COMMAND, AGENT_COMMAND,
-   * AGENT_DESCRIBE_COMMAND) and Codex (the same with CODEX_).
+   * AGENT_DESCRIBE_COMMAND), Codex (the same with CODEX_) and OpenCode (with
+   * OPENCODE_).
    */
   readonly commands: Readonly<Record<AgentId, AgentCommands>>;
   readonly timeoutSec: number;
@@ -174,6 +217,11 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
               setupCommand: str("CODEX_SETUP_COMMAND", DEFAULT_CODEX_SETUP),
               command: str("CODEX_COMMAND", DEFAULT_CODEX_COMMAND),
               describeCommand: str("CODEX_DESCRIBE_COMMAND", DEFAULT_CODEX_DESCRIBE_COMMAND),
+            }),
+            opencode: Config.all({
+              setupCommand: str("OPENCODE_SETUP_COMMAND", DEFAULT_OPENCODE_SETUP),
+              command: str("OPENCODE_COMMAND", DEFAULT_OPENCODE_COMMAND),
+              describeCommand: str("OPENCODE_DESCRIBE_COMMAND", DEFAULT_OPENCODE_DESCRIBE_COMMAND),
             }),
           }),
           timeoutSec: int("AGENT_TIMEOUT_SECONDS", 3600),

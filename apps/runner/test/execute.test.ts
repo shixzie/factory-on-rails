@@ -1278,6 +1278,8 @@ describe("executeRun", () => {
         expect(lines.slice(-4, -1)).toEqual(["set -eu", "rm -f /workspace/.factory/pull-request.md", READ_REPLY]);
         expect(sandboxes.state.commands.at(-3)).toContain("\ndescribe-pr");
         expect(sandboxes.state.envs.at(-3)).toEqual({
+          FACTORY_DIR: "/workspace/.factory",
+          FACTORY_OPENCODE_REPLY: "/workspace/.factory/opencode-reply.mjs",
           FACTORY_MODEL: "",
           FACTORY_REASONING_EFFORT: "",
           FACTORY_CODEX_EFFORT: "",

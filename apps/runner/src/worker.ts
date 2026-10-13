@@ -1,10 +1,10 @@
 import { PgClient } from "@effect/sql-pg";
 import {
-  agentCredential,
+  agentCredentials,
+  agentEnvVar,
   AGENTS,
   DEFAULT_AGENT,
   isAgentId,
-  MODEL_PROVIDERS,
   resolveMcpServers,
   snapshotsFor,
   Store,
@@ -25,19 +25,22 @@ const noKey = (agent: AgentId) =>
   `No usable key for ${AGENTS[agent].label}. Add or re-save it in Settings (or pick a sandbox snapshot that is signed in), then send a message to try again.`;
 
 /**
- * Decrypts the one credential of the run owner's that their agent should use
- * (see AGENTS) into the env var it reads. Only that one goes in: Claude Code,
- * for one, would pick an API key over a subscription token.
+ * Decrypts the run owner's credentials that their agent should use (see
+ * AGENTS) into the env vars it reads. For Claude Code and Codex only one goes
+ * in: Claude Code, for one, would pick an API key over a subscription token.
+ * OpenCode gets each of its providers' keys and picks one per model.
  */
 const userKeyEnv = (userId: string, agent: AgentId) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const cipher = yield* TokenCipher;
     const keys = yield* store.encryptedApiKeys(userId);
-    const provider = agentCredential(agent, keys.map((k) => k.provider));
-    const key = keys.find((k) => k.provider === provider);
-    if (!provider || !key) return {};
-    return { [MODEL_PROVIDERS[provider].envVar]: yield* cipher.decrypt(key.key_enc) };
+    const env: Record<string, string> = {};
+    for (const provider of agentCredentials(agent, keys.map((k) => k.provider))) {
+      const key = keys.find((k) => k.provider === provider)!;
+      env[agentEnvVar(agent, provider)] = yield* cipher.decrypt(key.key_enc);
+    }
+    return env;
   });
 
 /**

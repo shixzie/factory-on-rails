@@ -146,7 +146,7 @@ describes. For reference, the service it adds:
 # Deploy and Host Factory on Rails with Railway
 
 Factory on Rails is a self-hosted software factory. Sign in with GitHub, pick
-a repository, describe a change, and a coding agent (Claude Code or Codex) does
+a repository, describe a change, and a coding agent (Claude Code, Codex or OpenCode) does
 the work in its own Railway sandbox and opens a pull request. You can follow
 the agent live, answer its questions, attach screenshots and keep the
 conversation going. The agent writes the PR's title and description, waits for

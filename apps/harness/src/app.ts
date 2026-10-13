@@ -1,12 +1,13 @@
 import { HttpIncomingMessage, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import {
-  agentCredential,
+  agentCredentials,
   AGENTS,
   Api,
   DEFAULT_AGENT,
   GitHubError,
   GitHubUserApi,
   InstanceSettings,
+  isAgentId,
   isModelProvider,
   keyHint,
   MODEL_PROVIDERS,
@@ -60,7 +61,7 @@ export const toApiRun = (r: RunRow): Api.ApiRun => ({
   images: r.images ?? [],
   title: r.title,
   titleByUser: r.title_by_user,
-  agent: r.agent === "codex" ? "codex" : "claude",
+  agent: isAgentId(r.agent) ? r.agent : DEFAULT_AGENT,
   model: r.model ?? null,
   reasoningEffort: r.reasoning_effort ?? null,
   status: r.status,
@@ -167,7 +168,10 @@ const agentsFor = (user: UserRow) =>
     const saved = (yield* (yield* Store).listApiKeys(user.id)).map((k) => k.provider);
     const { selected } = yield* snapshotSettings(user);
     return (Object.keys(AGENTS) as AgentId[]).map(
-      (id): Api.ApiAgent => ({ id, label: AGENTS[id].label, ready: selected !== null || agentCredential(id, saved) !== undefined }),
+      (id): Api.ApiAgent => {
+        const providers = agentCredentials(id, saved);
+        return { id, label: AGENTS[id].label, ready: selected !== null || providers.length > 0, providers };
+      },
     );
   });
 

@@ -220,8 +220,9 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
       user: { login: "me", name: null, avatarUrl: null },
       hasApiKey: false,
       agents: [
-        { id: "claude", label: "Claude Code", ready: false },
-        { id: "codex", label: "Codex", ready: false },
+        { id: "claude", label: "Claude Code", ready: false, providers: [] },
+        { id: "codex", label: "Codex", ready: false, providers: [] },
+        { id: "opencode", label: "OpenCode", ready: false, providers: [] },
       ],
       snapshot: null,
       installUrl: "https://github.com/apps/factory-on-rails/installations/new",
@@ -747,10 +748,30 @@ describe.skipIf(!testDatabaseUrl)("harness app", () => {
 
       expect((await send("PUT", "/api/settings/keys/openai", cookie, { key: "sk-proj-" + "o".repeat(30) })).status).toBe(200);
       const me = await json(request("/api/me", { headers: { cookie } }));
-      expect(me.agents.map((a: { ready: boolean }) => a.ready)).toEqual([true, true]);
+      expect(me.agents.map((a: { ready: boolean }) => a.ready)).toEqual([true, true, true]);
       const ok = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "codex" });
       expect(ok.status).toBe(201);
       expect((await json(ok)).agent).toBe("codex");
+    });
+
+    it("lets OpenCode run on its own key or on the Anthropic and OpenAI keys", async () => {
+      const { cookie } = await signIn("opencoder", 14);
+      github.repos = [{ id: 1, full_name: "shixzie/demo", name: "demo", private: true, default_branch: "main", html_url: "h" }];
+      const opencode = async () => (await json(request("/api/me", { headers: { cookie } }))).agents.find((a: { id: string }) => a.id === "opencode");
+      expect(await opencode()).toEqual({ id: "opencode", label: "OpenCode", ready: false, providers: [] });
+      const refused = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "opencode" });
+      expect(await json(refused)).toMatchObject({ code: "api_key_required", error: expect.stringContaining("OpenCode") });
+
+      await send("PUT", "/api/settings/keys/anthropic", cookie, { key: "sk-ant-api03-" + "a".repeat(30) });
+      expect(await opencode()).toMatchObject({ ready: true, providers: ["anthropic"] });
+      expect((await send("PUT", "/api/settings/keys/opencode", cookie, { key: "sk-" + "z".repeat(40) })).status).toBe(200);
+      expect(await opencode()).toMatchObject({ ready: true, providers: ["opencode", "anthropic"] });
+      const slot = (await json(request("/api/settings/keys", { headers: { cookie } }))).find((k: { provider: string }) => k.provider === "opencode");
+      expect(slot).toMatchObject({ agent: "opencode", label: "OpenCode API key", saved: { hint: "zzzz" } });
+
+      const ok = await post("/api/runs", cookie, { installationId: 1, repo: "shixzie/demo", task: "x", agent: "opencode", model: "opencode-go/kimi-k3", reasoningEffort: "max" });
+      expect(ok.status).toBe(201);
+      expect(await json(ok)).toMatchObject({ agent: "opencode", model: "opencode-go/kimi-k3", reasoningEffort: "max" });
     });
 
     it("offers each user only their snapshots, and lets one stand in for a key", async () => {

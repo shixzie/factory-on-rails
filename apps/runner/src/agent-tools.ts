@@ -13,9 +13,14 @@
  *   output). After every tool call it hands the agent any messages the user
  *   sent meanwhile, and when the agent is about to stop with unread messages
  *   it keeps it going.
+ * - `opencode-plugin.mjs` does the same for OpenCode, which has plugins
+ *   rather than hooks: it adds the user's messages to each tool's output, and
+ *   prints a line when a tool starts so the run page sees a question while it
+ *   is open (OpenCode's own JSON reports a tool only once it is done). The
+ *   default OPENCODE_COMMAND keeps the agent going while messages are unread.
  * - Claude Code reads the server and hooks from `mcp.json` and
  *   `settings.json`; Codex gets them as `-c` config overrides, one per line
- *   of `codex-config`.
+ *   of `codex-config`; OpenCode reads `opencode.json`.
  *
  * The scripts are plain Node (the agent CLI is a Node program, so Node is in
  * the sandbox) with no dependencies.
@@ -35,6 +40,9 @@ const files = (dir: string) => ({
   askServer: `${dir}/ask-server.mjs`,
   inboxHook: `${dir}/inbox-hook.mjs`,
   codexConfig: `${dir}/codex-config`,
+  opencodeConfig: `${dir}/opencode.json`,
+  opencodePlugin: `${dir}/opencode-plugin.mjs`,
+  opencodeReply: `${dir}/opencode-reply.mjs`,
 });
 
 /** Shared by both scripts: claims unread messages, oldest first. */
@@ -148,12 +156,67 @@ for await (const _ of process.stdin) {
 const messages = takeMessages();
 if (messages.length > 0) {
   const text = "The user sent a message while you were working:\\n\\n" + messages.join("\\n\\n");
-  if (event === "stop") {
+  if (event === "next") {
+    // For an agent without a stop hook: the prompt to continue its session with.
+    process.stdout.write(text + "\\n\\nAddress it before you finish.");
+  } else if (event === "stop") {
     process.stdout.write(JSON.stringify({ decision: "block", reason: text + "\\n\\nAddress it before you finish." }));
   } else {
     process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: text } }));
   }
 }
+`;
+
+/** The line the plugin prints when a tool starts; see opencode-stream.ts. */
+export const OPENCODE_TOOL_START = "factory_tool_start";
+
+export const OPENCODE_PLUGIN_SCRIPT = `${TAKE_MESSAGES}
+export const FactoryPlugin = async () => ({
+  "tool.execute.before": async (input, output) => {
+    process.stdout.write(JSON.stringify({
+      type: ${JSON.stringify(OPENCODE_TOOL_START)},
+      sessionID: input.sessionID,
+      callID: input.callID,
+      tool: input.tool,
+      args: output.args,
+    }) + "\\n");
+  },
+  "tool.execute.after": async (input, output) => {
+    if (typeof output.output !== "string") return;
+    const messages = takeMessages();
+    if (messages.length === 0) return;
+    output.output += "\\n\\nThe user sent a message while you were working:\\n\\n" + messages.join("\\n\\n");
+  },
+});
+`;
+
+/**
+ * Reads `opencode run --format json` on stdin, writes the last message's text
+ * to the file in argv[2] and prints the session's id, for the default
+ * OPENCODE_DESCRIBE_COMMAND.
+ */
+export const OPENCODE_REPLY_SCRIPT = `import fs from "node:fs";
+let session = "";
+let message = "";
+let parts = [];
+for (const line of fs.readFileSync(0, "utf8").split("\\n")) {
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    continue;
+  }
+  if (!session && typeof event.sessionID === "string") session = event.sessionID;
+  const part = event.part;
+  if (event.type !== "text" || !part || typeof part.text !== "string" || event.sessionID !== session) continue;
+  if (part.messageID !== message) {
+    message = part.messageID;
+    parts = [];
+  }
+  parts.push(part.text);
+}
+if (parts.length > 0) fs.writeFileSync(process.argv[2], parts.join("\\n\\n"));
+process.stdout.write(session);
 `;
 
 export const SYSTEM_PROMPT = `You are working unattended in a Factory on Rails sandbox, on a fresh branch of the repository in the current directory. When you finish, the factory commits whatever you changed and opens a pull request, so leave your changes in the working tree and do not push or open a pull request yourself.
@@ -215,6 +278,28 @@ export function codexConfig(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMc
   ].join("\n") + "\n";
 }
 
+/**
+ * OpenCode's config (OPENCODE_CONFIG, merged over the user's own and the
+ * repo's): the ask_user server with a timeout long enough to wait for a
+ * person, the user's MCP servers, the factory's instructions and its plugin.
+ */
+export function opencodeConfig(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMcpServer> = []): string {
+  const f = files(dir);
+  return JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    autoupdate: false,
+    share: "disabled",
+    instructions: [f.systemPrompt],
+    plugin: [`file://${f.opencodePlugin}`],
+    mcp: Object.fromEntries([
+      ...userServers(servers).map((server) => [server.name, server.transport === "http"
+        ? { type: "remote", url: server.url, headers: server.headers, enabled: true }
+        : { type: "local", command: [server.command, ...server.args], environment: server.env, enabled: true }]),
+      ["factory", { type: "local", command: ["node", f.askServer], enabled: true, timeout: ASK_TIMEOUT_MS + 60_000 }],
+    ]),
+  }, null, 2);
+}
+
 /** What the runner writes into the sandbox before the agent starts, as [path, content] pairs. */
 export function agentToolFiles(dir = FACTORY_DIR, servers: ReadonlyArray<ResolvedMcpServer> = []): ReadonlyArray<readonly [string, string]> {
   const f = files(dir);
@@ -224,6 +309,9 @@ export function agentToolFiles(dir = FACTORY_DIR, servers: ReadonlyArray<Resolve
     [f.inboxHook, INBOX_HOOK_SCRIPT],
     [f.systemPrompt, SYSTEM_PROMPT],
     [f.codexConfig, codexConfig(dir, servers)],
+    [f.opencodePlugin, OPENCODE_PLUGIN_SCRIPT],
+    [f.opencodeReply, OPENCODE_REPLY_SCRIPT],
+    [f.opencodeConfig, opencodeConfig(dir, servers)],
     [f.mcpConfig, claudeMcpConfig(dir, servers)],
     [
       f.settings,
@@ -250,9 +338,17 @@ export function agentToolEnv(dir = FACTORY_DIR): Record<string, string> {
     FACTORY_SETTINGS_FILE: f.settings,
     FACTORY_SYSTEM_PROMPT_FILE: f.systemPrompt,
     FACTORY_CODEX_CONFIG: f.codexConfig,
+    FACTORY_OPENCODE_CONFIG: f.opencodeConfig,
+    FACTORY_OPENCODE_REPLY: f.opencodeReply,
+    FACTORY_INBOX_HOOK: f.inboxHook,
     // Claude Code gives up on an MCP tool call after this long; ask_user waits for a person.
     MCP_TOOL_TIMEOUT: String(ASK_TIMEOUT_MS + 60_000),
   };
+}
+
+/** Env for the describe command: what the default OPENCODE_DESCRIBE_COMMAND reads its reply with. */
+export function describeToolEnv(dir = FACTORY_DIR): Record<string, string> {
+  return { FACTORY_DIR: dir, FACTORY_OPENCODE_REPLY: files(dir).opencodeReply };
 }
 
 /**

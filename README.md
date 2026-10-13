@@ -10,9 +10,11 @@ TypeScript with [Effect](https://effect.website).
 While a run works you can follow it live, answer the agent's questions, and
 watch its subagents and the flow of work between them on the Flow map.
 
-- **Claude Code or Codex**, per run, on each user's own credential: a Claude
-  subscription token, an Anthropic API key, a ChatGPT sign-in or an OpenAI API
-  key. The composer also picks the model and reasoning effort.
+- **Claude Code, Codex or OpenCode**, per run, on each user's own credential:
+  a Claude subscription token, an Anthropic API key, a ChatGPT sign-in, an
+  OpenAI API key or an OpenCode API key (OpenCode Zen and Go; OpenCode can
+  also use the Anthropic and OpenAI keys). The composer also picks the model
+  and reasoning effort.
 - **Images and MCP servers.** Paste or drop up to four images into a task or
   follow-up. Under **Settings → MCP servers**, connect your own tools (remote
   HTTP with a token, headers or OAuth, or a command run in the sandbox); see
@@ -82,7 +84,7 @@ do, and the app walks you through it on its setup page:
    you can delete the token afterwards.
 6. **Save your agent credential** under **Settings** (a Claude subscription
    token or Anthropic API key for Claude Code, a ChatGPT sign-in or an OpenAI
-   API key for Codex) and start a run.
+   API key for Codex, an OpenCode API key for OpenCode) and start a run.
 
 Costs: services and sandboxes are billed to the Railway workspace you deploy
 into; each user's model usage goes to their own key or subscription. To open sign-in to

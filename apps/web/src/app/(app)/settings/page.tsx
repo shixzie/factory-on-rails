@@ -33,19 +33,19 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-10">
           <Section
             title="Agents and keys"
-            description="Bring your own key: your runs use your key, and only your runs. Each run gets the key for the agent it uses. Keys are encrypted at rest, never shown again after you save them, and only handed to the sandboxes that run your tasks."
+            description="Bring your own key: your runs use your key, and only your runs. Each run gets the keys for the agent it uses; OpenCode also uses your Anthropic and OpenAI keys for those providers' models. Keys are encrypted at rest, never shown again after you save them, and only handed to the sandboxes that run your tasks."
           >
             <ApiKeys initial={keys} />
           </Section>
           <Section
             title="MCP servers"
-            description="Connect tools for Claude Code and Codex. Your servers and credentials are saved for your account and used in every new thread and on the next turn of existing threads. Changes take effect when an agent next starts."
+            description="Connect tools for Claude Code, Codex and OpenCode. Your servers and credentials are saved for your account and used in every new thread and on the next turn of existing threads. Changes take effect when an agent next starts."
           >
             <McpServers initial={mcpServers} oauthResult={typeof params.mcp === "string" ? params.mcp : undefined} />
           </Section>
           <Section
             title="Sandbox snapshot"
-            description="A snapshot is a prepared sandbox your runs start from, for example with Claude Code or Codex already signed in to your subscription. An agent with no key saved above uses the sign-in in the snapshot; a saved key takes precedence over it."
+            description="A snapshot is a prepared sandbox your runs start from, for example with Claude Code, Codex or OpenCode already signed in to your subscription. An agent with no key saved above uses the sign-in in the snapshot; a saved key takes precedence over it."
           >
             <SnapshotPicker initial={snapshot} />
           </Section>

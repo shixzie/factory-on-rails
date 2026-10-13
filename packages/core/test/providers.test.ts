@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentCredential, isAgentId, isModelProvider, keyHint, parseSnapshots, snapshotsFor, validateApiKey } from "../src/providers.js";
+import { agentCredential, agentCredentials, agentEnvVar, isAgentId, isModelProvider, keyHint, parseSnapshots, snapshotsFor, validateApiKey } from "../src/providers.js";
 
 describe("model providers", () => {
   it("knows its providers and nothing unexpected", () => {
@@ -7,6 +7,7 @@ describe("model providers", () => {
     expect(isModelProvider("claude_oauth")).toBe(true);
     expect(isModelProvider("openai")).toBe(true);
     expect(isModelProvider("codex_oauth")).toBe(true);
+    expect(isModelProvider("opencode")).toBe(true);
     expect(isModelProvider("toString")).toBe(false);
     expect(isModelProvider("nope")).toBe(false);
   });
@@ -28,6 +29,12 @@ describe("model providers", () => {
   it("validates OpenAI keys", () => {
     expect(validateApiKey("openai", "sk-proj-" + "x".repeat(40))).toBeNull();
     expect(validateApiKey("openai", "pk-" + "x".repeat(40))).toMatch(/sk-/);
+  });
+
+  it("validates OpenCode keys, and sends Anthropic keys to their own slot", () => {
+    expect(validateApiKey("opencode", "sk-" + "x".repeat(40))).toBeNull();
+    expect(validateApiKey("opencode", "sk-ant-api03-" + "x".repeat(40))).toMatch(/Anthropic API key/);
+    expect(validateApiKey("opencode", "sk-short")).toMatch(/complete/);
   });
 
   it("validates Codex ChatGPT device-login documents", () => {
@@ -52,6 +59,18 @@ describe("agents", () => {
     expect(agentCredential("codex", ["anthropic"])).toBeUndefined();
     expect(agentCredential("codex", ["openai"])).toBe("openai");
     expect(agentCredential("codex", ["openai", "codex_oauth"])).toBe("codex_oauth");
+    expect(agentCredentials("claude", ["anthropic", "claude_oauth"])).toEqual(["claude_oauth"]);
+  });
+
+  it("gives OpenCode every key it can use, where it reads each", () => {
+    expect(isAgentId("opencode")).toBe(true);
+    expect(agentCredentials("opencode", ["openai", "claude_oauth", "anthropic", "opencode", "codex_oauth"])).toEqual(["opencode", "anthropic", "openai"]);
+    expect(agentCredentials("opencode", ["anthropic"])).toEqual(["anthropic"]);
+    expect(agentCredentials("opencode", ["claude_oauth", "codex_oauth"])).toEqual([]);
+    expect(agentEnvVar("opencode", "opencode")).toBe("OPENCODE_API_KEY");
+    expect(agentEnvVar("opencode", "anthropic")).toBe("ANTHROPIC_API_KEY");
+    expect(agentEnvVar("opencode", "openai")).toBe("OPENAI_API_KEY");
+    expect(agentEnvVar("codex", "openai")).toBe("CODEX_API_KEY");
   });
 });
 

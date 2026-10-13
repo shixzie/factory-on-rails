@@ -18,7 +18,9 @@ import { Api, api, runInBrowser } from "@/lib/api";
 import { initialComposerRepo } from "@/lib/composer-repo";
 import { cn } from "@/lib/utils";
 
-const modelOptions: Record<Api.AgentId, { value: string; label: string }[]> = {
+type ModelOption = { value: string; label: string };
+
+const modelOptions: Record<Api.AgentId, ModelOption[]> = {
   claude: [
     { value: "sonnet", label: "Sonnet" },
     { value: "opus", label: "Opus" },
@@ -29,7 +31,34 @@ const modelOptions: Record<Api.AgentId, { value: string; label: string }[]> = {
     { value: "gpt-6-astra", label: "GPT-6 Astra" },
     { value: "gpt-6-luna", label: "GPT-6 Luna" },
   ],
+  opencode: [],
 };
+
+/** OpenCode names models `provider/model`; it offers the ones whose provider the user has a key for. */
+const opencodeModels: Record<string, ModelOption[]> = {
+  opencode: [
+    { value: "opencode/claude-sonnet-5-5", label: "Zen · Claude Sonnet 5.5" },
+    { value: "opencode/gpt-6.1-sol", label: "Zen · GPT-6.1 Sol" },
+    { value: "opencode-go/kimi-k3", label: "Go · Kimi K3" },
+    { value: "opencode-go/glm-5.3", label: "Go · GLM-5.3" },
+    { value: "opencode-go/deepseek-v4-pro", label: "Go · DeepSeek V4 Pro" },
+  ],
+  anthropic: [
+    { value: "anthropic/claude-sonnet-5-5", label: "Anthropic · Claude Sonnet 5.5" },
+    { value: "anthropic/claude-opus-5-5", label: "Anthropic · Claude Opus 5.5" },
+  ],
+  openai: [
+    { value: "openai/gpt-6.1-sol", label: "OpenAI · GPT-6.1 Sol" },
+    { value: "openai/gpt-6-luna", label: "OpenAI · GPT-6 Luna" },
+  ],
+};
+
+/** The model choices for an agent; with no saved keys (a signed-in snapshot) OpenCode offers them all. */
+function agentModels(agent: Api.AgentId, providers: ReadonlyArray<string>): ModelOption[] {
+  if (agent !== "opencode") return modelOptions[agent];
+  const usable = providers.filter((p) => Object.hasOwn(opencodeModels, p));
+  return (usable.length > 0 ? usable : Object.keys(opencodeModels)).flatMap((p) => opencodeModels[p]!);
+}
 
 const repoKey = (r: Pick<Api.ApiRepo, "installationId" | "fullName">) => `${r.installationId}:${r.fullName}`;
 
@@ -72,8 +101,9 @@ export function Composer({
   const [agent, setAgent] = useState<Api.AgentId>(
     () => (me.agents.find((a) => a.id === defaultAgent && a.ready) ?? me.agents.find((a) => a.ready) ?? me.agents[0])?.id ?? "claude",
   );
+  const providersFor = (id: Api.AgentId) => me.agents.find((a) => a.id === id)?.providers ?? [];
   const [model, setModel] = useState(defaultAgent === agent ? defaultModel ?? "" : "");
-  const [customModel, setCustomModel] = useState(() => !!model && !modelOptions[agent].some((m) => m.value === model));
+  const [customModel, setCustomModel] = useState(() => !!model && !agentModels(agent, providersFor(agent)).some((m) => m.value === model));
   const [reasoningEffort, setReasoningEffort] = useState<Api.ReasoningEffort | "default">(
     defaultAgent === agent && defaultReasoningEffort && Api.AGENT_EFFORTS[agent].includes(defaultReasoningEffort)
       ? defaultReasoningEffort : "default",
@@ -116,7 +146,7 @@ export function Composer({
   };
 
   const agentItems = me.agents.map((a) => ({ value: a.id, label: a.label }));
-  const models = [{ value: "default", label: "Default model" }, ...modelOptions[agent], { value: "custom", label: "Custom model…" }];
+  const models = [{ value: "default", label: "Default model" }, ...agentModels(agent, providersFor(agent)), { value: "custom", label: "Custom model…" }];
   const efforts = [{ value: "default", label: "Default effort" }, ...Api.AGENT_EFFORTS[agent].map((value) => ({ value, label: Api.REASONING_EFFORT_LABELS[value] }))];
   const agentLabel = Api.AGENT_LABELS[agent];
 
@@ -224,7 +254,7 @@ export function Composer({
             maxLength={200}
             aria-label="Custom model ID"
             aria-invalid={!!model && !modelValid}
-            placeholder="Enter model ID"
+            placeholder={agent === "opencode" ? "provider/model" : "Enter model ID"}
             className="h-7 w-44 rounded-md border bg-transparent px-2 text-xs outline-none focus:border-ring"
           />}
           <Select items={efforts} value={reasoningEffort} onValueChange={(v) => v && setReasoningEffort(v as Api.ReasoningEffort | "default")} disabled={blocked || pending}>
