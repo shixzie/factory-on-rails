@@ -211,8 +211,8 @@ new run ──▶ running ──(5 min idle)──▶ stopping ──▶ stopped
 
 ### Sandbox snapshots
 
-A snapshot is a sandbox someone prepared by hand (signed Codex or Claude Code
-in to a subscription, installed toolchains) and saved as a named checkpoint in
+A snapshot is a sandbox someone prepared by hand (signed Codex, Claude Code or
+OpenCode in to a subscription, installed toolchains) and saved as a named checkpoint in
 the `agents` environment ([setup.md](setup.md), step 7). A user picks one under
 Settings, and every new sandbox for their runs boots from it; a sandbox
 resumed from a stopped run's checkpoint already has its contents.
@@ -319,8 +319,9 @@ queued ──▶ running ──▶ succeeded | failed ──(user sends a messag
    branch, and checks out `factory/run-<id>`.
 4. It runs the run's agent in the repo: `AGENT_SETUP_COMMAND` and
    `AGENT_COMMAND` for Claude Code, in headless mode
-   (`claude -p … --output-format stream-json`), or `CODEX_SETUP_COMMAND` and
-   `CODEX_COMMAND` for Codex (`codex exec --json`), each with the factory's
+   (`claude -p … --output-format stream-json`), `CODEX_SETUP_COMMAND` and
+   `CODEX_COMMAND` for Codex (`codex exec --json`), or `OPENCODE_SETUP_COMMAND`
+   and `OPENCODE_COMMAND` for OpenCode 2 (`opencode run --standalone --format json`), each with the factory's
    ask-the-user tool and inbox hook (see "Agents" below). Any CLI that edits
    files in the working tree works as a command, and plain text output is
    shown as a log.
@@ -374,15 +375,17 @@ not check the PR's existence or change it on GitHub.
 
 After a turn that pushed new commits, the runner asks the run's agent, with
 the run's own credentials and model, for the pull request's title and
-description (`AGENT_DESCRIBE_COMMAND` / `CODEX_DESCRIBE_COMMAND`). It
+description (`AGENT_DESCRIBE_COMMAND` / `CODEX_DESCRIBE_COMMAND` /
+`OPENCODE_DESCRIBE_COMMAND`). It
 continues the agent's session, so it knows why each change was made, reads
 the branch's diff against the base, and replies with the title on the first
 line and the description after it: a summary, Changes, How to verify, and
 Notes when something is open, or the repository's own pull request template
 when it has one (the prompt is `describePrompt` in `apps/runner/src/plan.ts`).
 The exchange isn't saved to the session (`claude --no-session-persistence`,
-`codex exec resume --ephemeral`), so the next turn continues the work, and
-Claude Code gets only read tools for it. The runner appends a footer linking
+`codex exec resume --ephemeral`, or for OpenCode a `--fork` of the session
+that is deleted afterwards), so the next turn continues the work, and
+Claude Code gets only read tools for it (OpenCode has file edits denied). The runner appends a footer linking
 the run, with the task folded away. On a later turn the open pull request's
 title and description are replaced rather than appended to. When the agent
 can't answer (an error, an empty reply, a custom command that can't
@@ -408,20 +411,20 @@ run) and the run page polls it.
 
 ## Agents
 
-A run uses Claude Code or Codex, picked in the composer (`runs.agent`; the
-new-run page starts on the agent used last). Both get the same tools and
-show up the same way on the run page.
+A run uses Claude Code, Codex or OpenCode, picked in the composer
+(`runs.agent`; the new-run page starts on the agent used last). All get the
+same tools and show up the same way on the run page.
 
-| | Claude Code | Codex |
-|---|---|---|
-| Command | `claude -p "<task>" --output-format stream-json` | `codex exec --json - < TASK.md` |
-| Next turn | `--continue` | `codex exec resume --last` |
-| Unattended | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` (the Railway sandbox is the boundary) |
-| ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` |
-| Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` |
-| Output parser | `agent-stream.ts` | `codex-stream.ts` |
-| Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY`, or a ChatGPT sign-in (`CODEX_AUTH_JSON`, written to `~/.codex/auth.json`) |
-| Model and effort | `--model`, `--effort` | `--model`, `-c model_reasoning_effort=…` |
+| | Claude Code | Codex | OpenCode |
+|---|---|---|---|
+| Command | `claude -p "<task>" --output-format stream-json` | `codex exec --json - < TASK.md` | `opencode run --standalone --format json --thinking < TASK.md` |
+| Next turn | `--continue` | `codex exec resume --last` | `--continue` |
+| Unattended | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` (the Railway sandbox is the boundary) | `--auto` |
+| ask_user server and hooks | `--mcp-config` and `--settings` files | `-c` overrides, one per line of `codex-config`, with `--dangerously-bypass-hook-trust` | `opencode.json` (as `OPENCODE_CONFIG`) with the factory's plugin, the `opencode-plugin` directory |
+| Factory instructions | `--append-system-prompt` | `-c developer_instructions=…` | The plugin's session `context` hook |
+| Output parser | `agent-stream.ts` | `codex-stream.ts` | `opencode-stream.ts` |
+| Credentials | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | `CODEX_API_KEY`, or a ChatGPT sign-in (`CODEX_AUTH_JSON`, written to `~/.codex/auth.json`) | Every one saved of `OPENCODE_API_KEY` (Zen and Go), `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` |
+| Model and effort | `--model`, `--effort` | `--model`, `-c model_reasoning_effort=…` | `--model provider/model#effort` |
 
 Codex prints `thread.started`, `turn.*` and `item.*` events. Each item maps
 onto the Claude Code tool it stands for, so the run page, the subagent cards
@@ -432,6 +435,35 @@ becomes `TodoWrite`, `web_search` becomes `WebSearch`, a `spawn_agent` call
 becomes `Agent`, and `file_change`, which names the files a patch touched but
 not its lines, becomes `FileChange` (the Diff panel has the lines). Its hooks
 take the same JSON as Claude Code's, so the inbox hook serves both.
+
+The runner installs OpenCode 2 (`@opencode/cli@2`), replacing an OpenCode 1
+a snapshot may have. Each `opencode run` is `--standalone`, on a private
+server that exits with it rather than the shared background service. It
+prints `step_start`, `step_finish`, `text`, `reasoning`, `tool_use` and
+`error` events, each carrying a message part. Its tools map the same way
+(`shell` to `Bash`, `read`/`write`/`edit` to `Read`/`Write`/`Edit`, `patch`
+to `FileChange`, `subagent` to `Agent`, and MCP tools, which OpenCode names
+`<server>_<tool>`, to `mcp__<server>__<tool>`). MCP servers are configured
+with Code Mode off, so each tool is called by its own name. OpenCode has
+plugins rather than hooks, so the factory's plugin does the hooks' work:
+its `context` hook adds the factory's instructions, `execute.after` appends
+the user's unread messages to a tool's result, and `execute.before` records
+a `factory_tool_start` line in `opencode-tools.jsonl`, which the command
+prints beside OpenCode's output (the plugin runs in OpenCode's server, whose
+stdout isn't the run's). OpenCode reports a tool only once it is done, so
+without that line a waiting question would not show. The prompt goes in on
+stdin, and since OpenCode 2 exits before printing its last step's finish,
+the command prints a `factory_turn_end` line after each run to close the
+turn. With no stop hook, `OPENCODE_COMMAND` continues the session
+(`--continue`) with any messages still unread when a run ends. Subagents'
+own steps are not shown, as with Codex.
+
+Unlike the other two, OpenCode gets every credential it can use, not only
+the first: one OpenCode API key covers OpenCode's pay-as-you-go Zen models
+(`opencode/<model>`) and, with an OpenCode Go subscription, the Go models
+(`opencode-go/<model>`), and the user's Anthropic and OpenAI keys work for
+`anthropic/<model>` and `openai/<model>`. The composer offers models from
+the providers the user has saved keys for.
 
 ### Model and reasoning effort
 
@@ -445,7 +477,8 @@ on the user's account and the installed CLI.
 The runner passes them to the agent command as `FACTORY_MODEL` and
 `FACTORY_REASONING_EFFORT` (empty for the default), plus
 `FACTORY_CODEX_EFFORT`, the whole quoted `-c` assignment for Codex or empty.
-A custom `AGENT_COMMAND`, `CODEX_COMMAND` or describe command must use them
+OpenCode takes the effort as the model's variant (`--model provider/model#high`),
+so it applies only with a model picked; the composer hides it until then. A custom `AGENT_COMMAND`, `CODEX_COMMAND`, `OPENCODE_COMMAND` or describe command must use them
 itself, quoted, as the defaults do.
 
 ### Images
@@ -463,8 +496,8 @@ agent a way to reach the user, so a run can be followed and steered from the
 run page while it works.
 
 - **Activity.** The agent's JSON output (Claude Code's `stream-json`, or
-  Codex's events, see "Agents" above) is parsed line by line
-  (`apps/runner/src/agent-stream.ts`, `codex-stream.ts`) into `message`, `thinking`, `tool_call`
+  Codex's or OpenCode's events, see "Agents" above) is parsed line by line
+  (`apps/runner/src/agent-stream.ts`, `codex-stream.ts`, `opencode-stream.ts`) into `message`, `thinking`, `tool_call`
   (name and input), `tool_result` and `agent_result` events in `run_events`,
   with details in its `data` column. Lines that aren't agent JSON stay
   `stdout`, so other agent CLIs still get a log. Long tool inputs and outputs
@@ -590,16 +623,19 @@ key under **Settings**, and it is used for their runs only.
 - Providers: an Anthropic API key and a Claude subscription token (from
   `claude setup-token`, which bills the user's Pro, Max, Team or Enterprise
   plan) for Claude Code; a Codex ChatGPT device-login document and an OpenAI
-  API key for Codex.
+  API key for Codex; an OpenCode API key (Zen, and Go with a subscription)
+  for OpenCode, which also uses the Anthropic and OpenAI API keys.
 - The harness refuses to queue a run whose agent has no credential (unless
   the user picked a sandbox snapshot, which can carry the agent's sign-in)
   and sends them to Settings. The runner decrypts the one credential the
   run's agent should use when it picks the run up and injects it under its
   env var, so the agent CLI in the sandbox bills that user's account. A saved
   ChatGPT login is written to `~/.codex/auth.json` for the user's sandbox and
-  is removed before checkpoints are saved. Only the selected credential goes
-  in: Claude Code prefers an API key over a subscription token, so
-  a saved subscription token is passed alone.
+  is removed before checkpoints are saved. For Claude Code and Codex only the
+  selected credential goes in: Claude Code prefers an API key over a
+  subscription token, so a saved subscription token is passed alone.
+  OpenCode picks a provider per model, so it gets each of its keys (the
+  OpenAI key as `OPENAI_API_KEY`, where OpenCode reads it).
 - Providers and agents live in `packages/core/src/providers.ts`. Adding one
   is a new entry there with its env var and key check.
 - The agent can read the key inside its sandbox, which is inherent to running
@@ -626,7 +662,7 @@ saved authorization does not revoke a provider-side grant.
 
 The runner reads the owner's enabled connections before launching an agent
 turn, including follow-ups in an existing thread, and merges them with the
-built-in `factory` MCP server for Claude Code and Codex. Changes apply at the
+built-in `factory` MCP server for Claude Code, Codex and OpenCode. Changes apply at the
 next launch, while an already running command keeps its configuration. The
 runner refreshes expired OAuth access tokens when a refresh token is available.
 A long-running agent may need another turn when its access token expires.

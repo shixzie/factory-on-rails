@@ -26,6 +26,7 @@ const settings = {
     commands: {
       claude: { setupCommand: "setup-agent", command: "run-agent" },
       codex: { setupCommand: "setup-codex", command: "run-codex" },
+      opencode: { setupCommand: "setup-opencode", command: "run-opencode" },
     },
     timeoutSec: 60,
     passthroughEnv: {},
@@ -159,6 +160,30 @@ describe.skipIf(!testDatabaseUrl)("runner", () => {
         expect(sandboxes.state.commands.some((c) => c.includes("run-agent"))).toBe(false);
         expect(sandboxes.state.createdWith?.CODEX_API_KEY).toBe("sk-proj-worker-test-key-0000");
         expect(sandboxes.state.createdWith?.ANTHROPIC_API_KEY).toBeUndefined();
+      }),
+    );
+
+    it.effect("runs OpenCode with every key it can use, each where OpenCode reads it", () =>
+      Effect.gen(function* () {
+        const sandboxes = fakeSandboxes();
+        const worker = yield* runner.pipe(Effect.provide(Layer.merge(sandboxes.layer, fakeGitHub())), Effect.fork);
+        const run = yield* queueRunWith({
+          agent: "opencode",
+          keys: { anthropic: API_KEY, openai: "sk-proj-worker-test-key-0000", opencode: "sk-opencode-worker-test-key-0000", claude_oauth: "sk-ant-oat01-unused-worker-token-0000" },
+        });
+
+        yield* waitForRun(run.id, (r) => r.status === "succeeded");
+        yield* Fiber.interrupt(worker);
+
+        expect(sandboxes.state.commands).toContainEqual(expect.stringContaining("setup-opencode"));
+        expect(sandboxes.state.commands).toContainEqual(expect.stringContaining("run-opencode"));
+        expect(sandboxes.state.createdWith).toMatchObject({
+          OPENCODE_API_KEY: "sk-opencode-worker-test-key-0000",
+          ANTHROPIC_API_KEY: API_KEY,
+          OPENAI_API_KEY: "sk-proj-worker-test-key-0000",
+        });
+        expect(sandboxes.state.createdWith?.CODEX_API_KEY).toBeUndefined();
+        expect(sandboxes.state.createdWith?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
       }),
     );
 

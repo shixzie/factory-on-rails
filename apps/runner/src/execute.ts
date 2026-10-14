@@ -2,8 +2,9 @@ import { GitHubAppApi, GitHubError, PREVIEW_AGENT_SCRIPT, signPreviewGrant, Stor
 import { Cause, Clock, Data, Duration, Effect, Exit, Option, Queue, Redacted, Schedule } from "effect";
 import { RailwayConnectionError, RailwayGraphQLError } from "railway";
 import { ASK_USER_TOOL, makeAgentStream } from "./agent-stream.js";
-import { agentToolEnv, agentToolFiles, deliverMessageScript } from "./agent-tools.js";
+import { agentToolEnv, agentToolFiles, deliverMessageScript, describeToolEnv } from "./agent-tools.js";
 import { makeCodexParser } from "./codex-stream.js";
+import { makeOpenCodeParser } from "./opencode-stream.js";
 import type { AgentCommands, PreviewSettings } from "./config.js";
 import { materializeImage, messageImages, withImages } from "./images.js";
 import { makeMediaCapture, type MediaBlob } from "./media.js";
@@ -65,7 +66,7 @@ export type RunOutcome =
 export interface ExecuteOptions {
   readonly log: RunLog;
   /**
-   * The run's agent (Claude Code unless `id` says Codex), how to install and
+   * The run's agent (Claude Code unless `id` says Codex or OpenCode), how to install and
    * run it, and the env (the user's own keys) every sandbox gets.
    */
   readonly agent: AgentCommands & { readonly id?: AgentId; readonly timeoutSec: number; readonly env: Record<string, string> };
@@ -488,8 +489,8 @@ const work = (
           },
           output: log.push,
         },
-        // Codex prints its own JSON events; everything else is read as Claude Code's stream-json.
-        agent.id === "codex" ? makeCodexParser() : undefined,
+        // Codex and OpenCode print their own JSON events; everything else is read as Claude Code's stream-json.
+        agent.id === "codex" ? makeCodexParser() : agent.id === "opencode" ? makeOpenCodeParser({ mcpServers: connections.servers.map((s) => s.name) }) : undefined,
       );
 
       yield* Effect.forkScoped(inboxLoop);
@@ -532,7 +533,7 @@ const work = (
           yield* sandbox.writeFile(DESCRIBE_FILE, describePrompt({ baseBranch: run.base_branch, existing: hasPullRequest }));
           yield* step(key, "Writing the pull request description", `rm -f ${PR_FILE}\n${agent.describeCommand}`, {
             cwd: REPO_DIR,
-            env: { ...modelEnv, FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
+            env: { ...describeToolEnv(), ...modelEnv, FACTORY_DESCRIBE_FILE: DESCRIBE_FILE, FACTORY_PR_FILE: PR_FILE },
             timeoutSec: 600,
             // Its reply is the PR text, not activity for the run page.
             onOutput: () => {},

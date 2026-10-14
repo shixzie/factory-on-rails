@@ -6,6 +6,8 @@ import { hostname } from "node:os";
 const MODEL_ARGUMENT = '${FACTORY_MODEL:+--model "$FACTORY_MODEL"}';
 const CLAUDE_EFFORT_ARGUMENT = '${FACTORY_REASONING_EFFORT:+--effort "$FACTORY_REASONING_EFFORT"}';
 const CODEX_EFFORT_ARGUMENT = '${FACTORY_CODEX_EFFORT:+-c "$FACTORY_CODEX_EFFORT"}';
+/** OpenCode 2 takes the effort as the model's variant, `provider/model#variant`, so it needs a model to apply one. */
+const OPENCODE_MODEL_ARGUMENT = '${FACTORY_MODEL:+--model "$FACTORY_MODEL${FACTORY_REASONING_EFFORT:+#$FACTORY_REASONING_EFFORT}"}';
 
 export const DEFAULT_AGENT_SETUP = "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code";
 /**
@@ -52,6 +54,46 @@ export const DEFAULT_CODEX_COMMAND = [
 ].join("\n");
 
 /**
+ * OpenCode 2 (`@opencode/cli`), replacing an OpenCode 1 (`opencode-ai`) that
+ * a sandbox image may already have under the same command.
+ */
+export const DEFAULT_OPENCODE_SETUP = 'case "$(opencode --version 2>/dev/null)" in *v2.*) ;; *) npm install -g --force @opencode/cli@2 ;; esac';
+/**
+ * The start of one `opencode run`: JSON events with the agent's reasoning, on
+ * a private server that exits with it (`--standalone`; the default is a
+ * shared background service, which would outlive the command and keep the
+ * environment it started with), approving its permission prompts (`--auto`;
+ * the Railway sandbox is the boundary, as with Claude Code's
+ * --dangerously-skip-permissions).
+ */
+const OPENCODE_RUN = ["opencode run --standalone --format json --thinking --auto", OPENCODE_MODEL_ARGUMENT];
+/**
+ * OpenCode 2 in non-interactive mode (see opencode-stream.ts), with the
+ * factory's plugin and ask-the-user server from FACTORY_OPENCODE_CONFIG (see
+ * agent-tools.ts). The plugin records tools as they start in
+ * FACTORY_OPENCODE_TOOLS, printed here beside OpenCode's own events. The
+ * prompt goes in on stdin: OpenCode 2 quotes and repeats one given as
+ * arguments after `--`, and without `--` one starting with "-" would be read
+ * as a flag. OpenCode 2 exits before printing its last step's finish, so a
+ * `factory_turn_end` line closes each run. OpenCode has no stop hook, so while
+ * the user's messages are waiting in the inbox it continues the session with
+ * them. On a later turn in the same sandbox it continues its last session.
+ */
+export const DEFAULT_OPENCODE_COMMAND = [
+  'export OPENCODE_CONFIG="$FACTORY_OPENCODE_CONFIG"',
+  ': > "$FACTORY_OPENCODE_TOOLS"',
+  'tail -n +1 -F "$FACTORY_OPENCODE_TOOLS" 2>/dev/null & tools=$!',
+  // The pause lets the last tool starts through before the tail stops.
+  "trap 'sleep 1; kill $tools 2>/dev/null' EXIT",
+  `opencode_run() { ${OPENCODE_RUN.join(" ")} "$@" || exit $?; echo '{"type":"factory_turn_end"}'; }`,
+  'opencode_run ${FACTORY_CONTINUE:+--continue} < "$FACTORY_TASK_FILE"',
+  'while next="$(node "$FACTORY_INBOX_HOOK" next < /dev/null)" && [ -n "$next" ]; do',
+  '  printf \'%s\\n\' "$next" > "$FACTORY_DIR/opencode-next.md"',
+  '  opencode_run --continue < "$FACTORY_DIR/opencode-next.md"',
+  "done",
+].join("\n");
+
+/**
  * Claude Code writing the pull request once the work is pushed (see
  * describePrompt in plan.ts). It continues the run's session, so it knows why
  * it made each change, without saving this exchange to it: the next turn
@@ -75,6 +117,20 @@ export const DEFAULT_CODEX_DESCRIBE_COMMAND = [
   '-o "$FACTORY_PR_FILE" - < "$FACTORY_DESCRIBE_FILE"',
 ].join(" ");
 
+/**
+ * The same for OpenCode, in a fork of its last session with file edits
+ * denied. Its reply is the last message's text; the fork is deleted
+ * afterwards, or the next turn's `--continue` would pick it up.
+ */
+export const DEFAULT_OPENCODE_DESCRIBE_COMMAND = [
+  `export OPENCODE_CONFIG_CONTENT='{"permissions":[{"action":"edit","resource":"*","effect":"deny"}]}'`,
+  [...OPENCODE_RUN, '--continue --fork < "$FACTORY_DESCRIBE_FILE" > "$FACTORY_DIR/describe.jsonl"'].join(" "),
+  "status=$?",
+  'session="$(node "$FACTORY_OPENCODE_REPLY" "$FACTORY_PR_FILE" < "$FACTORY_DIR/describe.jsonl")"',
+  'if [ -n "$session" ]; then opencode session delete --standalone "$session" >/dev/null 2>&1 || true; fi',
+  "exit $status",
+].join("\n");
+
 /** How to install and run one agent CLI in a sandbox. */
 export interface AgentCommands {
   readonly setupCommand: string;
@@ -90,7 +146,8 @@ export interface AgentCommands {
 export interface AgentSettings {
   /**
    * Per agent: Claude Code (AGENT_SETUP_COMMAND, AGENT_COMMAND,
-   * AGENT_DESCRIBE_COMMAND) and Codex (the same with CODEX_).
+   * AGENT_DESCRIBE_COMMAND), Codex (the same with CODEX_) and OpenCode (with
+   * OPENCODE_).
    */
   readonly commands: Readonly<Record<AgentId, AgentCommands>>;
   readonly timeoutSec: number;
@@ -174,6 +231,11 @@ export class RunnerConfig extends Context.Tag("@factory/RunnerConfig")<RunnerCon
               setupCommand: str("CODEX_SETUP_COMMAND", DEFAULT_CODEX_SETUP),
               command: str("CODEX_COMMAND", DEFAULT_CODEX_COMMAND),
               describeCommand: str("CODEX_DESCRIBE_COMMAND", DEFAULT_CODEX_DESCRIBE_COMMAND),
+            }),
+            opencode: Config.all({
+              setupCommand: str("OPENCODE_SETUP_COMMAND", DEFAULT_OPENCODE_SETUP),
+              command: str("OPENCODE_COMMAND", DEFAULT_OPENCODE_COMMAND),
+              describeCommand: str("OPENCODE_DESCRIBE_COMMAND", DEFAULT_OPENCODE_DESCRIBE_COMMAND),
             }),
           }),
           timeoutSec: int("AGENT_TIMEOUT_SECONDS", 3600),

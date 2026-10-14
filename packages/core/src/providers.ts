@@ -1,4 +1,4 @@
-import { AGENT_LABELS } from "./api.js";
+import { AGENT_LABELS, type AgentId } from "./api.js";
 
 /**
  * Model providers a user can bring their own key for. Each key is injected
@@ -41,6 +41,15 @@ export const MODEL_PROVIDERS = {
     helpLabel: "Code login instructions",
     multiline: true,
   },
+  opencode: {
+    label: "OpenCode API key",
+    description:
+      "OpenCode bills your OpenCode account: pay-as-you-go Zen models, and the Go models when you subscribe to OpenCode Go. The same key covers both.",
+    envVar: "OPENCODE_API_KEY",
+    placeholder: "sk-...",
+    helpUrl: "https://opencode.ai/auth",
+    helpLabel: "Get a key",
+  },
 } as const;
 
 export type ModelProvider = keyof typeof MODEL_PROVIDERS;
@@ -64,6 +73,9 @@ export function validateApiKey(provider: ModelProvider, key: string): string | n
     case "openai":
       if (!key.startsWith("sk-")) return "OpenAI API keys start with sk-.";
       return null;
+    case "opencode":
+      if (key.startsWith("sk-ant-")) return "That is an Anthropic key. Save it as your Anthropic API key instead; OpenCode uses it from there.";
+      return null;
     case "codex_oauth": {
       try {
         const auth = JSON.parse(key) as { auth_mode?: unknown; tokens?: { access_token?: unknown; refresh_token?: unknown } };
@@ -83,18 +95,40 @@ export function keyHint(key: string, provider?: ModelProvider): string {
   return key.slice(-4);
 }
 
+interface AgentSpec {
+  readonly label: string;
+  /** The saved credentials it reads, best first. */
+  readonly providers: ReadonlyArray<ModelProvider>;
+  /**
+   * Every saved credential goes in, not only the first: the agent picks a
+   * provider per model (OpenCode's `provider/model`), so each key is usable.
+   */
+  readonly allProviders?: boolean;
+  /** Where this agent reads a credential, when not the provider's own `envVar`. */
+  readonly envVars?: Partial<Record<ModelProvider, string>>;
+}
+
 /**
  * The coding agents a run can use, and the saved credentials each one reads,
- * best first. A run gets the first one the user has saved and none of the
- * others: Claude Code prefers an API key over a subscription token, so a
- * saved subscription token must go in alone to be used.
+ * best first. Claude Code and Codex get the first one the user has saved and
+ * none of the others: Claude Code prefers an API key over a subscription
+ * token, so a saved subscription token must go in alone to be used. OpenCode
+ * gets all of its own: an OpenCode key for Zen and Go models, and Anthropic
+ * and OpenAI keys for those providers' models.
  */
 export const AGENTS = {
   claude: { label: AGENT_LABELS.claude, providers: ["claude_oauth", "anthropic"] },
   codex: { label: AGENT_LABELS.codex, providers: ["codex_oauth", "openai"] },
-} as const satisfies Record<string, { label: string; providers: ReadonlyArray<ModelProvider> }>;
+  opencode: {
+    label: AGENT_LABELS.opencode,
+    providers: ["opencode", "anthropic", "openai"],
+    allProviders: true,
+    // OpenCode reads the OpenAI key where the OpenAI SDK does, not where Codex does.
+    envVars: { openai: "OPENAI_API_KEY" },
+  },
+} as const satisfies Record<AgentId, AgentSpec>;
 
-export type AgentId = keyof typeof AGENTS;
+export type { AgentId };
 
 export const DEFAULT_AGENT: AgentId = "claude";
 
@@ -104,8 +138,21 @@ export function isAgentId(value: string): value is AgentId {
 
 /** The saved credential the agent should use, if the user has one. */
 export function agentCredential(agent: AgentId, saved: Iterable<string>): ModelProvider | undefined {
+  return agentCredentials(agent, saved)[0];
+}
+
+/** Every saved credential that goes into the agent's sandbox, best first. */
+export function agentCredentials(agent: AgentId, saved: Iterable<string>): ReadonlyArray<ModelProvider> {
   const have = new Set(saved);
-  return AGENTS[agent].providers.find((p) => have.has(p));
+  const spec: AgentSpec = AGENTS[agent];
+  const usable = spec.providers.filter((p) => have.has(p));
+  return spec.allProviders ? usable : usable.slice(0, 1);
+}
+
+/** The env var the agent reads a credential from. */
+export function agentEnvVar(agent: AgentId, provider: ModelProvider): string {
+  const spec: AgentSpec = AGENTS[agent];
+  return spec.envVars?.[provider] ?? MODEL_PROVIDERS[provider].envVar;
 }
 
 /**
