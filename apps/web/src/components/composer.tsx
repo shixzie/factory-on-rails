@@ -42,6 +42,7 @@ const opencodeModels: Record<string, ModelOption[]> = {
     { value: "opencode-go/kimi-k3", label: "Go · Kimi K3" },
     { value: "opencode-go/glm-5.3", label: "Go · GLM-5.3" },
     { value: "opencode-go/deepseek-v4-pro", label: "Go · DeepSeek V4 Pro" },
+    { value: "opencode-go/deepseek-v4.1-flash", label: "Go · DeepSeek V4.1 Flash" },
   ],
   anthropic: [
     { value: "anthropic/claude-sonnet-5-5", label: "Anthropic · Claude Sonnet 5.5" },
